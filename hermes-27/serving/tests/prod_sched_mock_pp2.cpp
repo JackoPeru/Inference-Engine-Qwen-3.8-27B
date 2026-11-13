@@ -1,0 +1,119 @@
+// CUDA-free PP2 fake backend for testing both server scheduling modes.
+// Link with distributed/pp2_batch.cu -DHERMES_ADMISSION_CPU_ONLY.
+// Unlike mock_pp2_cpu.cpp, this intentionally does NOT define admit_check:
+// the real ContinuousScheduler must use worker-6's actual admission policy.
+#include "pp2_fwd.hpp"
+#include "pp2_batch.hpp"
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdlib>
+#include <fstream>
+#include <mutex>
+#include <sstream>
+#include <string>
+#include <thread>
+#include <vector>
+
+namespace {
+std::mutex trace_mutex;
+std::atomic<bool> decode_failed_once{false};
+
+int env_integer(const char* name, int default_value = 0) {
+  const char* value = std::getenv(name);
+  return value ? std::atoi(value) : default_value;
+}
+
+void trace(const std::string& operation, long position = -1) {
+  const char* output = std::getenv("FAKE_TRACE_FILE");
+  if (!output || !*output) return;
+  std::lock_guard<std::mutex> lock(trace_mutex);
+  std::ofstream file(output, std::ios::app);
+  file << operation;
+  if (position >= 0) file << ' ' << position;
+  file << '\n';
+}
+
+std::vector<int> fake_ids() {
+  const char* value = std::getenv("FAKE_IDS");
+  if (!value) return {100, 101, 102, 103};
+  std::istringstream line(value);
+  std::string field;
+  std::vector<int> ids;
+  while (std::getline(line, field, ',')) ids.push_back(std::stoi(field));
+  return ids.empty() ? std::vector<int>{100} : ids;
+}
+}
+
+namespace pp2 {
+bool upload(Stats& stats, std::string& error) { return upload(stats, error, "fake"); }
+
+bool upload(Stats& stats, std::string&, const std::string&) {
+  stats.upload_sec = 0.01;
+  return true;
+}
+
+int eos_token_id() { return 248046; }
+
+bool decode_init(DecodeState& state, std::string& error) {
+  return decode_init(state, error, DecodeState::MAXL);
+}
+
+bool decode_init(DecodeState& state, std::string& error, int capacity) {
+  if (std::getenv("FAKE_INIT_FAIL")) {
+    error = "forced mock init failure";
+    return false;
+  }
+  if (capacity < 1 || capacity > DecodeState::MAX_CONTEXT) {
+    error = "bad PP2 mock context";
+    return false;
+  }
+  if (state.inited) {
+    error = "mock double-initialization of the same PP2 state";
+    return false;
+  }
+  state.capacity = capacity;
+  state.inited = true;
+  trace("open", capacity);
+  return true;
+}
+
+std::vector<float> decode_step(int, DecodeState& state, long position,
+                               std::string& error) {
+  if (!state.inited || position < 0 || position >= state.capacity) {
+    error = "mock state not initialized or position out of capacity";
+    return {};
+  }
+  trace("step", position);
+  if (std::getenv("FAKE_DECODE_FAIL_ONCE") && !decode_failed_once.exchange(true)) {
+    error = "forced mock decode failure";
+    return {};
+  }
+  static const std::vector<int> ids = fake_ids();
+  const int token = ids[std::min(static_cast<std::size_t>(position), ids.size() - 1)];
+  if (token < 0 || token >= 248320) {
+    error = "invalid mock token";
+    return {};
+  }
+  std::vector<float> logits(248320, -100.0f);
+  logits[static_cast<std::size_t>(token)] = 100.0f;
+  const int delay = env_integer("FAKE_STEP_MS", 8);
+  if (delay > 0) std::this_thread::sleep_for(std::chrono::milliseconds(delay));
+  return logits;
+}
+
+void decode_free(DecodeState& state) {
+  if (!state.inited) return;
+  state.inited = false;
+  trace("close");
+}
+
+void free_all() {}
+}
+
+namespace pp2batch {
+void vram_used(size_t& gpu0_mib, size_t& gpu1_mib) {
+  gpu0_mib = gpu1_mib = static_cast<size_t>(env_integer("FAKE_GPU_USED_MIB"));
+}
+}

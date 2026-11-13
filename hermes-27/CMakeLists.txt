@@ -8,6 +8,7 @@ option(HERMES_BUILD_EXACT_PREFILL_BENCH "Build isolated BF16-exact NVFP4 prefill
 option(HERMES_BUILD_MTP_GENERATOR "Build verified greedy MTP diagnostic CLI (not a speculative speedup path)" OFF)
 option(HERMES_BUILD_W4A4_PROTOTYPE "Build unapproved CUTLASS NVFP4 activation-requantizing W4A4 prototype" OFF)
 option(HERMES_BUILD_REAL_GEMV_ORACLE "Build real GGUF same-X/W Scalar/Warp4/Packed4 oracle (GPU execution manual only)" OFF)
+option(HERMES_BUILD_REAL_PREFILL_TEST "Build real GGUF batched prefill state/cache/continuation gate (GPU execution manual only)" OFF)
 option(HERMES_REGISTER_GPU_TESTS "Register CUDA tests in CTest (run ONLY during exclusive GPU maintenance)" OFF)
 option(HERMES_REGISTER_HEAVY_CPU_TESTS "Register full-GGUF CPU reference tests (up to ~20min each)" OFF)
 option(HERMES_REGISTER_EXTERNAL_FIXTURE_TESTS "Register CPU GDN test requiring /tmp/gdn_tiny.bin fixture" OFF)
@@ -36,7 +37,9 @@ if(Python3_Interpreter_FOUND)
     COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_SOURCE_DIR}/tests/reliability_selftest.py)
   add_test(NAME async_stream_contract_cpu
     COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_SOURCE_DIR}/distributed/test_async_stream_contract.py)
-  set_tests_properties(logit_comparator_cpu release_harness_cpu async_stream_contract_cpu
+  add_test(NAME prefill_integration_contract_cpu
+    COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_SOURCE_DIR}/distributed/test_prefill_integration_contract.py)
+  set_tests_properties(logit_comparator_cpu release_harness_cpu async_stream_contract_cpu prefill_integration_contract_cpu
     PROPERTIES TIMEOUT 60)
 endif()
 add_executable(test_gguf_synth model/tests/test_gguf_synth.cpp)
@@ -198,6 +201,13 @@ set_target_properties(hermes_pp2 PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 target_link_libraries(hermes_pp2 PUBLIC hermes_gguf hermes_kernels)
 target_compile_definitions(hermes_pp2 PRIVATE
   HERMES_HAVE_W4A4=$<BOOL:${HERMES_BUILD_W4A4_PROTOTYPE}>)
+if(HERMES_BUILD_REAL_PREFILL_TEST)
+  add_executable(test_prefill_integration_real distributed/test_prefill_integration_real.cu)
+  target_include_directories(test_prefill_integration_real PRIVATE distributed)
+  target_link_libraries(test_prefill_integration_real PRIVATE
+    hermes_pp2 hermes_kernels hermes_gguf CUDA::cublas Threads::Threads)
+  # Not registered with CTest: an explicit prime-owned GPU window is required.
+endif()
 add_executable(hermes_generate tools/hermes_generate.cpp)
 target_link_libraries(hermes_generate PRIVATE hermes_pp2)
 add_dependencies(hermes_generate gguf_dump)

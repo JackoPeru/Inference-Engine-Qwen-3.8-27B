@@ -253,7 +253,8 @@ SubmitResult ContinuousScheduler::enqueue(ScheduledRequest request,
     ++counters_.rejected_total;
     return {SubmitCode::invalid, "invalid id, prompt, token, or context capacity"};
   };
-  if (request.id.empty() || request.prompt.empty() || request.max_new_tokens < 1 ||
+  if (request.id.empty() || request.id.size() > 128 ||
+      request.prompt.empty() || request.max_new_tokens < 1 ||
       request.prompt.size() > static_cast<size_t>(config_.max_context) ||
       static_cast<size_t>(request.max_new_tokens - 1) >
           static_cast<size_t>(config_.max_context) - request.prompt.size() ||
@@ -338,6 +339,7 @@ bool ContinuousScheduler::retire(const std::string& id) {
 SchedulerMetrics ContinuousScheduler::metrics() const {
   std::lock_guard<std::mutex> guard(mutex_);
   SchedulerMetrics result = counters_;
+  result.stopping = stopping_;
   result.active = running_.size();
   result.queued = waiting_.size();
   result.retained = jobs_.size();
@@ -405,12 +407,13 @@ void ContinuousScheduler::expire_waiting(SchedulerClock::time_point now) {
   for (const auto& job : expired) finish(job, JobStatus::expired, "queue timeout");
 }
 
-void ContinuousScheduler::promote() {
+void ContinuousScheduler::promote(std::size_t& remaining_admissions) {
   for (;;) {
     std::shared_ptr<Job> job;
     {
       std::lock_guard<std::mutex> guard(mutex_);
-      if (stopping_ || waiting_.empty() || running_.size() >= config_.max_active)
+      if (stopping_ || remaining_admissions == 0 || waiting_.empty() ||
+          running_.size() >= config_.max_active)
         return;
       // FIFO prevents a large request from being overtaken indefinitely. The
       // head stays queued when active allocations cannot fit its FP32 state.
@@ -422,6 +425,7 @@ void ContinuousScheduler::promote() {
       std::string detail;
       if (!admit_mixed(capacities, detail)) return;
       waiting_.pop_front();
+      --remaining_admissions; // includes failed opens, avoiding retry storms
     }
 
     void* state = nullptr;
@@ -456,6 +460,7 @@ void ContinuousScheduler::promote() {
       }
     }
     if (cancelled) finish(job, JobStatus::cancelled);
+    else emit_event(job, EventKind::admitted);
   }
 }
 
@@ -473,11 +478,18 @@ std::size_t ContinuousScheduler::tick(SchedulerClock::time_point now) {
     if (stopping_) return 0;
   }
   std::size_t decoded = 0;
+  // Event callbacks may enqueue replacement requests for a failed allocation;
+  // bound total state-open attempts in the entire tick, including failures.
+  std::size_t remaining_admissions = 16;
   // Skipping cancelled slots must not consume the decode fairness quantum.
   std::size_t skipped = 0;
   while (decoded < config_.steps_per_tick && skipped <= config_.max_active) {
+    {
+      std::lock_guard<std::mutex> guard(mutex_);
+      if (stopping_) break; // shutdown can flag stop while a GPU step runs
+    }
     expire_waiting(effective_now());
-    promote();
+    promote(remaining_admissions);
     std::shared_ptr<Job> job;
     {
       std::lock_guard<std::mutex> guard(mutex_);
@@ -568,12 +580,20 @@ std::size_t ContinuousScheduler::tick(SchedulerClock::time_point now) {
 }
 
 void ContinuousScheduler::shutdown() {
+  // Fail closed promptly while the pump is blocked on a noninterruptible
+  // CUDA step: prevent new enqueue and flag active requests before joining.
+  {
+    std::lock_guard<std::mutex> guard(mutex_);
+    stopping_ = true;
+    for (const auto& job : waiting_) job->cancel_requested = true;
+    for (const auto& job : running_) job->cancel_requested = true;
+    // One opening request may have been popped from waiting_, but promote()
+    // checks stopping_ after its GPU allocation and releases that state.
+  }
   std::lock_guard<std::mutex> pump(pump_mutex_);
   std::vector<std::shared_ptr<Job>> jobs;
   {
     std::lock_guard<std::mutex> guard(mutex_);
-    if (stopping_) return;
-    stopping_ = true;
     jobs.insert(jobs.end(), waiting_.begin(), waiting_.end());
     jobs.insert(jobs.end(), running_.begin(), running_.end());
   }

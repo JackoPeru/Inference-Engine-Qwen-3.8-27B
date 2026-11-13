@@ -65,6 +65,7 @@ struct Config {
   int queue_timeout_sec = 60;
   int gpu0_start_limit_mib = 2000;
   int gpu1_start_limit_mib = 2500;
+  bool continuous_scheduler = false; // Experimental opt-in; legacy is default.
 };
 
 void usage(FILE* out) {
@@ -72,6 +73,7 @@ void usage(FILE* out) {
     "Usage: hermes_server --model FILE.gguf [--host 127.0.0.1] [--port 0] "
     "[--active 1..16] [--queue 1..32] [--context 1..8192] [--api-key KEY | --api-key-file FILE]\n"
     "Optional: --tokenizer FILE --gguf-dump FILE --python FILE --model-id ID\n"
+    "Experimental: --continuous-scheduler (single-owner PP2 scheduler, opt-in)\n"
     "Greedy text-only PP2; context defaults to 128. Unsupported sampling/tools are rejected.\n");
 }
 
@@ -89,6 +91,7 @@ bool parse_args(int argc, char** argv, Config& cfg, bool& show_help) {
   for (int i = 1; i < argc; ++i) {
     std::string arg = argv[i];
     if (arg == "--help" || arg == "-h") { usage(stdout); show_help = true; return false; }
+    if (arg == "--continuous-scheduler") { cfg.continuous_scheduler = true; continue; }
     if (i + 1 >= argc) { std::fprintf(stderr, "missing value for %s\n", arg.c_str()); return false; }
     const char* value = argv[++i];
     if (arg == "--model") cfg.model = value;
@@ -303,6 +306,7 @@ struct Job {
   std::vector<std::string> stops;
   std::size_t sent_bytes = 0;
   std::string error;
+  std::string callback_error; // Opt-in scheduler: fail closed after tokenizer error.
   json response;
   bool stream = false;
   bool include_usage = false;
@@ -323,16 +327,92 @@ struct Job {
   std::size_t stream_buffered_bytes = 0;
 };
 
+#ifndef HERMES_ADMISSION_CPU_ONLY
+// The production adapter is defined by worker-6 and exclusively owns each
+// PP2 DecodeState via ContinuousScheduler::StepBackend open/close.
+using ServerContinuousBackend = pp2batch::PP2StepBackend;
+#else
+// CPU-only build of the real HTTP server with the no-CUDA fake PP2 runtime.
+// This adapter is deliberately unavailable to the production CMake target.
+class ServerContinuousBackend final : public pp2batch::StepBackend {
+ public:
+  bool open(int capacity, void*& state, std::string& error) override {
+    state = nullptr;
+    // Mirror the production adapter's live-VRAM fail-closed preflight; the
+    // CPU fake exposes usage via FAKE_GPU_USED_MIB (no CUDA calls).
+    size_t used0 = 0, used1 = 0;
+    pp2batch::vram_used(used0, used1);
+    const size_t need_mib = 96 + (static_cast<size_t>(capacity) * 64 + 1023) / 1024;
+    if (used0 + need_mib > 15360 || used1 + need_mib > 15360) {
+      error = "live VRAM preflight rejected PP2 state on GPU0 (CPU mock)";
+      return false;
+    }
+    auto candidate = std::make_unique<pp2::DecodeState>();
+    if (!pp2::decode_init(*candidate, error, capacity)) {
+      pp2::decode_free(*candidate);
+      return false;
+    }
+    state = candidate.release();
+    return true;
+  }
+  bool step(void* state, int token, long position,
+            std::vector<float>& logits, std::string& error) override {
+    logits = pp2::decode_step(token, *static_cast<pp2::DecodeState*>(state),
+                              position, error);
+    return !logits.empty();
+  }
+  void close(void* state) noexcept override {
+    if (!state) return;
+    auto* decoder = static_cast<pp2::DecodeState*>(state);
+    pp2::decode_free(*decoder);
+    delete decoder;
+  }
+};
+#endif
+
 class Scheduler {
  public:
   Scheduler(TokenizerBridge& tokenizer, int eos, const Config& cfg)
       : tokenizer_(tokenizer), eos_(eos), active_limit_(cfg.active), queue_limit_(cfg.queued),
-        queue_timeout_(cfg.queue_timeout_sec), worker_(&Scheduler::run, this) {}
+        queue_timeout_(cfg.queue_timeout_sec) {
+    if (cfg.continuous_scheduler) {
+      backend_ = std::make_unique<ServerContinuousBackend>();
+      pp2batch::SchedulerConfig options;
+      options.max_active = static_cast<std::size_t>(cfg.active);
+      options.max_queued = static_cast<std::size_t>(cfg.queued);
+      options.max_context = cfg.context;
+      options.eos_token_id = eos;
+      options.vocab_size = kVocab;
+      options.steps_per_tick = static_cast<std::size_t>(cfg.active);
+      options.queue_timeout = std::chrono::seconds(cfg.queue_timeout_sec);
+      options.max_retained = 64;
+      options.on_event = [this](const pp2batch::SchedulerEvent& event) {
+        continuous_event(event);
+      };
+      continuous_ = std::make_unique<pp2batch::ContinuousScheduler>(options, *backend_);
+    }
+    worker_ = std::thread(&Scheduler::run, this);
+  }
 
   ~Scheduler() { stop(); }
 
   bool enqueue(const std::shared_ptr<Job>& job) {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (continuous_) {
+      if (stopping_) return false;
+      jobs_[job->id] = job;
+      auto result = continuous_->enqueue({job->id, job->prompt, job->max_new_tokens});
+      if (result.code != pp2batch::SubmitCode::accepted) {
+        jobs_.erase(job->id);
+        return false;
+      }
+      job->queued_at = Clock::now();
+      if (job->stream) push_stream_locked(*job, chunk(*job, {{"role", "assistant"}}, nullptr));
+      metrics_.accepted.fetch_add(1);
+      metrics_.prompt_tokens.fetch_add(job->prompt.size());
+      cv_.notify_all();
+      return true;
+    }
     if (stopping_ || static_cast<int>(queue_.size()) >= queue_limit_) return false;
     job->queued_at = Clock::now();
     jobs_[job->id] = job;
@@ -345,6 +425,11 @@ class Scheduler {
   }
 
   bool cancel(const std::string& id) {
+    if (continuous_) {
+      // A queued cancellation synchronously emits a terminal callback.
+      // Do not hold the HTTP jobs mutex across continuous_->cancel().
+      return continuous_->cancel(id);
+    }
     std::lock_guard<std::mutex> lock(mutex_);
     auto it = jobs_.find(id);
     if (it == jobs_.end()) return false;
@@ -359,6 +444,7 @@ class Scheduler {
   void retire(const std::string& id) {
     std::lock_guard<std::mutex> lock(mutex_);
     jobs_.erase(id);
+    if (continuous_) continuous_->retire(id);
   }
 
   void rejected() { metrics_.rejected.fetch_add(1); }
@@ -368,7 +454,12 @@ class Scheduler {
     std::size_t queued = 0, active = 0;
     {
       std::lock_guard<std::mutex> lock(mutex_);
-      queued = queue_.size(); active = active_.size();
+      if (!continuous_) { queued = queue_.size(); active = active_.size(); }
+    }
+    if (continuous_) {
+      const auto current = continuous_->metrics();
+      queued = current.queued;
+      active = current.active;
     }
     size_t used0 = 0, used1 = 0;
     pp2batch::vram_used(used0, used1);
@@ -397,14 +488,135 @@ class Scheduler {
       std::lock_guard<std::mutex> lock(mutex_);
       if (stopping_) return;
       stopping_ = true;
-      for (auto& job : queue_) job->cancel.store(true);
-      for (auto& job : active_) job->cancel.store(true);
+      if (!continuous_) {
+        for (auto& job : queue_) job->cancel.store(true);
+        for (auto& job : active_) job->cancel.store(true);
+      }
     }
     cv_.notify_all();
     if (worker_.joinable()) worker_.join();
+    if (continuous_) continuous_->shutdown();
   }
 
  private:
+  void continuous_event(const pp2batch::SchedulerEvent& event) {
+    std::shared_ptr<Job> job;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      const auto found = jobs_.find(event.id);
+      if (found != jobs_.end()) job = found->second.lock();
+    }
+    if (!job) {
+      // A retired/disconnected client cannot retain a live PP2 state.
+      if (event.kind != pp2batch::EventKind::terminal) continuous_->cancel(event.id);
+      return;
+    }
+    if (event.kind == pp2batch::EventKind::admitted) {
+      if (job->cancel.load()) { continuous_->cancel(event.id); return; }
+      // The PP2 state is already allocated exclusively by ContinuousScheduler.
+      // Initialize tokenizer state before releasing HTTP 200/SSE headers.
+      if ((job->stream || !job->stops.empty()) && tokenizer_.incremental_supported()) {
+        try {
+          tokenizer_.stream_start(job->id);
+          job->stream_started = true;
+        } catch (const std::exception& e) {
+          job->callback_error = std::string("incremental decoder startup failed: ") + e.what();
+          continuous_->cancel(job->id);
+          return;
+        }
+      }
+      {
+        std::lock_guard<std::mutex> lock(job->mutex);
+        job->admitted = true;
+        job->cv.notify_all();
+      }
+      return;
+    }
+    if (event.kind == pp2batch::EventKind::token) {
+      if (job->done.load()) return;
+      job->prompt_pos = event.prompt_consumed;
+      job->output.push_back(event.token_id);
+      try {
+        if (job->stream_started) {
+          const std::string delta = tokenizer_.stream_push(job->id, event.token_id);
+          if (job->stops.empty()) job->text += delta;
+          else {
+            job->decoded_text += delta;
+            update_visible_text(*job, false);
+          }
+          stream_text(job);
+        } else if (!job->stops.empty()) {
+          // Non-ByteLevel fallback: do not emit provisional SSE prefixes.
+          job->decoded_text = tokenizer_.decode(job->output);
+          update_visible_text(*job, false);
+        }
+      } catch (const std::exception& e) {
+        job->callback_error = std::string("tokenization failed: ") + e.what();
+        continuous_->cancel(job->id);
+        return;
+      }
+      if (job->stop_matched || job->cancel.load()) continuous_->cancel(job->id);
+      return;
+    }
+    // Terminal event occurs exactly once, after ContinuousScheduler has
+    // released the privately owned DecodeState. There is no second free.
+    if (job->done.load()) return;
+    if (job->output != event.generated && job->callback_error.empty())
+      job->callback_error = "continuous scheduler token/event sequence mismatch";
+    int status = 200;
+    std::string error;
+    std::string reason = "length";
+    if (!job->callback_error.empty()) {
+      status = 500;
+      error = job->callback_error;
+    } else if (event.status == pp2batch::JobStatus::failed) {
+      // Capacity refusal is retriable (429); initialization failure is 503.
+      // Preserve the legacy HTTP classification without allocating a second
+      // state or introducing a second GPU-admission queue.
+      const bool vram_limit = event.error.find("live VRAM preflight rejected") != std::string::npos;
+      status = vram_limit ? 429 : (job->admitted ? 500 : 503);
+      error = event.error.empty() ? "PP2 scheduler request failed" : event.error;
+    } else if (event.status == pp2batch::JobStatus::expired) {
+      status = 429;
+      error = "request queue timeout; retry later";
+    } else if (event.status == pp2batch::JobStatus::cancelled) {
+      if (job->stop_matched) {
+        reason = "stop";
+      } else {
+        bool expected = false;
+        if (job->cancel.compare_exchange_strong(expected, true))
+          metrics_.cancelled.fetch_add(1);
+        reason = "cancelled";
+      }
+    } else if (event.status == pp2batch::JobStatus::completed) {
+      reason = !job->output.empty() && job->output.back() == eos_ ? "stop" : "length";
+    } else {
+      status = 500;
+      error = "continuous scheduler emitted invalid terminal status";
+    }
+    if (status == 429 || (status == 503 && !job->admitted))
+      metrics_.rejected.fetch_add(1);
+    complete(job, status, std::move(error), reason);
+  }
+
+  void run_continuous() {
+    for (;;) {
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (stopping_) break;
+      }
+      // One pump, one owner for prompt consumption, logit selection and PP2
+      // state. Never enter the legacy queue_/active_ decode loop here.
+      continuous_->tick();
+      const auto occupancy = continuous_->metrics();
+      if (occupancy.queued == 0 && occupancy.active == 0) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        if (stopping_) break;
+        cv_.wait_for(lock, std::chrono::milliseconds(25));
+      }
+    }
+  }
+
   static void update_visible_text(Job& job, bool final) {
     if (job.stop_matched) return;
     if (job.stops.empty()) return;
@@ -588,6 +800,7 @@ class Scheduler {
   }
 
   void run() {
+    if (continuous_) { run_continuous(); return; }
     for (;;) {
       std::vector<std::shared_ptr<Job>> expired, start;
       bool should_stop = false;
@@ -756,6 +969,8 @@ class Scheduler {
   std::unordered_map<std::string, std::weak_ptr<Job>> jobs_;
   bool stopping_ = false;
   Metrics metrics_;
+  std::unique_ptr<pp2batch::StepBackend> backend_;
+  std::unique_ptr<pp2batch::ContinuousScheduler> continuous_;
   std::thread worker_;
 };
 

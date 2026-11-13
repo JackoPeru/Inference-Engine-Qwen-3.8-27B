@@ -11,7 +11,8 @@ TOKENIZER="${HERMES_TEST_TOKENIZER:-/opt/hermes/models/Qwen3.8-27B-Uncensored-EX
 PYTHON="${HERMES_TEST_PYTHON:-/opt/hermes/runtimes/exllamav3-venv/bin/python}"
 PORT="${HERMES_TEST_PORT:-18127}"
 MODE="${HERMES_TEST_MODE:-async}"
-LOG="${ROOT}/http-smoke-${MODE}.log"
+SCHEDULER="${HERMES_TEST_SCHEDULER:-legacy}"
+LOG="${ROOT}/http-smoke-${MODE}-${SCHEDULER}.log"
 SERVER_PID=""
 
 for file in "${BUILD}/hermes_server" "${BUILD}/gguf_dump" "${SOURCE}/serving/tokenizer_bridge.py" "${SOURCE}/serving/smoke.py" "${MODEL}" "${TOKENIZER}" "${PYTHON}"; do
@@ -26,6 +27,10 @@ if [[ "$PORT" != "18127" ]]; then
 fi
 if [[ "$MODE" != "async" && "$MODE" != "legacy" ]]; then
   echo "BLOCKED: HERMES_TEST_MODE must be async or legacy" >&2
+  exit 77
+fi
+if [[ "$SCHEDULER" != "continuous" && "$SCHEDULER" != "legacy" ]]; then
+  echo "BLOCKED: HERMES_TEST_SCHEDULER must be continuous or legacy" >&2
   exit 77
 fi
 if ss -ltnH "( sport = :${PORT} )" | grep -q .; then
@@ -57,6 +62,10 @@ if [[ "$MODE" == "async" ]]; then
 else
   unset HERMES_PP2_ASYNC_STREAMS || true
 fi
+scheduler_args=()
+if [[ "$SCHEDULER" == "continuous" ]]; then
+  scheduler_args+=(--continuous-scheduler)
+fi
 
 cleanup() {
   if [[ -n "$SERVER_PID" ]]; then
@@ -74,6 +83,7 @@ timeout --signal=TERM --kill-after=10 240 "${BUILD}/hermes_server" \
   --model "$MODEL" --tokenizer "$TOKENIZER" \
   --gguf-dump "${BUILD}/gguf_dump" --python "$PYTHON" \
   --host 127.0.0.1 --port "$PORT" --context 256 --active 4 --queue 32 \
+  "${scheduler_args[@]}" \
   >"$LOG" 2>&1 &
 SERVER_PID=$!
 
@@ -93,10 +103,10 @@ if [[ "$ready" != 1 ]]; then
   tail -n 40 "$LOG" >&2
   exit 1
 fi
-echo "SCRATCH SERVER READY mode=$MODE port=$PORT"
+echo "SCRATCH SERVER READY mode=$MODE scheduler=$SCHEDULER port=$PORT"
 timeout --signal=TERM --kill-after=10 175 "$PYTHON" -B "${SOURCE}/serving/smoke.py" \
   --base-url "http://127.0.0.1:${PORT}" --model hermes-27
-echo "SCRATCH HTTP GPU SMOKE: PASS mode=$MODE"
+echo "SCRATCH HTTP GPU SMOKE: PASS mode=$MODE scheduler=$SCHEDULER"
 if [[ "${HERMES_TEST_LOAD:-0}" == 1 ]]; then
   if [[ "${HERMES_TEST_LOAD_STYLE:-arithmetic}" == "explain" ]]; then
     timeout --signal=TERM --kill-after=10 175 "$PYTHON" -B "${SOURCE}/scripts/scratch_http_load.py" \
@@ -107,5 +117,5 @@ if [[ "${HERMES_TEST_LOAD:-0}" == 1 ]]; then
       --base-url "http://127.0.0.1:${PORT}" --clients 1 2 4 8 --rounds 2 \
       --max-tokens 8 --prompt-style arithmetic
   fi
-  echo "SCRATCH HTTP CONCURRENCY: PASS mode=$MODE"
+  echo "SCRATCH HTTP CONCURRENCY: PASS mode=$MODE scheduler=$SCHEDULER"
 fi

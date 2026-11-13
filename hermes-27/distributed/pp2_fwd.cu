@@ -7,6 +7,7 @@
 #include "hermes/rmsnorm.hpp"
 #include "hermes/nvfp4_gemv.hpp"
 #include "hermes/nvfp4_gemv_warp_variants.hpp"
+#include "hermes/nvfp4_prefill_exact.hpp"
 #include "hermes/head_bf16_optimized.hpp"
 #include "hermes/nvfp4_gemm.hpp"
 #include "hermes/gdn_step.hpp"
@@ -22,6 +23,8 @@
 #include <string>
 #include <mutex>
 #include <new>
+#include <stdexcept>
+#include <limits>
 
 using namespace hermes;
 
@@ -265,8 +268,76 @@ static WEntry* find_w(const std::string& n){
   return nullptr;
 }
 static thread_local cudaError_t g_async_gemv_error=cudaSuccess;
+
+// Only set while an EXPLICIT seeded-prefill request is executing on this
+// host thread. The regular prefill(), decode_step() and other users keep the
+// existing raw-GGUF GEMV dispatch exactly as before.
+struct PrefillBF16ProjectionScope {
+  // Worker-2's stream/event-safe tiled scratch: 8 MiB per GPU instead of a
+  // full 170 MiB BF16 copy of the largest matrix. The helper owns one private
+  // cuBLAS handle/event per device and enqueues correctly ordered tiles.
+  static constexpr size_t weight_capacity=8ULL*1024*1024;
+  void* unpacked[2]={nullptr,nullptr};
+  hermes::prefill_exact::ReusableBF16WeightScratch slot[2];
+  bool initialize(std::string& err){
+    for(int dev=0;dev<2;++dev){
+      cudaError_t e=cudaSetDevice(dev);
+      if(e!=cudaSuccess){err="BF16 select device: "+std::string(cudaGetErrorString(e));return false;}
+      size_t free_bytes=0,total_bytes=0;
+      e=cudaMemGetInfo(&free_bytes,&total_bytes);
+      const size_t reserve=512ULL*1024*1024; // preserve room for T64 logits+workspace
+      if(e!=cudaSuccess || free_bytes<weight_capacity+reserve){
+        err="BF16 prefill fail-closed VRAM GPU"+std::to_string(dev)+
+            " free="+std::to_string(free_bytes)+
+            " required="+std::to_string(weight_capacity+reserve);
+        return false;
+      }
+      e=cudaMalloc((void**)&unpacked[dev],weight_capacity);
+      if(e!=cudaSuccess){err="BF16 weight scratch CUDA malloc: "+std::string(cudaGetErrorString(e));return false;}
+      auto status=slot[dev].init(unpacked[dev],weight_capacity);
+      if(!status.ok()){
+        err="BF16 scratch init GPU"+std::to_string(dev)+" code="+
+            std::to_string((int)status.code)+" cuda="+
+            cudaGetErrorString(status.cuda_error)+" cublas="+
+            std::to_string((int)status.blas_error);
+        return false;
+      }
+    }
+    return true;
+  }
+  void gemm(const uint16_t* x,const uint8_t* w,float* y,int T,int N,int K){
+    int dev=-1;
+    cudaError_t e=cudaGetDevice(&dev);
+    if(e!=cudaSuccess || dev<0 || dev>1 ||
+       !hermes::prefill_exact::bf16_weight_scratch_bytes(N,K) ||
+       !unpacked[dev]){
+      throw std::runtime_error("BF16 prefill GEMM invalid GPU/buffer/matrix");
+    }
+    auto status=slot[dev].enqueue(w,x,y,T,N,K,0);
+    if(!status.ok())
+      throw std::runtime_error("BF16 tiled GGUF GEMM enqueue GPU"+
+        std::to_string(dev)+" code="+std::to_string((int)status.code)+
+        " cuda="+cudaGetErrorString(status.cuda_error)+
+        " cublas="+std::to_string((int)status.blas_error));
+  }
+  ~PrefillBF16ProjectionScope(){
+    for(int dev=0;dev<2;++dev){
+      (void)cudaSetDevice(dev);
+      (void)slot[dev].shutdown(); // drain worker-2 event BEFORE free
+      if(unpacked[dev]) (void)cudaFree(unpacked[dev]);
+    }
+  }
+};
+static thread_local PrefillBF16ProjectionScope* g_prefill_bf16_scope=nullptr;
+
 static void gemv_batch(const uint16_t* d_in, const uint8_t* d_W, float* d_out, int H, int N, int T,
                        cudaStream_t stream=0){
+  if(g_prefill_bf16_scope){
+    if(T<1||T>64||stream!=0)
+      throw std::runtime_error("BF16 prefill batch only supports T<=64 default stream");
+    g_prefill_bf16_scope->gemm(d_in,d_W,d_out,T,N,H);
+    return;
+  }
   // Experimental CUDA GEMV A/B. No weights are repacked and the validated
   // scalar implementation stays default. The new packed4 path is opt-in.
   // Read only once per process; changing the flag requires a restart.
@@ -311,7 +382,39 @@ static bool use_head_bf16_warp(){
   return enabled;
 }
 
-static bool run_gdn_layer(int li, float* d_x, int T, std::string& err){
+// Retain the exact original buffer layouts, but validate every CUDA
+// allocation and drain/free all partially allocated scratch on failure.
+// A DecodeState's recurrent S/KV remains externally owned.
+struct PrefillLayerScratch {
+  std::vector<void*> buffers;
+  template<class P> bool alloc(P*& p, size_t bytes, std::string& err){
+    cudaError_t rc=cudaMalloc((void**)&p,bytes);
+    if(rc!=cudaSuccess){
+      err="prefill CUDA allocation "+std::to_string(bytes)+": "+cudaGetErrorString(rc);
+      return false;
+    }
+    buffers.push_back(p);
+    return true;
+  }
+  ~PrefillLayerScratch(){
+    // cudaFree synchronizes work using scratch before releasing memory.
+    for(void* p:buffers) (void)cudaFree(p);
+  }
+};
+
+// S[k] is the post-token GDN recurrent tensor; conv_state is the last three
+// *pre-convolution* QKV tokens, matching conv_decode_k's shifting queue.
+__global__ void seed_conv_tail_k(float* conv_state,const float* qkv,int T,int C){
+  const int c=int(blockIdx.x*blockDim.x+threadIdx.x);
+  if(c>=C)return;
+  for(int j=0;j<3;++j){
+    int t=T-3+j;
+    conv_state[(size_t)c*3+j]=(t<0)?0.f:qkv[(size_t)t*C+c];
+  }
+}
+
+static bool run_gdn_layer(int li, float* d_x, int T, std::string& err,
+                          DecodeState* seed=nullptr){
   char Pb[16]; snprintf(Pb,16,"blk.%d.",li); std::string P=Pb;
   WEntry *wNorm=find_w(P+"attn_norm.weight"), *wQkv=find_w(P+"attn_qkv.weight"),
          *wGate=find_w(P+"attn_gate.weight"), *wBeta=find_w(P+"ssm_beta.weight"),
@@ -326,21 +429,33 @@ static bool run_gdn_layer(int li, float* d_x, int T, std::string& err){
         *d_be=nullptr, *d_gl=nullptr, *d_q=nullptr, *d_k=nullptr, *d_v=nullptr, *d_o=nullptr,
         *d_S=nullptr, *d_g=nullptr, *d_core=nullptr, *d_gg=nullptr, *d_uu=nullptr, *d_hid=nullptr, *d_down=nullptr;
   uint16_t *d_hb=nullptr, *d_h2b=nullptr, *d_gb=nullptr, *d_hidb=nullptr;
-  cudaMalloc(&d_h,nH*4); cudaMalloc(&d_hb,nH*2);
-  cudaMalloc(&d_qkv,(size_t)T*CC*4); cudaMalloc(&d_cv,(size_t)T*CC*4);
-  cudaMalloc(&d_zl,(size_t)T*VDD*4); cudaMalloc(&d_b,(size_t)T*HV*4); cudaMalloc(&d_ar,(size_t)T*HV*4);
-  cudaMalloc(&d_be,(size_t)T*HV*4); cudaMalloc(&d_gl,(size_t)T*HV*4);
-  cudaMalloc(&d_q,(size_t)T*HV*KHD*4); cudaMalloc(&d_k,(size_t)T*HV*KHD*4); cudaMalloc(&d_v,(size_t)T*HV*VHD*4);
-  cudaMalloc(&d_o,(size_t)T*HV*VHD*4); cudaMalloc(&d_S,(size_t)HV*KHD*VHD*4);
-  cudaMalloc(&d_g,(size_t)T*VDD*4); cudaMalloc(&d_core,nH*4);
-  cudaMalloc(&d_gg,(size_t)T*FFN*4); cudaMalloc(&d_uu,(size_t)T*FFN*4);
-  cudaMalloc(&d_hid,(size_t)T*FFN*4); cudaMalloc(&d_down,nH*4);
-  cudaMalloc(&d_h2b,nH*2); cudaMalloc(&d_gb,(size_t)T*VDD*2); cudaMalloc(&d_hidb,(size_t)T*FFN*2);
+  PrefillLayerScratch scratch;
+#define P_ALLOCF(ptr,bytes) do{ if(!scratch.alloc(ptr,(bytes),err)) return false; }while(0)
+  P_ALLOCF(d_h,nH*4); P_ALLOCF(d_hb,nH*2);
+  P_ALLOCF(d_qkv,(size_t)T*CC*4); P_ALLOCF(d_cv,(size_t)T*CC*4);
+  P_ALLOCF(d_zl,(size_t)T*VDD*4); P_ALLOCF(d_b,(size_t)T*HV*4); P_ALLOCF(d_ar,(size_t)T*HV*4);
+  P_ALLOCF(d_be,(size_t)T*HV*4); P_ALLOCF(d_gl,(size_t)T*HV*4);
+  P_ALLOCF(d_q,(size_t)T*HV*KHD*4); P_ALLOCF(d_k,(size_t)T*HV*KHD*4); P_ALLOCF(d_v,(size_t)T*HV*VHD*4);
+  P_ALLOCF(d_o,(size_t)T*HV*VHD*4);
+  if(seed){
+    d_S=seed->S[li];
+    if(!d_S || !seed->CS[li]){err="prefill seeded GDN buffers missing";return false;}
+  } else {
+    P_ALLOCF(d_S,(size_t)HV*KHD*VHD*4);
+  }
+  P_ALLOCF(d_g,(size_t)T*VDD*4); P_ALLOCF(d_core,nH*4);
+  P_ALLOCF(d_gg,(size_t)T*FFN*4); P_ALLOCF(d_uu,(size_t)T*FFN*4);
+  P_ALLOCF(d_hid,(size_t)T*FFN*4); P_ALLOCF(d_down,nH*4);
+  P_ALLOCF(d_h2b,nH*2); P_ALLOCF(d_gb,(size_t)T*VDD*2); P_ALLOCF(d_hidb,(size_t)T*FFN*2);
+#undef P_ALLOCF
   // 1 RMS
   rms_f32_k<<<T,512,(size_t)512*4>>>(d_h,d_x,(float*)wNorm->d,T,HID);
   f32_to_bf16_k<<<(int)((nH+255)/256),256>>>(d_hb,d_h,(int)nH);
   // 2 linears GEMV
   gemv_batch(d_hb,(uint8_t*)wQkv->d,d_qkv,HID,CC,T);
+  if(seed){
+    seed_conv_tail_k<<<(CC+255)/256,256>>>(seed->CS[li],d_qkv,T,CC);
+  }
   gemv_batch(d_hb,(uint8_t*)wGate->d,d_zl,HID,VDD,T);
   gemv_batch(d_hb,(uint8_t*)wBeta->d,d_b,HID,HV,T);
   wa_gemm_k<<<(int)((T*HV+255)/256),256>>>(d_h,(float*)wAlpha->d,d_ar,T,HV,HID);
@@ -357,7 +472,7 @@ static bool run_gdn_layer(int li, float* d_x, int T, std::string& err){
   // 6 norm qk
   qk_norm_scale_k<<<(T*HV),128>>>(d_q,d_k,T);
   // 7 gdn
-  cudaMemset(d_S,0,(size_t)HV*KHD*VHD*4);
+  if(!seed) cudaMemset(d_S,0,(size_t)HV*KHD*VHD*4);
   for(int t=0;t<T;++t) gdn_step_cuda(d_q+(size_t)t*HV*KHD,d_k+(size_t)t*HV*KHD,d_v+(size_t)t*HV*VHD,
     d_be+(size_t)t*HV,d_gl+(size_t)t*HV,d_S,d_o+(size_t)t*HV*VHD,HV,KHD,VHD);
   // 8 gated
@@ -383,15 +498,16 @@ static bool run_gdn_layer(int li, float* d_x, int T, std::string& err){
   f32_to_bf16_k<<<(int)(((size_t)T*FFN+255)/256),256>>>(d_hidb,d_hid,(int)((size_t)T*FFN));
   gemv_batch(d_hidb,(uint8_t*)wFd->d,d_down,FFN,HID,T);
   add_k<<<(int)((nH+255)/256),256>>>(d_x,d_down,(int)nH);
-  cudaDeviceSynchronize();
-  cudaFree(d_h);cudaFree(d_hb);cudaFree(d_qkv);cudaFree(d_cv);cudaFree(d_zl);cudaFree(d_b);cudaFree(d_ar);
-  cudaFree(d_be);cudaFree(d_gl);cudaFree(d_q);cudaFree(d_k);cudaFree(d_v);cudaFree(d_o);cudaFree(d_S);
-  cudaFree(d_g);cudaFree(d_core);cudaFree(d_gg);cudaFree(d_uu);cudaFree(d_hid);cudaFree(d_down);
-  cudaFree(d_h2b);cudaFree(d_gb);cudaFree(d_hidb);
+  cudaError_t layer_result=cudaDeviceSynchronize();
+  if(layer_result!=cudaSuccess){
+    err="GDN prefill layer "+std::to_string(li)+": "+cudaGetErrorString(layer_result);
+    return false;
+  }
   return true;
 }
 
-static bool run_full_layer(int li, float* d_x, int T, std::string& err){
+static bool run_full_layer(int li, float* d_x, int T, std::string& err,
+                           DecodeState* seed=nullptr){
   char Pb[16]; snprintf(Pb,16,"blk.%d.",li); std::string P=Pb;
   WEntry *wNorm=find_w(P+"attn_norm.weight"),
          *wQ=find_w(P+"attn_q.weight"), *wK=find_w(P+"attn_k.weight"), *wV=find_w(P+"attn_v.weight"),
@@ -405,14 +521,17 @@ static bool run_full_layer(int li, float* d_x, int T, std::string& err){
   float *d_h=nullptr,*d_qq=nullptr,*d_kk=nullptr,*d_vv=nullptr,*d_Q=nullptr,*d_K=nullptr,*d_V=nullptr,
         *d_att=nullptr,*d_G=nullptr,*d_core=nullptr,*d_gg=nullptr,*d_uu=nullptr,*d_hid=nullptr,*d_down=nullptr;
   uint16_t *d_hb=nullptr,*d_h2b=nullptr,*d_hidb=nullptr,*d_gb=nullptr;
-  cudaMalloc(&d_h,nH*4); cudaMalloc(&d_hb,nH*2);
-  cudaMalloc(&d_qq,(size_t)T*NQQ*4); cudaMalloc(&d_kk,(size_t)T*NKK*4); cudaMalloc(&d_vv,(size_t)T*NKK*4);
-  cudaMalloc(&d_Q,(size_t)T*NQHD*4); cudaMalloc(&d_K,(size_t)T*NKK*4); cudaMalloc(&d_V,(size_t)T*NKK*4);
-  cudaMalloc(&d_att,(size_t)T*NQHD*4); cudaMalloc(&d_G,(size_t)T*NQHD*4);
-  cudaMalloc(&d_core,nH*4);
-  cudaMalloc(&d_gg,(size_t)T*FFN*4); cudaMalloc(&d_uu,(size_t)T*FFN*4);
-  cudaMalloc(&d_hid,(size_t)T*FFN*4); cudaMalloc(&d_down,nH*4);
-  cudaMalloc(&d_h2b,nH*2); cudaMalloc(&d_hidb,(size_t)T*FFN*2); cudaMalloc(&d_gb,(size_t)T*NQHD*2);
+  PrefillLayerScratch scratch;
+#define P_ALLOCF(ptr,bytes) do{ if(!scratch.alloc(ptr,(bytes),err)) return false; }while(0)
+  P_ALLOCF(d_h,nH*4); P_ALLOCF(d_hb,nH*2);
+  P_ALLOCF(d_qq,(size_t)T*NQQ*4); P_ALLOCF(d_kk,(size_t)T*NKK*4); P_ALLOCF(d_vv,(size_t)T*NKK*4);
+  P_ALLOCF(d_Q,(size_t)T*NQHD*4); P_ALLOCF(d_K,(size_t)T*NKK*4); P_ALLOCF(d_V,(size_t)T*NKK*4);
+  P_ALLOCF(d_att,(size_t)T*NQHD*4); P_ALLOCF(d_G,(size_t)T*NQHD*4);
+  P_ALLOCF(d_core,nH*4);
+  P_ALLOCF(d_gg,(size_t)T*FFN*4); P_ALLOCF(d_uu,(size_t)T*FFN*4);
+  P_ALLOCF(d_hid,(size_t)T*FFN*4); P_ALLOCF(d_down,nH*4);
+  P_ALLOCF(d_h2b,nH*2); P_ALLOCF(d_hidb,(size_t)T*FFN*2); P_ALLOCF(d_gb,(size_t)T*NQHD*2);
+#undef P_ALLOCF
   rms_f32_k<<<T,512,(size_t)512*4>>>(d_h,d_x,(float*)wNorm->d,T,HID);
   f32_to_bf16_k<<<(int)((nH+255)/256),256>>>(d_hb,d_h,(int)nH);
   gemv_batch(d_hb,(uint8_t*)wQ->d,d_qq,HID,NQQ,T);
@@ -421,6 +540,15 @@ static bool run_full_layer(int li, float* d_x, int T, std::string& err){
   q_norm_rope_k<<<(T*NQ),256>>>(d_qq,(float*)wQn->d,d_Q,T);
   k_norm_rope_k<<<(T*NKV),256>>>(d_kk,(float*)wKn->d,d_K,T);
   cudaMemcpy(d_V,d_vv,(size_t)T*NKK*4,cudaMemcpyDeviceToDevice);
+  if(seed){
+    if(!seed->Kc[li] || !seed->Vc[li] || seed->capacity<T){
+      err="prefill full layer K/V cache missing or too short li="+std::to_string(li);
+      return false;
+    }
+    cudaError_t e=cudaMemcpy(seed->Kc[li],d_K,(size_t)T*NKK*4,cudaMemcpyDeviceToDevice);
+    if(e==cudaSuccess)e=cudaMemcpy(seed->Vc[li],d_V,(size_t)T*NKK*4,cudaMemcpyDeviceToDevice);
+    if(e!=cudaSuccess){err="prefill K/V seeding "+std::to_string(li)+": "+cudaGetErrorString(e);return false;}
+  }
   // G raw = second half of qqkv per head: qq[hd*512+256+d]
   // build G on GPU from d_qq
   // simple kernel inline: use gate path — extract via copy kernel
@@ -454,10 +582,12 @@ static bool run_full_layer(int li, float* d_x, int T, std::string& err){
   f32_to_bf16_k<<<(int)(((size_t)T*FFN+255)/256),256>>>(d_hidb,d_hid,(int)((size_t)T*FFN));
   gemv_batch(d_hidb,(uint8_t*)wFd->d,d_down,FFN,HID,T);
   add_k<<<(int)((nH+255)/256),256>>>(d_x,d_down,(int)nH);
-  cudaDeviceSynchronize();
-  cudaFree(d_h);cudaFree(d_hb);cudaFree(d_qq);cudaFree(d_kk);cudaFree(d_vv);
-  cudaFree(d_Q);cudaFree(d_K);cudaFree(d_V);cudaFree(d_att);cudaFree(d_G);cudaFree(d_core);
-  cudaFree(d_gg);cudaFree(d_uu);cudaFree(d_hid);cudaFree(d_down);cudaFree(d_h2b);cudaFree(d_hidb);cudaFree(d_gb);
+  cudaError_t layer_result=cudaDeviceSynchronize();
+  if(layer_result!=cudaSuccess){
+    err="full prefill layer "+std::to_string(li)+": "+cudaGetErrorString(layer_result);
+    return false;
+  }
+  if(seed) seed->klen[li]=T;
   return true;
 }
 
@@ -480,6 +610,7 @@ bool upload(Stats& st, std::string& err, const std::string& model_path){
   cudaSetDevice(1); cudaMemGetInfo(&f1,&tt1);
   st.free0_before=f0; st.free1_before=f1;
   // conversione 1 matrice (misura, non residente doppia)
+#if defined(HERMES_HAVE_W4A4) && HERMES_HAVE_W4A4
   {
     auto v=g_be.view("blk.0.attn_qkv.weight");
     int N=10240,K=5120;
@@ -494,6 +625,13 @@ bool upload(Stats& st, std::string& err, const std::string& model_path){
       N,K,sfa,sfb,st.convert_ms_one,Nvfp4GemmW4A4::backend_name());
     fflush(stdout);
   }
+#else
+  // The CUTLASS W4A4 research prototype may not be built in stable trees.
+  // PP2 inference uses resident raw GGUF GEMV; no conversion is required.
+  st.convert_ms_one=0;
+  printf("pp2 W4A4 conversion microbench disabled (HERMES_HAVE_W4A4=0)\n");
+  fflush(stdout);
+#endif
   size_t b0=0,b1=0;
   for(auto &t: gf.tensors){
     std::string n=t.name;
@@ -563,18 +701,54 @@ int eos_token_id(){
   return (int)it->second;
 }
 
-std::vector<float> prefill(const std::vector<int>& ids, Stats& st, std::string& err,
-                           std::vector<float>* h_last_out){
+struct PrefillFrameBuffers {
+  std::vector<std::pair<int,void*>> buffers;
+  template<class P> bool alloc(int dev, P*& ptr, size_t bytes, std::string& err){
+    cudaError_t e=cudaSetDevice(dev);
+    if(e==cudaSuccess)e=cudaMalloc((void**)&ptr,bytes);
+    if(e!=cudaSuccess){
+      err="prefill frame allocation GPU"+std::to_string(dev)+" "+std::to_string(bytes)+
+          ": "+cudaGetErrorString(e);
+      return false;
+    }
+    buffers.emplace_back(dev,ptr);
+    return true;
+  }
+  ~PrefillFrameBuffers(){
+    for(auto it=buffers.rbegin();it!=buffers.rend();++it){
+      (void)cudaSetDevice(it->first);
+      (void)cudaFree(it->second);
+    }
+  }
+};
+struct PrefillPinned {
+  float* ptr=nullptr;
+  ~PrefillPinned(){ if(ptr) (void)cudaFreeHost(ptr); }
+};
+
+static std::vector<float> prefill_impl(const std::vector<int>& ids, Stats& st,
+                                      std::string& err, std::vector<float>* h_last_out,
+                                      DecodeState* seed, bool private_staging){
   if(!g_up){ err="not uploaded"; return {}; }
   int T=(int)ids.size();
   if(T<=0||T>(int)PIN_TMAX){ err="bad T"; return {}; }
   auto tp0=std::chrono::high_resolution_clock::now();
   size_t nH=(size_t)T*HID;
+  PrefillFrameBuffers allocations;
+  PrefillPinned temporary_pinned;
+  float* stage=g_pinned;
+  if(private_staging){
+    cudaError_t pe=cudaHostAlloc((void**)&temporary_pinned.ptr,nH*sizeof(float),cudaHostAllocDefault);
+    if(pe!=cudaSuccess){err="prefill private pinned: "+std::string(cudaGetErrorString(pe));return {};}
+    stage=temporary_pinned.ptr;
+  }
+  if(!stage){err="prefill pinned staging not available";return {};}
   // GPU0
-  cudaSetDevice(0);
   int* d_ids=nullptr; float* d_x0=nullptr;
-  cudaMalloc(&d_ids,T*4); cudaMemcpy(d_ids,ids.data(),T*4,cudaMemcpyHostToDevice);
-  cudaMalloc(&d_x0,nH*4);
+  if(!allocations.alloc(0,d_ids,T*4,err) ||
+     !allocations.alloc(0,d_x0,nH*4,err)) return {};
+  cudaError_t copy_err=cudaMemcpy(d_ids,ids.data(),T*4,cudaMemcpyHostToDevice);
+  if(copy_err!=cudaSuccess){err="prefill token H2D: "+std::string(cudaGetErrorString(copy_err));return {};}
   {
     auto it=g_w0.find("token_embd.weight");
     if(it==g_w0.end()){ err="no emb"; return {}; }
@@ -583,7 +757,7 @@ std::vector<float> prefill(const std::vector<int>& ids, Stats& st, std::string& 
   }
   for(int li=0;li<=SPLIT_LAST0;++li){
     bool is_full=(li%4==3);
-    bool ok = is_full? run_full_layer(li,d_x0,T,err) : run_gdn_layer(li,d_x0,T,err);
+    bool ok = is_full? run_full_layer(li,d_x0,T,err,seed) : run_gdn_layer(li,d_x0,T,err,seed);
     if(!ok) return {};
     if(li%8==0||li==SPLIT_LAST0){
       std::vector<float> hx(nH); cudaMemcpy(hx.data(),d_x0,nH*4,cudaMemcpyDeviceToHost);
@@ -594,19 +768,28 @@ std::vector<float> prefill(const std::vector<int>& ids, Stats& st, std::string& 
   }
   // xfer GPU0->host->GPU1 pinned
   auto tx0=std::chrono::high_resolution_clock::now();
-  cudaMemcpy(g_pinned,d_x0,nH*4,cudaMemcpyDeviceToHost);
+  float* d_x1=nullptr;
+  if(!allocations.alloc(1,d_x1,nH*4,err)) return {};
+  // Regular prefill() still uses the shared g_pinned staging buffer:
+  // synchronize BOTH copies under the same mutex as legacy decode_step().
+  // The explicit seeded API has its own pinned allocation and skips the lock.
+  std::unique_lock<std::mutex> transfer_lock;
+  if(!private_staging) transfer_lock=std::unique_lock<std::mutex>(g_xfer_mu);
+  cudaSetDevice(0);
+  copy_err=cudaMemcpy(stage,d_x0,nH*4,cudaMemcpyDeviceToHost);
+  if(copy_err!=cudaSuccess){err="prefill boundary D2H: "+std::string(cudaGetErrorString(copy_err));return {};}
   cudaSetDevice(1);
-  float* d_x1=nullptr; cudaMalloc(&d_x1,nH*4);
-  cudaMemcpy(d_x1,g_pinned,nH*4,cudaMemcpyHostToDevice);
+  copy_err=cudaMemcpy(d_x1,stage,nH*4,cudaMemcpyHostToDevice);
+  if(copy_err!=cudaSuccess){err="prefill boundary H2D: "+std::string(cudaGetErrorString(copy_err));return {};}
+  if(transfer_lock.owns_lock()) transfer_lock.unlock();
   auto tx1=std::chrono::high_resolution_clock::now();
   st.xfer_ms=std::chrono::duration<double,std::milli>(tx1-tx0).count();
   printf("pp2 xfer T=%d bytes=%zu ms=%.3f (pinned host)\n",T,nH*4,st.xfer_ms); fflush(stdout);
-  cudaFree(d_ids); cudaFree(d_x0);
   // GPU1
   for(int li=SPLIT_LAST0+1;li<NL;++li){
     bool is_full=(li%4==3);
-    bool ok = is_full? run_full_layer(li,d_x1,T,err) : run_gdn_layer(li,d_x1,T,err);
-    if(!ok){ cudaFree(d_x1); return {}; }
+    bool ok = is_full? run_full_layer(li,d_x1,T,err,seed) : run_gdn_layer(li,d_x1,T,err,seed);
+    if(!ok) return {};
     if(li%8==0||li==NL-1){
       std::vector<float> hx(nH); cudaMemcpy(hx.data(),d_x1,nH*4,cudaMemcpyDeviceToHost);
       double m=0; for(auto v:hx)m+=v; m/=hx.size();
@@ -623,16 +806,18 @@ std::vector<float> prefill(const std::vector<int>& ids, Stats& st, std::string& 
     }
     auto itn=g_w1.find("output_norm.weight");
     auto itw=g_w1.find("output.weight");
-    if(itn==g_w1.end()||itw==g_w1.end()){ err="no head"; cudaFree(d_x1); return {}; }
-    float* d_xn=nullptr; cudaMalloc(&d_xn,nH*4);
+    if(itn==g_w1.end()||itw==g_w1.end()){ err="no head"; return {}; }
+    float* d_xn=nullptr;
+    if(!allocations.alloc(1,d_xn,nH*4,err)) return {};
     rms_f32_k<<<T,512,(size_t)512*4>>>(d_xn,d_x1,(float*)itn->second.d,T,HID);
-    float* d_log=nullptr; cudaMalloc(&d_log,(size_t)T*VOC*4);
+    float* d_log=nullptr;
+    if(!allocations.alloc(1,d_log,(size_t)T*VOC*4,err)) return {};
     if(use_head_bf16_warp()){
       cudaError_t launch_err=hermes::head_bf16_warp_cuda(
         d_log,d_xn,(uint16_t*)itw->second.d,T,HID,VOC);
       if(launch_err!=cudaSuccess){
         err="head_bf16_warp prefill launch: "+std::string(cudaGetErrorString(launch_err));
-        cudaFree(d_xn); cudaFree(d_log); cudaFree(d_x1); return {};
+        return {};
       }
     } else {
       head_bf16_k<<<(int)(((size_t)T*VOC+255)/256),256>>>(d_log,d_xn,(uint16_t*)itw->second.d,T);
@@ -640,20 +825,24 @@ std::vector<float> prefill(const std::vector<int>& ids, Stats& st, std::string& 
     cudaError_t head_sync_err=cudaDeviceSynchronize();
     if(head_sync_err!=cudaSuccess){
       err="output head prefill sync: "+std::string(cudaGetErrorString(head_sync_err));
-      cudaFree(d_xn); cudaFree(d_log); cudaFree(d_x1); return {};
+      return {};
     }
     std::vector<float> logits((size_t)T*VOC);
     cudaError_t head_copy_err=cudaMemcpy(logits.data(),d_log,(size_t)T*VOC*4,cudaMemcpyDeviceToHost);
     if(head_copy_err!=cudaSuccess){
       err="output head prefill logits copy: "+std::string(cudaGetErrorString(head_copy_err));
-      cudaFree(d_xn); cudaFree(d_log); cudaFree(d_x1); return {};
+      return {};
     }
-    cudaFree(d_xn); cudaFree(d_log); cudaFree(d_x1);
     auto tp1=std::chrono::high_resolution_clock::now();
     st.prefill_ms=std::chrono::duration<double,std::milli>(tp1-tp0).count();
     printf("pp2 prefill T=%d ms=%.1f (incl xfer %.2f)\n",T,st.prefill_ms,st.xfer_ms); fflush(stdout);
     return logits;
   }
+}
+
+std::vector<float> prefill(const std::vector<int>& ids, Stats& st,
+                           std::string& err, std::vector<float>* h_last_out){
+  return prefill_impl(ids,st,err,h_last_out,nullptr,false);
 }
 
 void free_all(){
@@ -1230,6 +1419,7 @@ bool decode_init(DecodeState& ds, std::string& err, int capacity){
   ds.ws0=nullptr; ds.ws1=nullptr; ds.idsbuf=nullptr; ds.x0buf=nullptr;
   ds.x1buf=nullptr; ds.xnbuf=nullptr; ds.logbuf=nullptr; ds.ws_bytes=0;
   ds.async_ctx=nullptr;
+  ds.ever_advanced=false;
 
   const size_t kv_bytes=(size_t)capacity*1024*sizeof(float);
   size_t required[2]={0,0};
@@ -1335,8 +1525,157 @@ void decode_free(DecodeState& ds){
   if(ds.logbuf){ cudaFree(ds.logbuf); ds.logbuf=nullptr; }
   ds.ws_bytes=0;
   ds.async_ctx=nullptr;
+  ds.ever_advanced=false;
   ds.capacity=DecodeState::MAXL;
   ds.inited=false;
+}
+
+std::vector<float> prefill_into_decode_state(
+    const std::vector<int>& ids, DecodeState& ds, Stats& st,
+    std::string& err, std::vector<float>* h_last_out){
+  // This is an explicit experimental API, never selected by prefill() or
+  // decode_step(). Recurrent/cached state is valid only for an EMPTY prompt.
+  if(!ds.inited){err="seeded prefill needs initialized DecodeState";return {};}
+  auto* ctx=static_cast<AsyncDecodeContext*>(ds.async_ctx);
+  std::unique_lock<std::mutex> state_lock;
+  if(ctx){
+    state_lock=std::unique_lock<std::mutex>(ctx->step_mutex,std::try_to_lock);
+    if(!state_lock.owns_lock()){
+      err="seeded prefill denied: concurrent async token in flight";
+      return {};
+    }
+  }
+  auto fail=[&]()->std::vector<float>{
+    if(ctx) ctx->poisoned=true;
+    if(h_last_out) h_last_out->clear();
+    // decode_free locks the async request while draining; release our lock
+    // first to avoid deadlock. Caller must own DecodeState lifetime.
+    if(state_lock.owns_lock()) state_lock.unlock();
+    decode_free(ds);
+    return {};
+  };
+  const size_t T=ids.size();
+  if(ds.ever_advanced || (ctx && ctx->poisoned)){
+    err="seeded prefill requires clean untouched DecodeState";
+    return fail();
+  }
+  if(!g_up || T<1 || T>64 || T>(size_t)ds.capacity){
+    err="seeded prefill needs uploaded GGUF and 1<=T<=min(64,capacity)";
+    return fail();
+  }
+  if(std::getenv("HERMES_L26")){
+    err="seeded prefill does not support HERMES_L26 debug";
+    return fail();
+  }
+  for(int li=0;li<NL;++li){
+    if(ds.klen[li]!=0){err="seeded prefill requires fresh empty KV state";return fail();}
+    if(li%4==3 && (!ds.Kc[li]||!ds.Vc[li])){
+      err="seeded prefill missing full-attention K/V";return fail();
+    }
+    if(li%4!=3 && (!ds.S[li]||!ds.CS[li])){
+      err="seeded prefill missing GDN S/CS";return fail();
+    }
+  }
+  for(int tok:ids){
+    if(tok<0||tok>=VOC){err="seeded prefill token id OOB";return fail();}
+  }
+  // Existing prefill layer scratch is at most O(T*(3*FFN*4 + ...)).
+  // Reserve 512MiB free on each device BEFORE any state mutation. BF16
+  // adds 8MiB per-device tiled weight scratch, checked by initialize().
+  for(int dev=0;dev<2;++dev){
+    cudaError_t e=cudaSetDevice(dev);
+    size_t free_bytes=0,total_bytes=0;
+    if(e==cudaSuccess)e=cudaMemGetInfo(&free_bytes,&total_bytes);
+    if(e!=cudaSuccess || free_bytes<512ULL*1024*1024){
+      err="seeded prefill VRAM preflight GPU"+std::to_string(dev)+
+          " free="+std::to_string(free_bytes)+" minimum=536870912";
+      return fail();
+    }
+  }
+
+  const char* option=std::getenv("HERMES_PP2_PREFILL_BF16");
+  const bool bf16=(option && std::strcmp(option,"1")==0);
+  std::vector<float> baseline;
+  if(bf16){
+    // Fail closed with FULL output logits; a single-projection GEMM error
+    // cannot establish whole-network quality or successful cache seeding.
+    Stats baseline_stats;
+    std::string baseline_err;
+    baseline=prefill_impl(ids,baseline_stats,baseline_err,nullptr,nullptr,true);
+    if(baseline.size()!=T*(size_t)VOC){
+      err="BF16 quality reference prefill failed: "+baseline_err;
+      return fail();
+    }
+  }
+
+  try {
+    PrefillBF16ProjectionScope scope;
+    if(bf16 && !scope.initialize(err)) return fail();
+    struct ScopedDispatch {
+      explicit ScopedDispatch(PrefillBF16ProjectionScope* ptr){
+        g_prefill_bf16_scope=ptr;
+      }
+      ~ScopedDispatch(){g_prefill_bf16_scope=nullptr;}
+    } dispatch(bf16?&scope:nullptr);
+    std::vector<float> logits=prefill_impl(ids,st,err,h_last_out,&ds,true);
+    if(logits.size()!=T*(size_t)VOC){
+      if(err.empty()) err="seeded prefill incomplete logits";
+      return fail();
+    }
+    // All cache mutations occurred during the same T-token batched pass.
+    // Checking full-model logits against the existing GGUF GEMV reference
+    // is mandatory when experimental cuBLAS BF16 is requested. This route
+    // intentionally adds a reference pass: it is a QUALITY PROTOTYPE, not a
+    // production speedup, until the prime approves a persistent gate.
+    double max_abs=0, squared_error=0, squared_reference=0;
+    size_t max_index=0, argmax_mismatches=0;
+    for(size_t t=0;t<T;++t){
+      int winner_ref=-1,winner_bf16=-1;
+      float max_ref=-std::numeric_limits<float>::infinity();
+      float max_bf16=-std::numeric_limits<float>::infinity();
+      for(int j=0;j<VOC;++j){
+        size_t i=t*(size_t)VOC+(size_t)j;
+        const float value=logits[i];
+        if(!std::isfinite(value)){
+          err="seeded prefill nonfinite logit t="+std::to_string(t);
+          return fail();
+        }
+        if(bf16){
+          if(!std::isfinite(baseline[i])){
+            err="BF16 reference nonfinite logit t="+std::to_string(t);
+            return fail();
+          }
+          const double difference=double(value)-double(baseline[i]);
+          const double abs_diff=std::fabs(difference);
+          squared_error+=difference*difference;
+          squared_reference+=double(baseline[i])*double(baseline[i]);
+          if(abs_diff>max_abs){max_abs=abs_diff;max_index=i;}
+          if(baseline[i]>max_ref){max_ref=baseline[i];winner_ref=j;}
+          if(value>max_bf16){max_bf16=value;winner_bf16=j;}
+        }
+      }
+      if(bf16 && winner_ref!=winner_bf16) ++argmax_mismatches;
+    }
+    if(bf16){
+      const double rel_rmse=std::sqrt(squared_error/
+          std::max(1.e-30,squared_reference));
+      std::printf("pp2 BF16 full-logit gate T=%zu max_abs=%.9g rel_rmse=%.9g "
+                  "argmax_mismatches=%zu max_index=%zu limit=1e-3\n",
+                  T,max_abs,rel_rmse,argmax_mismatches,max_index);
+      std::fflush(stdout);
+      if(max_abs>1.e-3 || argmax_mismatches!=0){
+        err="BF16 full-logit quality gate FAIL max_abs="+std::to_string(max_abs)+
+            " rel_rmse="+std::to_string(rel_rmse)+
+            " argmax_mismatches="+std::to_string(argmax_mismatches);
+        return fail();
+      }
+    }
+    ds.ever_advanced=true;
+    return logits;
+  } catch(const std::exception& e){
+    err="seeded prefill exception: "+std::string(e.what());
+    return fail();
+  }
 }
 
 static std::vector<float> decode_step_async(int tok, DecodeState& ds, long pos,
@@ -1349,6 +1688,7 @@ static std::vector<float> decode_step_async(int tok, DecodeState& ds, long pos,
     return {};
   }
   if(ctx->poisoned){ err="async decode state poisoned: reinitialize request"; return {}; }
+  ds.ever_advanced=true; // under request mutex, never a cross-thread data race
   g_async_gemv_error=cudaSuccess;
   auto fail=[&]()->std::vector<float>{ ctx->poisoned=true; return {}; };
   if(tok<0||tok>=VOC){ err="async decode token OOB"; return fail(); }
@@ -1434,6 +1774,7 @@ std::vector<float> decode_step(int tok, DecodeState& ds, long pos, std::string& 
     err="decode ws not inited"; return {};
   }
   if(ds.async_ctx) return decode_step_async(tok,ds,pos,err);
+  ds.ever_advanced=true;
   cudaSetDevice(0);
   int* d_ids = ds.idsbuf;
   float* d_x0 = ds.x0buf;

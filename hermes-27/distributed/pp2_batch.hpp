@@ -96,7 +96,11 @@ struct JobSnapshot {
   std::string error;
 };
 
-enum class EventKind { token, terminal };
+// admitted: PP2 state is allocated and active; the consumer may now start
+// HTTP 200/SSE headers. A request that fails, expires or is cancelled while
+// queued emits terminal only, so the HTTP layer can still return 429/503.
+// Each successful admission emits exactly one admitted event before any token.
+enum class EventKind { token, terminal, admitted };
 struct SchedulerEvent {
   EventKind kind = EventKind::terminal;
   std::string id;
@@ -118,11 +122,14 @@ struct SchedulerConfig {
   int eos_token_id = -1;              // -1 disables EOS stopping
   // Synchronous, optional event sink: no callbacks under metadata lock.
   // Must be thread-safe: queued cancellation calls it from the canceller,
-  // other events from the pump. Never call tick/shutdown from this callback.
+  // admission, tokens and other terminal events from the pump. May call
+  // cancel/inspect/retire/enqueue, but never tick/shutdown from this callback.
+  // Keep it nonblocking and bound HTTP/SSE queues; cancel on backpressure.
   std::function<void(const SchedulerEvent&)> on_event;
 };
 
 struct SchedulerMetrics {
+  bool stopping = false;
   std::size_t active = 0;
   std::size_t queued = 0;
   std::size_t retained = 0;
@@ -169,7 +176,7 @@ class ContinuousScheduler {
   void finish(const std::shared_ptr<Job>& job, JobStatus status,
               const std::string& error = {});
   void expire_waiting(SchedulerClock::time_point now);
-  void promote();
+  void promote(std::size_t& remaining_admissions);
   void emit_event(const std::shared_ptr<Job>& job, EventKind kind, int token_id = -1);
   bool closed(JobStatus status) const;
   void trim_finished_locked();

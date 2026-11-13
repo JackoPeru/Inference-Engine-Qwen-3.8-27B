@@ -13,8 +13,11 @@
 #include <cmath>
 #include <chrono>
 #include <algorithm>
+#include <atomic>
+#include <condition_variable>
 #include <functional>
 #include <limits>
+#include <mutex>
 #include <stdexcept>
 #include <thread>
 #ifndef HERMES_ADMISSION_CPU_ONLY
@@ -51,7 +54,7 @@ namespace {
 struct FakeBackend final : pp2batch::StepBackend {
   struct State { int serial, capacity, next_pos; };
   struct Call { int serial, token; long pos; };
-  int opens = 0, closes = 0, live = 0, peak_live = 0;
+  int attempts = 0, opens = 0, closes = 0, live = 0, peak_live = 0;
   bool fail_next_open = false, fail_next_step = false, wrong_logits = false;
   bool nan_logits = false, throw_step = false;
   std::vector<Call> calls;
@@ -60,6 +63,7 @@ struct FakeBackend final : pp2batch::StepBackend {
 
   bool open(int capacity, void*& state, std::string& error) override {
     state = nullptr;
+    ++attempts;
     if (fail_next_open) {
       fail_next_open = false;
       error = "injected open OOM";
@@ -151,6 +155,8 @@ int run_scheduler_tests() {
     };
     ContinuousScheduler s(cfg, backend);
     expect(s.enqueue({"", {1}, 1}).code == SubmitCode::invalid, "empty ID");
+    expect(s.enqueue({std::string(129, 'x'), {1}, 1}).code ==
+           SubmitCode::invalid, "request ID length bounded");
     expect(s.enqueue({"blank", {}, 1}).code == SubmitCode::invalid, "empty prompt");
     expect(s.enqueue({"negative", {-1}, 1}).code == SubmitCode::invalid, "negative token");
     expect(s.enqueue({"vocab", {8}, 1}).code == SubmitCode::invalid, "out of vocab");
@@ -212,15 +218,20 @@ int run_scheduler_tests() {
            m.decode_steps_total == 7, "completed counters and no active leak");
     std::vector<std::string> event_signature;
     for (const auto& event : events)
-      event_signature.push_back(event.id + (event.kind == EventKind::token ? ":token" : ":end"));
+      event_signature.push_back(event.id + (event.kind == EventKind::token ? ":token" :
+                                             event.kind == EventKind::admitted ? ":admitted" : ":end"));
     expect(event_signature == std::vector<std::string>({
-           "B:token", "B:token", "B:end", "A:token",
-           "C:token", "C:end", "A:token", "A:end"}),
-           "exact token and terminal events in generation order");
-    expect(events[2].generated == std::vector<int>({2, 2}) &&
-           events[5].generated == std::vector<int>({2}) &&
-           events[7].generated == std::vector<int>({2, 2}),
+           "A:admitted", "B:admitted", "B:token", "B:token", "B:end",
+           "C:admitted", "A:token", "C:token", "C:end", "A:token", "A:end"}),
+           "admission, token and terminal events in generation order");
+    expect(events[4].generated == std::vector<int>({2, 2}) &&
+           events[8].generated == std::vector<int>({2}) &&
+           events[10].generated == std::vector<int>({2, 2}),
            "terminal callback owns complete generated output");
+    expect(events[0].kind == EventKind::admitted &&
+           events[0].status == JobStatus::active &&
+           events[0].generated.empty() && events[0].token_id == -1,
+           "admission signals active GPU state before sampling");
     JobSnapshot removed;
     expect(s.retire("A") && !s.inspect("A", removed), "retire terminal state");
   }
@@ -268,6 +279,55 @@ int run_scheduler_tests() {
            backend.live == 0 && backend.opens == backend.closes,
            "cancelled opening state immediately freed");
   }
+  // Cancellation from admitted callback is legal. An accepted but cancelled
+  // stream emits admitted then terminal; no generated token is produced.
+  {
+    FakeBackend backend;
+    auto cfg = config();
+    std::vector<EventKind> received;
+    ContinuousScheduler* scheduler = nullptr;
+    cfg.on_event = [&](const SchedulerEvent& event) {
+      received.push_back(event.kind);
+      if (event.kind == EventKind::admitted)
+        expect(scheduler->cancel(event.id), "cancel from admitted callback");
+    };
+    ContinuousScheduler s(cfg, backend);
+    scheduler = &s;
+    s.enqueue({"cancel-admitted", {1, 2}, 2});
+    expect(s.tick() == 0, "cancel after admitted avoids decode");
+    expect(received == std::vector<EventKind>({EventKind::admitted, EventKind::terminal}),
+           "admitted event precedes cancellation terminal exactly once");
+    expect(has_status(s, "cancel-admitted", JobStatus::cancelled) && backend.live == 0,
+           "admission callback cancellation releases GPU state");
+  }
+  // A bounded SSE sink may discover backpressure while handling a token.
+  // The reentrant cancellation must suppress any further decode steps and
+  // deliver terminal exactly once, without holding a scheduler metadata lock.
+  {
+    FakeBackend backend;
+    auto cfg = config();
+    cfg.steps_per_tick = 4;
+    ContinuousScheduler* scheduler = nullptr;
+    std::vector<EventKind> events;
+    cfg.on_event = [&](const SchedulerEvent& event) {
+      events.push_back(event.kind);
+      if (event.kind == EventKind::token)
+        expect(scheduler->cancel(event.id), "SSE backpressure cancels active job");
+      if (event.kind == EventKind::terminal)
+        expect(scheduler->retire(event.id), "terminal callback may retire job");
+    };
+    ContinuousScheduler s(cfg, backend);
+    scheduler = &s;
+    s.enqueue({"bounded-sse", {1}, 4});
+    expect(s.tick() == 1 && backend.calls.size() == 1,
+           "cancel after first token prevents further decoding in same tick");
+    expect(events == std::vector<EventKind>({
+           EventKind::admitted, EventKind::token, EventKind::terminal}),
+           "SSE cancellation emits admission/token/terminal once");
+    JobSnapshot j;
+    expect(!s.inspect("bounded-sse", j) && backend.live == 0 &&
+           s.metrics().cancelled_total == 1, "terminal callback retire no deadlock");
+  }
   // Queue deadline runs even when all active slots are occupied.
   {
     FakeBackend backend;
@@ -283,6 +343,72 @@ int run_scheduler_tests() {
     expect(has_status(s, "wait", JobStatus::expired) &&
            s.metrics().expired_total == 1, "queued request expires under pressure");
     expect(s.metrics().queued == 0 && backend.opens == 1, "expired never opens state");
+  }
+  // Stop from a separate host thread while the backend holds a GPU step:
+  // new enqueue is rejected immediately, the step returns, and no later
+  // tokens or duplicate terminals are delivered. shutdown() waits for safe
+  // device-state cleanup, but never holds the metadata mutex across CUDA.
+  {
+    FakeBackend backend;
+    auto cfg = config();
+    cfg.max_active = 1;
+    cfg.steps_per_tick = 8;
+    cfg.queue_timeout = seconds(60);
+    std::mutex gate_mutex, events_mutex;
+    std::condition_variable gate_cv;
+    bool entered_step = false, release_step = false;
+    std::vector<std::string> events;
+    backend.during_step = [&]() {
+      std::unique_lock<std::mutex> lk(gate_mutex);
+      entered_step = true;
+      gate_cv.notify_all();
+      gate_cv.wait(lk, [&] { return release_step; });
+    };
+    cfg.on_event = [&](const SchedulerEvent& event) {
+      std::lock_guard<std::mutex> lk(events_mutex);
+      events.push_back(event.id + (event.kind == EventKind::admitted ? ":admitted" :
+                                   event.kind == EventKind::token ? ":token" : ":end"));
+    };
+    ContinuousScheduler s(cfg, backend);
+    s.enqueue({"running-stop", {1, 2, 3}, 3});
+    s.enqueue({"queued-stop", {4}, 1});
+    std::atomic<std::size_t> executed{100};
+    std::thread pump([&] { executed.store(s.tick()); });
+    {
+      std::unique_lock<std::mutex> lk(gate_mutex);
+      gate_cv.wait(lk, [&] { return entered_step; });
+    }
+    std::thread stopping([&] { s.shutdown(); });
+    // Wait until shutdown has flagged stop before releasing the fake CUDA step.
+    bool signalled = false;
+    const auto deadline = SchedulerClock::now() + seconds(2);
+    while (SchedulerClock::now() < deadline) {
+      if (s.metrics().stopping) { signalled = true; break; }
+      std::this_thread::sleep_for(milliseconds(1));
+    }
+    expect(signalled, "stop visible while backend decode remains blocked");
+    if (signalled)
+      expect(s.enqueue({"late-stop", {3}, 1}).code == SubmitCode::stopped,
+             "new work rejected before in-flight CUDA step returns");
+    {
+      std::lock_guard<std::mutex> lk(gate_mutex);
+      release_step = true;
+    }
+    gate_cv.notify_all();
+    pump.join();
+    stopping.join();
+    expect(executed.load() == 1 && backend.calls.size() == 1 &&
+           backend.live == 0 && backend.opens == backend.closes,
+           "shutdown drains active state after exactly one in-flight step");
+    expect(has_status(s, "running-stop", JobStatus::cancelled) &&
+           has_status(s, "queued-stop", JobStatus::cancelled) &&
+           s.metrics().cancelled_total == 2,
+           "shutdown cancels running and waiting jobs exactly once");
+    expect(events == std::vector<std::string>({
+           "running-stop:admitted", "running-stop:end", "queued-stop:end"}),
+           "concurrent stop emits admitted then one terminal per job");
+    expect(s.tick() == 0 && s.metrics().active == 0 &&
+           s.metrics().queued == 0, "stopped scheduler stays drained");
   }
   // The clock also advances within a single tick. A slow backend step must
   // not admit an already expired waiting job on the next iteration.
@@ -333,6 +459,11 @@ int run_scheduler_tests() {
     FakeBackend backend;
     auto cfg = config();
     cfg.max_active = 1;
+    std::vector<std::string> event_order;
+    cfg.on_event = [&](const SchedulerEvent& e) {
+      event_order.push_back(e.id + (e.kind == EventKind::admitted ? ":admitted" :
+                                     e.kind == EventKind::token ? ":token" : ":terminal"));
+    };
     ContinuousScheduler s(cfg, backend);
     s.enqueue({"oom", {1}, 1});
     s.enqueue({"next", {2}, 1});
@@ -340,6 +471,9 @@ int run_scheduler_tests() {
     s.tick();
     expect(has_status(s, "oom", JobStatus::failed) &&
            has_status(s, "next", JobStatus::completed, 1), "failed open frees admission");
+    expect(event_order == std::vector<std::string>({
+             "oom:terminal", "next:admitted", "next:token", "next:terminal"}),
+           "failed open has terminal without admitted or token");
     expect(backend.opens == 1 && backend.closes == 1, "open failure no GPU leak");
     backend.nan_logits = true;
     s.enqueue({"nan", {3}, 1});
@@ -358,6 +492,36 @@ int run_scheduler_tests() {
     s.tick();
     expect(has_status(s, "throw", JobStatus::failed) && backend.live == 0,
            "decode exceptions release GPU state");
+  }
+  // An HTTP consumer might retry a failed state allocation from on_event.
+  // A single tick must bound ALL open attempts, even when every failure
+  // immediately injects new queued work.
+  {
+    FakeBackend backend;
+    auto cfg = config();
+    cfg.max_active = 1;
+    cfg.max_queued = 32;
+    cfg.max_retained = 0;
+    cfg.queue_timeout = seconds(60);
+    ContinuousScheduler* scheduler = nullptr;
+    int retries = 0;
+    cfg.on_event = [&](const SchedulerEvent& event) {
+      if (event.kind != EventKind::terminal || event.status != JobStatus::failed)
+        return;
+      backend.fail_next_open = true;
+      scheduler->enqueue({"retry-" + std::to_string(++retries), {1}, 1});
+    };
+    ContinuousScheduler s(cfg, backend);
+    scheduler = &s;
+    backend.fail_next_open = true;
+    s.enqueue({"retry-0", {1}, 1});
+    expect(s.tick() == 0, "failed allocation retry storm executes no decode");
+    expect(backend.attempts == 16 && retries == 16 &&
+           s.metrics().queued == 1 && s.metrics().active == 0,
+           "single tick bounds failed admission attempts to 16");
+    expect(s.metrics().failed_total == 16 && backend.live == 0,
+           "retry storm releases all failed state attempts");
+    s.shutdown();
   }
   // Completion must reach its consumer without depending on retained history.
   // Throwing consumer callbacks are observable but cannot leak GPU state.
@@ -398,7 +562,7 @@ int run_scheduler_tests() {
     s.enqueue({"throws-cb", {1}, 1});
     s.tick();
     expect(has_status(s, "throws-cb", JobStatus::completed, 1) &&
-           s.metrics().callback_errors_total == 2 && backend.live == 0,
+           s.metrics().callback_errors_total == 3 && backend.live == 0,
            "callback exception accounted without model state leak");
   }
   // Terminal snapshots have a configured finite bound, preventing retaining

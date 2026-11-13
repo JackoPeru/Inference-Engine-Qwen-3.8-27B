@@ -25,19 +25,26 @@
 
 The test binary in the commands below was compiled from real serving/server.cpp, cpp-httplib and an isolated CPU mock PP2 implementation. It cannot use GPU; scratch files live at /tmp/hermes27-worker3-serving-check.
 
-To build the CPU-only test server independently from the real production binary, create a scratch directory and copy the named files from the current source tree. Use headers from the current distributed/ directory without modifying them:
+The server now references worker-6's ContinuousScheduler even when the
+legacy scheduler remains selected. Link the **real** pp2_batch.cu in
+CPU-only mode, using the NEW prod_sched_mock_pp2.cpp (not the older
+mock_pp2_cpu.cpp, which defines a duplicate admit_check symbol).
+The one-command runner copies all sources to a fresh isolated scratch
+directory, builds this link configuration, and runs both HTTP backends:
 
-    mkdir -p /tmp/hermes27-serving-cpu/{build,serving/tests}
-    cp serving/server.cpp /tmp/hermes27-serving-cpu/server.cpp
-    cp distributed/pp2_fwd.hpp distributed/pp2_batch.hpp /tmp/hermes27-serving-cpu/
-    cp serving/tokenizer_bridge.py /tmp/hermes27-serving-cpu/serving/tokenizer_bridge.py
-    cp serving/tests/mock_pp2_cpu.cpp /tmp/hermes27-serving-cpu/serving/tests/
-    cp serving/tests/mock_gguf_dump.py /tmp/hermes27-serving-cpu/gguf_dump_fake.py
-    chmod 755 /tmp/hermes27-serving-cpu/gguf_dump_fake.py
-    touch /tmp/hermes27-serving-cpu/fake.gguf
-    g++ -std=c++20 -O0 -pthread -I/tmp/hermes27-serving-cpu -I/opt/hermes/src/llama-cpp-turboquant/vendor/cpp-httplib -I/opt/hermes/src/llama-cpp-turboquant/vendor /tmp/hermes27-serving-cpu/server.cpp /tmp/hermes27-serving-cpu/serving/tests/mock_pp2_cpu.cpp /opt/hermes/src/llama-cpp-turboquant/vendor/cpp-httplib/httplib.cpp -o /tmp/hermes27-serving-cpu/build/hermes_server
+    bash serving/tests/prod_sched_cpu_gate.sh
 
-Use your actual scratch path in the test commands. The test executable's parent directory must contain serving/tokenizer_bridge.py, as expected by the server's normal runtime helper lookup. The mock environment variables include FAKE_IDS, FAKE_STEP_MS, FAKE_INIT_FAIL, FAKE_DECODE_FAIL_ONCE and FAKE_GPU_USED_MIB.
+The runner defaults to /tmp/hermes27-prod-sched-cpu and accepts
+HERMES_CPU_SCRATCH, HERMES_CPP_HTTPLIB_ROOT, HERMES_TEST_TOKENIZER and
+HERMES_TEST_PYTHON environment overrides. Its fake model file is empty
+and its mock GGUF template prints a one-token prompt. It never executes
+the CUDA PP2 adapter or actual model upload.
+
+For individual test execution, substitute the runner's scratch directory
+in the commands below. Production tests can run directly against the
+scratch executable (legacy) or through
+serving/tests/prod_sched_launcher.py (continuous opt-in; requires
+HERMES_TEST_SERVER_BIN set to the scratch executable).
 
 Tokenizer, with real Qwen tokenizer:
 
@@ -73,3 +80,60 @@ Tests ran against separate localhost ephemeral ports. No production Hermes servi
 - Once SSE headers have been sent, later generation errors appear as SSE error events. Nonstream clients disconnecting without explicit cancellation can continue occupying scheduler resources.
 - The API has neither native TLS nor per-user rate limits. A correctly configured TLS/authenticated proxy is required for public network deployment.
 - Before the real-backend launch, prime must rebuild gguf_dump using the integrated model/parser source. An old gguf_dump binary may have stale metadata/chat-template semantics.
+
+## Experimental opt-in: worker-6 ContinuousScheduler (2026-11-13)
+
+Enable with --continuous-scheduler when starting a **new, isolated** server
+instance. There is no runtime switch. The preexisting host-threaded
+Scheduler remains the default, with no changes to its queue/decode loop.
+
+The opt-in path enqueues each HTTP request exactly once into
+pp2batch::ContinuousScheduler and never places it in the legacy
+queue_/active_ structures. The outer jobs_ map only tracks the HTTP
+response lifetime; it is not a second work queue. PP2StepBackend owns the
+sole DecodeState for each admitted request; the HTTP Job's unused legacy
+DecodeState is never initialized, stepped or freed.
+
+Worker-6's EventKind::admitted occurs **after** PP2 state allocation
+and before the first token event. The callback initializes per-request
+ByteLevel tokenizer state and only then releases the HTTP 200/SSE headers.
+A failed state open therefore returns HTTP 503 (or HTTP 429 for a
+specifically identified live VRAM preflight rejection) before SSE.
+Expired waiting requests return HTTP 429 without any state allocation.
+
+Token events feed the existing UTF-8-safe incremental decoder, stop
+sequence filter, and bounded SSE buffer. A text stop or slow-client
+backpressure invokes ContinuousScheduler::cancel, and the backend frees
+its state. Terminal events compare exact generated ID lists, finalize
+the reference tokenizer parity, populate nonstream/SSE usage and finish
+reason, and wake HTTP waiters. Client cancellation and SIGTERM follow
+the same callback path. The single scheduler pump calls tick(), which
+performs at most max_active sequential PP2 steps per turn; it is **not**
+fused GPU batching and no speedup is claimed.
+
+### Verified isolated CPU gates for the opt-in mode
+
+- Pre-integration legacy baseline: 19/19 existing HTTP tests PASS.
+- Integrated source, legacy default: **19/19 existing HTTP tests PASS**.
+- Integrated source, --continuous-scheduler: **19/19 HTTP tests PASS**.
+- Continuous opt-in, NEW prod_sched_state_test.py: **7/7 PASS** with
+  FAKE_TRACE_FILE checks proving exactly one PP2 state open and close
+  per admitted request, matching decode-step/token counts, no state
+  allocation on queue timeout/open failure, correct stop/cancel,
+  6 concurrent states and cleanup on SIGTERM.
+- Continuous opt-in, existing SSE/Unicode parity regression: **9/9 PASS**
+  (ASCII, CJK, accents, emoji and split/invalid UTF-8 byte sequences).
+- Existing independent real-tokenizer tests: 5/5 PASS.
+
+Build used g++ -std=c++20 -DHERMES_ADMISSION_CPU_ONLY with the real
+distributed/pp2_batch.cu, and serving/tests/prod_sched_mock_pp2.cpp.
+No GPUs, services or CMake files were touched. Worker-6's
+EventKind::admitted API **must** be present in both the deployed
+pp2_batch.hpp and pp2_batch.cu. Prime must rebuild the integrated
+server and gguf_dump from one consistent source snapshot before
+authorizing GPU tests.
+
+**Not yet proven:** real GPU multiuser correctness, VRAM under real
+Qwen weights, throughput, response latency, real CUDA cancellation
+or concurrent backend safety. Until GPU gate and production soak are
+completed, leave --continuous-scheduler disabled by default.

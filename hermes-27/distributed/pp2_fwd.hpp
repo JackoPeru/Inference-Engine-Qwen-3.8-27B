@@ -72,7 +72,21 @@ struct DecodeState {
   // completion events and distinct pinned staging. Owned by decode_init/free.
   // nullptr means the original synchronous decode_step remains active.
   void* async_ctx = nullptr;
+  // Reject seeded prefill after ANY decode step, including interrupted steps
+  // which may have mutated GDN state before klen becomes nonzero.
+  bool ever_advanced = false;
 };
+
+// Experimental, explicitly invoked batched PP2 prefill which seeds a FRESH
+// decode_init() state directly: GDN recurrent S, convolution CS tails and
+// full-attention K/V cache for every token. No token-by-token replay.
+// Only 1 <= ids.size() <= 64 and capacity >= ids.size(). On any failure the
+// request state is invalidated and decode_free() is called (fail closed).
+// Uses legacy raw-GGUF GEMV by default; BF16 projection is separate opt-in.
+// This API has not been cleared for production until full-GGUF parity gates.
+std::vector<float> prefill_into_decode_state(
+    const std::vector<int>& ids, DecodeState& ds, Stats& st, std::string& err,
+    std::vector<float>* h_last_out = nullptr);
 
 // Alloca/stati zero su GPU proprietaria (richiede upload già fatto). Ritorna false su errore/OOM.
 bool decode_init(DecodeState& ds, std::string& err);

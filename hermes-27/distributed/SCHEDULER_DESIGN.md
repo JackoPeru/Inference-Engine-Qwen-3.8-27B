@@ -35,8 +35,12 @@ cfg.steps_per_tick = 4;          // total decode_step calls per pump invocation
 cfg.max_retained = 64;           // terminal snapshots; set by consumer capacity
 cfg.eos_token_id = pp2::eos_token_id();
 cfg.on_event = [](const pp2batch::SchedulerEvent& event) {
-  // Deliver token IDs to a bounded SSE queue, or mark the HTTP Job complete
-  // on EventKind::terminal. The consumer must synchronize its own Job state.
+  // EventKind::admitted: PP2 GPU state exists; streaming response may now
+  // send HTTP 200 and SSE headers.
+  // EventKind::token: append token ID to a bounded, nonblocking output queue.
+  // EventKind::terminal: finish HTTP job with generated IDs/status/error;
+  // if admitted never occurred, send HTTP 429/503 before SSE begins.
+  // Consumer must synchronize its own Job state.
 };
 pp2batch::ContinuousScheduler scheduler(cfg, backend);
 auto accepted = scheduler.enqueue({"request-1", prompt_ids, 64});
@@ -46,7 +50,7 @@ pp2batch::JobSnapshot result;
 if (scheduler.inspect("request-1", result)) { /* consume and retire result */ }
 ```
 
-- Enqueue validates the nonempty request ID, nonempty prompt, token range,
+- Enqueue validates the request ID length (1..128 bytes), nonempty prompt, token range,
   `max_new_tokens>=1`, and `prompt_len+max_new_tokens-1<=max_context`.
   The last sampled output token requires no further decode step.
 - Only the **waiting** deque occupies `max_queued` slots. At admission,
@@ -56,11 +60,16 @@ if (scheduler.inspect("request-1", result)) { /* consume and retire result */ }
   bypass of larger requests. Queued requests have no allocated GPU state.
 - The active deque rotates after **one decoder token per turn**. A new request
   can enter when an active request exits, independent of other prompts' lengths.
-  `steps_per_tick` bounds the work of each pump call; no padding is done.
+  `steps_per_tick` bounds the total GPU decode calls of each pump invocation
+  to 1..16; up to 16 state-open attempts may occur in that same invocation,
+  including failed attempts. This separate admission cap prevents an OOM
+  retry callback from causing an infinite allocation loop. No padding is done.
 - `cancel(id)` removes queued jobs immediately. For a request currently
   opening GPU state or decoding, it sets a cancellation flag; the pump closes
   its private state after the non-interruptible backend call returns. The
-  token returned by that step is discarded. Neither cancellation nor
+  token returned by that step is discarded if cancellation is seen before
+  it is committed. A token already committed while cancellation races may
+  still be delivered, always before the terminal event. Neither cancellation nor
   `inspect` holds a lock across a CUDA operation.
 - `tick(now)` expires all queued jobs whose monotonic deadline has elapsed,
   including when the active set is full. The deadline is rechecked between
@@ -69,21 +78,38 @@ if (scheduler.inspect("request-1", result)) { /* consume and retire result */ }
   timers in the background. The injectable `now` parameter permits
   deterministic deadline tests while still advancing by elapsed real time
   during each tick.
-- `shutdown()` blocks until any in-flight `tick()` returns, cancels all
-  remaining jobs and frees every allocated state. Concurrent `tick()` calls
-  are serialized; the caller must not destroy the backend before the scheduler.
+- `shutdown()` first sets the stopping flag under the short metadata lock,
+  then waits for any in-flight `tick()` to return. New enqueue attempts are
+  rejected as soon as the flag is visible (see `metrics().stopping`). Active
+  and queued requests are flagged for cancellation while any GPU step is
+  still running. It then drains all jobs and frees every allocated state.
+  Concurrent `tick()` calls are serialized; the caller must not destroy the
+  backend before the scheduler.
 - Terminal `JobSnapshot` records are kept up to `max_retained` (0..1024)
   then oldest are evicted. Consumers should collect and `retire(id)` responses
-  as they complete. The optional synchronous `on_event` delivers **every
-  produced token ID** and **one terminal event per accepted request**,
-  including queue cancellation/expiry, without depending on retained history.
+  as they complete. The optional synchronous `on_event` delivers:
+  - `EventKind::admitted`: **exactly once**, after successful PP2 state
+    allocation and active registration, always before the first token.
+    A job that fails to allocate, expires or is cancelled before admission
+    emits a terminal event without any admission event. The HTTP adapter
+    must wait for `admitted` before sending success/SSE headers.
+  - `EventKind::token`: every generated token ID after logits validation.
+    Prompt processing produces no token event until its final prompt step.
+  - `EventKind::terminal`: **exactly once per accepted request**,
+    including queued cancellation, timeout, OOM, backend failure and shutdown,
+    without depending on retained history.
   A terminal event carries complete generated IDs, status and error. The
   callback runs outside scheduler locks. It may safely call
-  `enqueue/cancel/inspect/retire`, but must not call `tick/shutdown` (pump
-  recursion). Its implementation must be thread-safe because queued
-  cancellations can invoke it from a different caller thread. Exceptions
-  are captured and counted in `callback_errors_total`; consumers must check
-  that metric and avoid throwing in critical HTTP delivery paths.
+  `enqueue/cancel/inspect/retire` (including cancelling the same request
+  on token-output backpressure and retiring it in its terminal callback),
+  but must not call `tick/shutdown` (pump recursion). Its implementation
+  must be thread-safe because queued cancellations can invoke it from a
+  different caller thread. It must also be nonblocking and must queue only
+  a bounded amount of SSE output; if that queue is full, cancel the request.
+  Callbacks never own PP2 GPU state or model logits. Exceptions are captured
+  and counted in `callback_errors_total`; consumers must check that metric
+  and avoid throwing in critical HTTP delivery paths. The callback object
+  and any captured HTTP Job registry must outlive the scheduler.
 - Errors from failed allocation, invalid/nonfinite logits, wrong output size,
   backend step exceptions, and invalid contexts terminate the affected job
   and release its state. `SchedulerMetrics` reports queue/active occupancy,
@@ -126,16 +152,26 @@ g++ -std=c++17 -Wall -Wextra -Werror -pedantic -O2 \
 ```
 
 As of 2026-11-13 the same sources passed **11 original FP32 admission
-regressions** and **78 scheduler mock assertions, 0 failures**, including
+regressions** and **99 scheduler mock assertions, 0 failures**, including
 mixed-context admission, queue bounds, fairness, per-job token/position
 sequence, EOS, queued/in-flight/opening cancellation, queue expiry under load
 and within one slow backend tick,
 state-allocation failure, invalid logits, exceptions, bounded history and
 shutdown, queued cancellation with zero retained history (map eviction
 under lock), a five-request 8K FP32 pressure scenario with four admitted slots
-and delayed fifth-state admission, exact token/terminal event ordering, event delivery with zero
-retained history and callback exception isolation. The host test also passed with `-fsanitize=address,undefined`
-and leak detection. The real adapter translation unit compiled with CUDA
+and delayed fifth-state admission, exact admission/token/terminal ordering
+including failed-open terminal without admission, callback-driven cancellation
+and retirement, shutdown from a concurrent thread during an in-flight decode,
+and pathological OOM callbacks that immediately enqueue retries (16 bounded
+admission attempts per tick),
+event delivery with zero retained history and callback exception isolation.
+The host test also passed with `-fsanitize=address,undefined`
+and leak detection. An independent `-fsanitize=thread` build succeeded, but
+its runtime is **not a valid race gate** on the Ubuntu test host: a direct
+run exits 66 with `ThreadSanitizer: unexpected memory mapping` before the
+tests can complete; retry with a non-PIE binary reproduced the same runtime
+failure. Concurrency correctness therefore remains supported by deterministic
+CPU tests and ASAN, not by a verified TSAN run. The real adapter translation unit compiled with CUDA
 12.8 `nvcc -c` offline, without running model kernels.
 
 **GPU correctness and throughput remain UNTESTED for this new adapter.**
@@ -152,10 +188,15 @@ and only one **PP2 state owner per request**:
    in the existing `serving::Scheduler::active_/queue_` and do not call
    `pp2::decode_step` directly for the same request.
 2. One server worker calls `tick()` repeatedly. Its `on_event` callback
-   uses the request ID to find the corresponding HTTP Job; token events
-   append a decoded text delta and terminal events set final status/usage,
-   signal `Job::cv`, and allow `retire(id)`. The callback must not hold
-   scheduler locks (the library does not hold them).
+   uses the request ID to find the corresponding HTTP Job. On `admitted`,
+   set the HTTP Job admitted flag and signal `Job::cv`; the request thread
+   may now begin HTTP 200/SSE. On `token`, append a decoded text delta
+   into a bounded queue, or call `cancel(id)` on overflow. On `terminal`,
+   set final status/usage, signal `Job::cv`, and `retire(id)`. For jobs
+   that never emitted `admitted`, the HTTP handler can return an appropriate
+   HTTP 429/503 status, avoiding a false 200 stream. The callback must not
+   hold scheduler locks (the library does not hold them) and must never
+   write directly to a potentially blocking network sink.
 3. HTTP cancellation and client disconnect call `cancel(id)`. The server
    must bound its per-request SSE chunk buffers and cancel slow consumers.
    `SubmitCode::queue_full` should become HTTP 429; model allocation
