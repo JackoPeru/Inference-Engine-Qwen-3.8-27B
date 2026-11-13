@@ -12,16 +12,15 @@ Stato server verificato prima di agire: golden E1 diretto rigenerato, E2 rebuild
 - Quantizzazione attivazioni device-side: prototipo bit-esatto disabilitato di default (`HERMES_ENABLE_DEVICE_QUANT`), repack interleaved ancora host; verifica tiny host-vs-device prima di abilitare.
 - I 257 TFLOPS (2048³) restano prova di correttezza MMA, NON stima end-to-end (scritto nel report).
 
-## C. Correttezza kernel e test — PARZIALE
-- `kernels/src/gdn_step.cu`: eliminato `return` prima di `__syncthreads` (predicato `active`, tutti i thread alla barriera). `test_gdn_step` PASS incl. caso V=16<128 che hangava.
-- Validazione modello: top5 non basta — saver full-logits pronti (`E1_SAVE_LOGITS`, `test_logits_dump`, registrati ma fuori ctest); confronto full-logits + multi-prompt + chunked accodati dopo MTP.
-- Convenzione norme corretta a diretto `rms(x)*w` (llama `build_norm`, pesi GGUF ~1): golden (1+w) invalidato e rigenerato; dettagli `reports/NORM_CONVENTION.md`.
-- Baseline EXL3 solo per perf/comportamento, mai per numerica (checkpoint diverso).
+## C. Correttezza kernel e test — QUASI CHIUSO
+- `kernels/src/gdn_step.cu`: eliminato `return` prima di `__syncthreads` (predicato `active`). `test_gdn_step` PASS incl. caso V=16<128 che hangava.
+- Full-logits E1vsE2 11×248320 ESEGUITO: maxerr 7.75e-03 (E1 fp16), meanerr 4.17e-04; argmax 11/11 SAME, top50 50/50 (`cmp_logits.py`). Lunghezze 3,4,11,12,13,14,15 coperte; secondo prompt distinto rimandato a fase GPU (no CPU ridondanti).
+- Convenzione norme diretta `rms(x)*w` (llama `build_norm`, pesi ~1): golden (1+w) invalidato e rigenerato (`NORM_CONVENTION.md`).
+- Baseline EXL3 solo per perf/comportamento, mai per numerica.
 
-## D. MTP — semantica fixata, validazione in corso
-- `architecture/tests/test_mtp_accept.cpp` (da /tmp, registrato in CMake): exit 0 = finito+sano+identita` greedy K=1; 1 = invalido numerico; 2 = valido ma mismatch. Rollback/sampling-residua e sweep K=1..5 pending (spec `speculation/MTP_WIRING_AUDIT.md`).
-- Codice MTP conservato; priorita` a inferenza GPU completa prima delle ottimizzazioni MTP.
-- K=1 re-run in convenzione diretta in corso (il REJECT precedente era sotto (1+w), invalidato).
+## D. MTP — semantica fixata, K=1 ACCEPT
+- `test_mtp_accept`: exit 0/1/2 (identita`/invalido/mismatch). K=1 diretto: draft 17 == teacher 17 → **ACCEPT exit 0**; wiring vs llama `graph_mtp` confermato (`MTP_WIRING_AUDIT.md`).
+- Rollback/sampling-residua e sweep K=1..5 pending. Codice MTP conservato; ottimizzazioni dopo P1.
 
 ## P1-P5
 - P1 (runtime GPU PP2-first, TP2 mantenuto): disegno in `docs/M3_PP2_PLAN.md`; implementazione dopo chiusura validazione CPU/GPU-numerica. Prerequisito: finestra GPU libera (`CUDA_VISIBLE_DEVICES=1`), servizi da fermare comunicati prima — nessuna validazione dichiarata senza test reale.

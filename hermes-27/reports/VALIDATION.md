@@ -33,15 +33,15 @@
 - Gate: beta=sigmoid, g=-exp(A)*softplus(a+dt_bias) (confermato in fla gate.py).
 - Full-attn tiny vs layer transformers: 1.7e-7 (dopo fix split).
 
-## Modello reale (2026-11-13: E1==E2 PASS)
-- E1 (torch CPU fp32): prefill golden top5 `[898,34566,22197,29069,73]`.
-- E2 (C++ indipendente): `test_model_fwd` top5 identici → **MATCH E1 PASS**.
-- Decode: `test_decode_quick` T=3 prefill_vs_incr 1.57e-03 PASS,
-  decode_vs_teacher 1.85e-04 PASS. Teacher-forcing E1 (`e1_teacher.py` rot fix) in run.
-- Bug chiusi: softplus segno, gate full-attn SiLU→sigmoid, decode Q doppio-norm,
-  decode GDN doppio-GEMM (dettagli `E2_FIXES_2026-11-13.md`).
-- MTP blk.64: 15 tensori (full-attn BF16 + eh_proj/enorm/hnorm/shared_head_norm);
-  draft `mtp_draft` implementato in `model_fwd`, build OK, validazione dopo teacher.
+## Modello reale (2026-11-13: E1==E2 diretto, full-logits, MTP ACCEPT)
+- Golden vigente (norme dirette, vecchio (1+w) `[898,...]` invalidato): E1 top5
+  `[220,1374,27053,17,1147]`; E2 `test_model_fwd` identici → **MATCH PASS**.
+- Full-logits 11×248320: maxerr 7.75e-03 (E1 salvato fp16), meanerr 4.17e-04;
+  argmax 11/11 SAME, top50 50/50. Lunghezze coperte 3,4,11,12,13,14,15.
+- Decode T=3: prefill_vs_incr 1.57e-03 PASS; decode_vs_teacher 1.85e-04 PASS.
+- MTP K=1: draft 17 == teacher 17 → **ACCEPT exit 0** (wiring vs llama `graph_mtp` OK).
+- Bug chiusi: softplus segno, gate SiLU→sigmoid, norme (1+w)→(w), decode Q doppio-norm,
+  GDN doppio-GEMM (`E2_FIXES_2026-11-13.md`, `NORM_CONVENTION.md`).
 
 ## Decisioni architetturali (misurate)
 - TP2 pesi: 10.35 GiB/GPU (sharding validato, nessun BAD).
