@@ -8,6 +8,7 @@ option(HERMES_BUILD_EXACT_PREFILL_BENCH "Build isolated BF16-exact NVFP4 prefill
 option(HERMES_BUILD_MTP_GENERATOR "Build verified greedy MTP diagnostic CLI (not a speculative speedup path)" OFF)
 option(HERMES_BUILD_W4A4_PROTOTYPE "Build unapproved CUTLASS NVFP4 activation-requantizing W4A4 prototype" OFF)
 option(HERMES_BUILD_REAL_GEMV_ORACLE "Build real GGUF same-X/W Scalar/Warp4/Packed4 oracle (GPU execution manual only)" OFF)
+option(HERMES_BUILD_LAYER0_LLAMA_GEMV_ORACLE "Build same-GGUF layer0 llama-capture GEMV differential (GPU execution manual only)" OFF)
 option(HERMES_BUILD_REAL_PREFILL_TEST "Build real GGUF batched prefill state/cache/continuation gate (GPU execution manual only)" OFF)
 option(HERMES_BUILD_CHUNK_PREFILL_TEST "Build experimental T65..8192 PP2 chunked prefill test (manual GPU execution only)" OFF)
 option(HERMES_REGISTER_GPU_TESTS "Register CUDA tests in CTest (run ONLY during exclusive GPU maintenance)" OFF)
@@ -90,6 +91,13 @@ if(HERMES_BUILD_REAL_GEMV_ORACLE)
   target_link_libraries(gemv_real_compare PRIVATE hermes_gguf hermes_kernels)
   # Do NOT add gemv_real_compare to CTest; the real-checkpoint workload
   # is only permitted with both GPUs exclusively reserved.
+endif()
+if(HERMES_BUILD_LAYER0_LLAMA_GEMV_ORACLE)
+  add_executable(gemv_layer0_compare kernels/tests/gemv_layer0_compare.cu)
+  target_include_directories(gemv_layer0_compare PRIVATE kernels/tests)
+  target_link_libraries(gemv_layer0_compare PRIVATE hermes_gguf hermes_kernels)
+  # Requires an independently authenticated llama.cpp capture and explicit
+  # GPU exclusivity. Never register this full-checkpoint test in CTest.
 endif()
 add_executable(test_rmsnorm kernels/tests/test_rmsnorm.cu)
 target_link_libraries(test_rmsnorm PRIVATE hermes_kernels)
