@@ -18,9 +18,14 @@ It is **not a fused GPU batch**, does not change the CUDA kernel layout or
 promise better aggregate tokens/s. By default each turn executes exactly
 one PP2 token step per selected request. When `enable_batched_prefill=true`,
 up to 64 prompt tokens can be processed in one *stateful batched pass* on
-the same per-request state; continuation remains incremental. One pump
-thread serializes these calls; the underlying PP2 worker may later provide
-a separately verified multi-stream API.
+the same per-request state; continuation remains incremental. With the
+**separate strict opt-in `enable_parallel_steps=true`**, one scheduler pump
+dispatches a bounded wave of host worker threads on **different** active
+requests (never two steps for the same state), then joins and commits all
+token/events in deterministic round-robin selection order. It uses the
+existing per-request async PP2 streams, not a second scheduler or a new GPU
+kernel. Host thread waves still have a **join barrier** and do not implement
+event-driven overlapped staging. Real GPU throughput is unverified.
 
 The existing `BatchState`, `batch_step[_parallel]` and `admit_check`
 interfaces remain unchanged. `serving/server.cpp` now exposes an opt-in
@@ -42,6 +47,7 @@ cfg.steps_per_tick = 4;          // total decode_step calls per pump invocation
 cfg.max_retained = 64;           // terminal snapshots; set by consumer capacity
 cfg.eos_token_id = pp2::eos_token_id();
 cfg.enable_batched_prefill = false; // set true ONLY for explicit opt-in
+cfg.enable_parallel_steps = false; // strict opt-in; PP2 requires HERMES_PP2_ASYNC_STREAMS=1
 cfg.on_event = [](const pp2batch::SchedulerEvent& event) {
   // EventKind::admitted: PP2 GPU state exists; streaming response may now
   // send HTTP 200 and SSE headers.
@@ -61,6 +67,60 @@ if (scheduler.inspect("request-1", result)) { /* consume and retire result */ }
 - Enqueue validates the request ID length (1..128 bytes), nonempty prompt, token range,
   `max_new_tokens>=1`, and `prompt_len+max_new_tokens-1<=max_context`.
   The last sampled output token requires no further decode step.
+- `enable_parallel_steps=false` **remains the default** and executes the
+  previous synchronous one-request-at-a-time `tick()` loop unchanged.
+  The new opt-in uses **one** `ContinuousScheduler`, its existing
+  `pump_mutex_` and request map. There is no additional scheduler,
+  duplicative CUDA state, global scratch buffer or speculative second
+  token for any request. A wave selects at most
+  `min(max_active, steps_per_tick - executed, running_count)` **distinct**
+  active states; launches at most that many C++ host threads; joins
+  **all** workers before sampling, emitting events, releasing states or
+  starting the next wave. One request contributes at most one token
+  step per wave; positions and input tokens are captured exactly once
+  under the short scheduler metadata lock before dispatch. Selection
+  rotates the existing round-robin queue and FIFO admission stays intact.
+- `StepBackend::supports_parallel_steps() const noexcept` returns
+  **false by default**. The scheduler constructor **rejects** the
+  opt-in unless the backend explicitly advertises independent-state
+  thread safety. The production `PP2StepBackend` advertises it **only
+  when `HERMES_PP2_ASYNC_STREAMS=1`** (exact match), which enables
+  separate CUDA streams, pinned host buffers and per-request step locks
+  in `pp2_fwd.cu`. The synchronous fallback shares staging/default
+  streams and is **not** accepted for this experimental parallel path.
+  This is a capability contract, **not** evidence of hardware overlap.
+- All backend `step()` calls are outside `mutex_`. Only the worker
+  thread touches its private `DecodeState`; the pump waits for
+  completion and alone advances `prompt_consumed`, `generated`,
+  `JobStatus`, events and lifetime. One request is never selected twice
+  within a wave and `pump_mutex_` serializes concurrent `tick()`
+  callers. Worker exceptions become request-local failures; partial
+  host thread-creation failure joins every started worker then fails
+  unlaunched jobs **without unsafe fallback/replay**.
+- `cancel()` and `shutdown()` remain responsive during in-flight
+  steps. Shutdown flags stop and rejects enqueue **before** waiting for
+  `pump_mutex_`; worker results are discarded on cancellation, after
+  joining, and allocated states are released only when safe. A slow
+  or failed request cannot corrupt other states. The pump emits
+  `admitted`/`token`/`terminal` from the **single committing host
+  thread**, outside `mutex_`, in deterministic selection order.
+  A token callback that reports SSE backpressure may cancel its job;
+  no future wave steps that cancelled request. A token already
+  committed before a concurrent cancellation may legitimately be
+  delivered, always before its terminal event. Queued cancellation
+  callbacks may still occur from the cancelling thread, as before.
+- The parallel variant honors `max_active<=16`, `max_queued<=32`,
+  `steps_per_tick<=16`, mixed FP32 GPU memory admission, 16 total
+  opening attempts/tick, per-request absolute positions and waiting
+  timeouts rechecked **between waves**. A blocking full wave cannot
+  interrupt an in-flight CUDA call to enforce a queued timeout
+  instantly; the next wave or `tick()` rechecks the monotonic clock.
+  `SchedulerMetrics::parallel_waves_total` and
+  `parallel_dispatched_steps_total` count completed host dispatch
+  waves and started backend steps; `decode_steps_total` retains its
+  original meaning. Prompt seeding remains serial in `promote()`
+  and may still block the pump: parallel step dispatch alone **does
+  not fix multiuser seeded-prefill barriers**.
 - With `enable_batched_prefill=false` (default), no backend prefill call
   happens; the previous token-by-token prompt path is unchanged. Opt-in
   prefill executes **inside `tick()->promote()`** after allocating one
@@ -205,7 +265,7 @@ g++ -std=c++17 -Wall -Wextra -Werror -pedantic -O2 \
 ```
 
 As of 2026-11-13 the same sources passed **11 original FP32 admission
-regressions** and **174 scheduler mock assertions, 0 failures**, including
+regressions** and **267 scheduler mock assertions, 0 failures**, including
 mixed-context admission, queue bounds, fairness, per-job token/position
 sequence, EOS, queued/in-flight/opening cancellation, queue expiry under load
 and within one slow backend tick,
@@ -231,6 +291,16 @@ exactly three seeded passes and 69 incremental decode steps instead of
 145 token steps, with all four requests sharing weights but using exactly
 four separate allocate/free state pairs, eight token events and four
 terminal events.
+The optional parallel-step tests additionally check an initial RED compile
+failure before adding the API, followed by N4 real host-thread overlap
+(`peak_inflight>=2`) and exact sequential output/event equivalence;
+bounded N8 FIFO cohorts with only four live states/threads;
+`steps_per_tick=2` fair round-robin; parallel plus T1/11/64/65
+seeded/fallback parity; injected backend error, NaN and exception
+isolated to one state; cancellation of one in-flight request; cancel
+from SSE token callback/terminal retire; EOS; concurrent shutdown with
+four blocked decode workers and a queued request; and simultaneous
+`tick()` callers with no duplicate absolute positions or double frees.
 The host test also passed with `-fsanitize=address,undefined`
 and leak detection (earlier 161-assertion suite repeated 12 consecutive
 times with no failures). An independent `-fsanitize=thread` build succeeded, but
@@ -238,14 +308,20 @@ its runtime is **not a valid race gate** on the Ubuntu test host: a direct
 run exits 66 with `ThreadSanitizer: unexpected memory mapping` before the
 tests can complete; retry with a non-PIE binary reproduced the same runtime
 failure. Concurrency correctness therefore remains supported by deterministic
-CPU tests and ASAN, not by a verified TSAN run. The real seeded-prefill
-adapter translation unit compiled with CUDA 12.8 `nvcc -c` offline,
-without running model kernels.
+CPU tests and ASAN, not by a verified TSAN run. The PP2 scheduler adapter
+translation unit also compiled with CUDA 12.8 `nvcc -c` offline,
+without running model kernels. **All new parallel-step assertions and
+the original regressions passed under GCC `-Werror` and ASAN/UBSAN
+with leak detection**, not a performance benchmark.
 
 **Real-GPU seeded prefill correctness and throughput remain UNTESTED for this
 new scheduler integration.** This is not evidence of a speedup or whole-model
 logit parity. The independent PP2 seeded-prefill path has its own raw/BF16
 validation requirements; none are loosened by this adapter.
+**Real-GPU parallel-step correctness and multiuser throughput are also
+UNTESTED for this new opt-in**. Host-thread overlap measured by a sleeping
+CPU mock says nothing about actual two-GPU stream overlap, busy time,
+TTFT/TPOT, CUDA errors or aggregate HTTP token rate.
 The prime must authorize exclusive GPU access before measuring it against the
 target-only PP2 path with varied prompt lengths, EOS, 1/2/4/8K contexts,
 N=1/2/4, cancellation and VRAM leak tracking. Do not infer speedup from
@@ -287,8 +363,22 @@ and only one **PP2 state owner per request**:
    validate 1/11/64/65-token prompts, failed prefill before SSE headers,
    cancellation mid-prefill, and exact input/output usage. A failure after
    mutated state is terminal-only; there is no fallback on that request.
+6. For parallel host steps, the serving owner may introduce a **separate
+   explicit `--parallel-steps` opt-in**, valid only with
+   `--continuous-scheduler` and `HERMES_PP2_ASYNC_STREAMS=1`.
+   After model upload, assign
+   `options.enable_parallel_steps = cfg.parallel_steps` before constructing
+   **one** `pp2batch::ContinuousScheduler`. The constructor fails
+   closed if the backend does not certify parallel step support.
+   Do **not** start another scheduler or call PP2 decode directly from
+   serving for these jobs. Preserve stream/non-stream response, usage,
+   cancellation, SSE queue cap and event ordering. Run real HTTP
+   parallel N1/2/4/8 correctness before interpreting any throughput
+   numbers. The current flag is a proposal for the separate serving
+   owner; worker-6 did not change serving or CMake.
 
 The existing HTTP server is unchanged by worker-6. This component schedules
 token-by-token prompt processing by default and optional T<=64 stateful
-prefill only after explicit opt-in. It performs greedy decoding only; it has
-no fused decode batching, MTP rollback or SSE transport.
+prefill and/or bounded parallel host step waves only after separate explicit
+opt-ins. It performs greedy decoding only and has no fused decode
+batching, MTP rollback, fully event-driven pipeline or SSE transport.

@@ -20,6 +20,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <thread>
+#include <tuple>
 #ifndef HERMES_ADMISSION_CPU_ONLY
 #include <cuda_runtime.h>
 #endif
@@ -136,6 +137,79 @@ struct FakeBackend final : pp2batch::StepBackend {
   }
 };
 
+// Independent, thread-safe mock: each open() returns one exclusive state,
+// while step() records the maximum number of SIMULTANEOUS in-flight calls.
+// A serial scheduler cannot pass the overlap requirement below.
+struct ParallelProbeBackend final : pp2batch::StepBackend {
+  struct State { int serial, capacity, next_pos; };
+  struct Call { int serial, token; long position; };
+  mutable std::mutex mu;
+  std::vector<Call> calls;
+  std::atomic<int> inflight{0}, peak_inflight{0}, opens{0}, closes{0};
+  std::atomic<int> serial_counter{0};
+  std::atomic<int> prefill_calls{0};
+  std::atomic<int> fail_serial{0}, nan_serial{0}, throw_serial{0};
+  bool permit_parallel = true;
+  bool support_seeded = false;
+  std::chrono::milliseconds latency{12};
+  std::function<void(int)> after_enter;
+
+  bool supports_parallel_steps() const noexcept override { return permit_parallel; }
+  bool open(int capacity, void*& state, std::string&) override {
+    state = new State{++serial_counter, capacity, 0};
+    ++opens;
+    return true;
+  }
+  bool step(void* state, int token, long pos,
+            std::vector<float>& logits, std::string& error) override {
+    auto* s = static_cast<State*>(state);
+    const int current = inflight.fetch_add(1) + 1;
+    for (int prior = peak_inflight.load(); current > prior &&
+         !peak_inflight.compare_exchange_weak(prior, current);) {}
+    if (after_enter) after_enter(s->serial);
+    std::this_thread::sleep_for(latency);
+    bool valid = pos == s->next_pos && pos >= 0 && pos < s->capacity;
+    if (valid) ++s->next_pos;
+    {
+      std::lock_guard<std::mutex> guard(mu);
+      calls.push_back({s->serial, token, pos});
+    }
+    inflight.fetch_sub(1);
+    if (!valid) { error = "duplicate or out-of-order per-request position"; return false; }
+    if (throw_serial == s->serial)
+      throw std::runtime_error("injected request-local parallel CUDA failure");
+    if (fail_serial == s->serial) {
+      error = "injected request-local step error";
+      return false;
+    }
+    logits.assign(8, -1.f);
+    if (nan_serial == s->serial)
+      logits[0] = std::numeric_limits<float>::quiet_NaN();
+    logits[2] = 1.f;
+    return true;
+  }
+  pp2batch::PrefillResult prefill(void* state, const std::vector<int>& prompt,
+                                 std::vector<float>& last_logits,
+                                 std::string& error) override {
+    ++prefill_calls;
+    if (!support_seeded) return pp2batch::PrefillResult::unsupported;
+    auto* s = static_cast<State*>(state);
+    if (s->next_pos != 0 || prompt.empty() ||
+        prompt.size() > 64 || prompt.size() > static_cast<size_t>(s->capacity)) {
+      error = "invalid/advanced parallel-seed state";
+      return pp2batch::PrefillResult::failed;
+    }
+    s->next_pos = static_cast<int>(prompt.size());
+    last_logits.assign(8, -1.f);
+    last_logits[2] = 1.f;
+    return pp2batch::PrefillResult::success;
+  }
+  void close(void* state) noexcept override {
+    delete static_cast<State*>(state);
+    ++closes;
+  }
+};
+
 int checks = 0, failures = 0;
 void expect(bool pass, const char* name) {
   ++checks;
@@ -163,6 +237,431 @@ bool has_status(pp2batch::ContinuousScheduler& s, const std::string& id,
 int run_scheduler_tests() {
   using namespace pp2batch;
   using namespace std::chrono;
+  // RED gate: a scheduler that merely rotates jobs serially inside tick()
+  // cannot pass overlap N4, even if CUDA streams exist underneath.
+  // Exact terminal, token and usage ordering must match the serial oracle.
+  {
+    auto execute = [&](bool parallel) {
+      ParallelProbeBackend backend;
+      auto cfg = config();
+      cfg.max_active = 4;
+      cfg.max_queued = 4;
+      cfg.steps_per_tick = 4;
+      cfg.queue_timeout = seconds(60);
+      cfg.enable_parallel_steps = parallel;
+      std::vector<std::string> events;
+      cfg.on_event = [&](const SchedulerEvent& e) {
+        events.push_back(e.id + (e.kind == EventKind::admitted ? ":admitted" :
+                                 e.kind == EventKind::token ? ":token" : ":terminal"));
+      };
+      ContinuousScheduler scheduler(cfg, backend);
+      for (int i = 0; i < 4; ++i)
+        expect(scheduler.enqueue({"P" + std::to_string(i), {i + 1}, 2}).code ==
+               SubmitCode::accepted, "parallel N4 enqueues");
+      std::size_t steps = scheduler.tick();
+      steps += scheduler.tick();
+      std::vector<JobSnapshot> outputs(4);
+      for (int i = 0; i < 4; ++i)
+        expect(scheduler.inspect("P" + std::to_string(i), outputs[i]) &&
+               outputs[i].status == JobStatus::completed,
+               "parallel N4 all requests complete");
+      expect(steps == 8 && scheduler.metrics().decode_steps_total == 8 &&
+             backend.opens == 4 && backend.closes == 4 && backend.inflight == 0,
+             "parallel N4 state lifecycle / exact eight steps");
+      return std::make_tuple(events, outputs, backend.peak_inflight.load());
+    };
+    auto serial = execute(false);
+    auto parallel = execute(true);
+    expect(std::get<0>(serial) == std::get<0>(parallel),
+           "parallel N4 admitted/token/terminal order identical to sequential");
+    for (int i = 0; i < 4; ++i)
+      expect(std::get<1>(serial)[i].prompt_consumed ==
+                 std::get<1>(parallel)[i].prompt_consumed &&
+             std::get<1>(serial)[i].generated == std::get<1>(parallel)[i].generated &&
+             std::get<1>(parallel)[i].generated == std::vector<int>({2, 2}),
+             "parallel N4 prompt/usage/output bit-exact to sequential oracle");
+    expect(std::get<2>(serial) == 1 && std::get<2>(parallel) >= 2 &&
+           std::get<2>(parallel) <= 4,
+           "parallel N4 genuinely overlaps independent backend steps");
+  }
+  {
+    ParallelProbeBackend backend;
+    backend.permit_parallel = false;
+    auto cfg = config();
+    cfg.enable_parallel_steps = true;
+    bool rejected = false;
+    try { ContinuousScheduler incompatible(cfg, backend); }
+    catch (const std::invalid_argument&) { rejected = true; }
+    expect(rejected, "parallel opt-in rejects backend without thread-safety contract");
+  }
+  // N8 must remain bounded at four concurrently resident states and a
+  // four-thread wave. The second FIFO cohort starts only after release.
+  {
+    ParallelProbeBackend backend;
+    auto cfg = config();
+    cfg.enable_parallel_steps = true;
+    cfg.max_active = 4;
+    cfg.max_queued = 8;
+    cfg.steps_per_tick = 4;
+    cfg.queue_timeout = seconds(60);
+    std::vector<std::string> admitted;
+    cfg.on_event = [&](const SchedulerEvent& event) {
+      if (event.kind == EventKind::admitted)
+        admitted.push_back(event.id);
+    };
+    ContinuousScheduler scheduler(cfg, backend);
+    for (int i = 0; i < 8; ++i)
+      expect(scheduler.enqueue({"bound-P" + std::to_string(i), {(i % 7) + 1}, 1}).code ==
+                 SubmitCode::accepted,
+             "parallel N8 bounded queue enqueue");
+    expect(scheduler.tick() == 4 && scheduler.metrics().queued == 4 &&
+           scheduler.metrics().active == 0,
+           "parallel N8 only first FIFO cohort executes during first tick");
+    expect(scheduler.tick() == 4 && scheduler.metrics().queued == 0 &&
+           scheduler.metrics().completed_total == 8,
+           "parallel N8 second cohort admitted when first frees states");
+    expect(backend.peak_inflight == 4 && backend.opens == 8 &&
+           backend.closes == 8 && backend.inflight == 0 &&
+           scheduler.metrics().parallel_dispatched_steps_total == 8,
+           "parallel N8 maximum threads bounded by max_active four");
+    expect(admitted == std::vector<std::string>({
+             "bound-P0", "bound-P1", "bound-P2", "bound-P3",
+             "bound-P4", "bound-P5", "bound-P6", "bound-P7"}),
+           "parallel N8 strict FIFO admission across active waves");
+  }
+  // EOS and callback-driven backpressure are terminal after one sampled
+  // output; a cancelled job is never sent another step in a later wave.
+  {
+    ParallelProbeBackend backend;
+    auto cfg = config();
+    cfg.enable_parallel_steps = true;
+    cfg.max_active = 4;
+    cfg.max_queued = 4;
+    cfg.steps_per_tick = 4;
+    cfg.queue_timeout = seconds(60);
+    cfg.eos_token_id = 2;
+    ContinuousScheduler scheduler(cfg, backend);
+    for (int i = 0; i < 4; ++i)
+      scheduler.enqueue({"eos-P" + std::to_string(i), {i + 1}, 8});
+    expect(scheduler.tick() == 4 && scheduler.metrics().completed_total == 4 &&
+           backend.opens == 4 && backend.closes == 4,
+           "parallel EOS sampled once per request, no duplicate GPU steps");
+    for (int i = 0; i < 4; ++i)
+      expect(has_status(scheduler, "eos-P" + std::to_string(i),
+                        JobStatus::completed, 1),
+             "parallel EOS exact one completion token per request");
+  }
+  {
+    ParallelProbeBackend backend;
+    auto cfg = config();
+    cfg.enable_parallel_steps = true;
+    cfg.max_active = 4;
+    cfg.max_queued = 4;
+    cfg.steps_per_tick = 4;
+    cfg.queue_timeout = seconds(60);
+    std::vector<std::string> terminals;
+    ContinuousScheduler* ptr = nullptr;
+    cfg.on_event = [&](const SchedulerEvent& event) {
+      if (event.kind == EventKind::token && event.id == "backpressure-P1")
+        expect(ptr->cancel(event.id), "parallel SSE backpressure cancel from callback");
+      if (event.kind == EventKind::terminal) {
+        terminals.push_back(event.id);
+        expect(ptr->retire(event.id), "parallel terminal callback reentrantly retires");
+      }
+    };
+    ContinuousScheduler scheduler(cfg, backend);
+    ptr = &scheduler;
+    for (int i = 0; i < 4; ++i)
+      scheduler.enqueue({"backpressure-P" + std::to_string(i), {i + 1}, 2});
+    expect(scheduler.tick() == 4 &&
+           scheduler.metrics().cancelled_total == 1 &&
+           scheduler.metrics().active == 3,
+           "parallel backpressure cancels only its request in first wave");
+    expect(scheduler.tick() == 3 &&
+           scheduler.metrics().completed_total == 3 &&
+           backend.opens == 4 && backend.closes == 4,
+           "parallel cancelled request gets no second decode step");
+    JobSnapshot removed;
+    expect(!scheduler.inspect("backpressure-P1", removed) &&
+           terminals == std::vector<std::string>({
+             "backpressure-P1", "backpressure-P0",
+             "backpressure-P2", "backpressure-P3"}),
+           "parallel SSE exact terminal ordering and safe retire callback");
+  }
+  // Two simultaneous tick() callers are serialized by pump_mutex_. A
+  // second host caller cannot submit position 0 again on any live state.
+  {
+    ParallelProbeBackend backend;
+    auto cfg = config();
+    cfg.enable_parallel_steps = true;
+    cfg.max_active = 4;
+    cfg.max_queued = 4;
+    cfg.steps_per_tick = 4;
+    cfg.queue_timeout = seconds(60);
+    ContinuousScheduler scheduler(cfg, backend);
+    for (int i = 0; i < 4; ++i)
+      scheduler.enqueue({"dual-tick-P" + std::to_string(i), {i + 1}, 2});
+    std::atomic<std::size_t> total{0};
+    std::thread a([&] { total += scheduler.tick(); });
+    std::thread b([&] { total += scheduler.tick(); });
+    a.join();
+    b.join();
+    expect(total == 8 && scheduler.metrics().completed_total == 4 &&
+           scheduler.metrics().failed_total == 0 &&
+           backend.opens == 4 && backend.closes == 4,
+           "parallel simultaneous tick callers cannot replay same position");
+    std::size_t first_steps = 0, second_steps = 0;
+    for (const auto& call : backend.calls) {
+      first_steps += call.position == 0;
+      second_steps += call.position == 1;
+    }
+    expect(first_steps == 4 && second_steps == 4,
+           "parallel duplicate tick prevented by one pump mutex");
+  }
+  // Both opt-in flags may coexist without duplicate state seeding. Compare
+  // mixed T1/11/64/65 to the serial seeded reference, including fallback.
+  {
+    auto execute = [&](bool parallel) {
+      ParallelProbeBackend backend;
+      backend.support_seeded = true;
+      backend.latency = milliseconds(2);
+      auto cfg = config();
+      cfg.enable_parallel_steps = parallel;
+      cfg.enable_batched_prefill = true;
+      cfg.max_active = 4;
+      cfg.max_queued = 4;
+      cfg.max_context = 128;
+      cfg.steps_per_tick = 4;
+      cfg.queue_timeout = seconds(60);
+      std::vector<std::string> events;
+      cfg.on_event = [&](const SchedulerEvent& e) {
+        events.push_back(e.id + (e.kind == EventKind::admitted ? ":admitted" :
+                                 e.kind == EventKind::token ? ":token" : ":terminal"));
+      };
+      ContinuousScheduler scheduler(cfg, backend);
+      for (int t : {1, 11, 64, 65})
+        scheduler.enqueue({"mixed-" + std::to_string(t),
+                           std::vector<int>(static_cast<size_t>(t), 1), 2});
+      std::size_t total = 0;
+      for (int i = 0; i < 40 && scheduler.metrics().completed_total != 4; ++i)
+        total += scheduler.tick();
+      std::vector<JobSnapshot> jobs(4);
+      for (std::size_t i = 0; i < jobs.size(); ++i) {
+        const int t = (i == 0 ? 1 : i == 1 ? 11 : i == 2 ? 64 : 65);
+        expect(scheduler.inspect("mixed-" + std::to_string(t), jobs[i]) &&
+               jobs[i].status == JobStatus::completed &&
+               jobs[i].prompt_consumed == static_cast<size_t>(t) &&
+               jobs[i].generated == std::vector<int>({2, 2}),
+               "parallel and serial seeded mixed request usage/outputs");
+      }
+      expect(backend.prefill_calls == 3 &&
+             scheduler.metrics().prefill_seeded_total == 3 &&
+             scheduler.metrics().prefill_prompt_tokens_total == 76 &&
+             total == 69 && backend.opens == 4 && backend.closes == 4,
+             "parallel+seeded exact three prefill passes and 69 incremental steps");
+      return std::make_tuple(events, jobs, backend.peak_inflight.load());
+    };
+    auto serial = execute(false);
+    auto parallel = execute(true);
+    expect(std::get<0>(serial) == std::get<0>(parallel),
+           "parallel+seeded N4 admission/token/terminal event order identical");
+    for (std::size_t i = 0; i < 4; ++i)
+      expect(std::get<1>(serial)[i].prompt_consumed ==
+                 std::get<1>(parallel)[i].prompt_consumed &&
+             std::get<1>(serial)[i].generated == std::get<1>(parallel)[i].generated,
+             "parallel+seeded N4 exact positions and token count parity");
+    expect(std::get<2>(parallel) <= 4 && std::get<2>(parallel) >= 2,
+           "parallel+seeded bounded concurrent continuation on independent states");
+  }
+  // A smaller step quantum than active occupancy must preserve round-robin
+  // fairness. A second pump must not run on the first pump's live state.
+  {
+    ParallelProbeBackend backend;
+    auto cfg = config();
+    cfg.enable_parallel_steps = true;
+    cfg.max_active = 4;
+    cfg.max_queued = 4;
+    cfg.steps_per_tick = 2;
+    cfg.queue_timeout = seconds(60);
+    std::vector<std::string> tokens;
+    cfg.on_event = [&](const SchedulerEvent& event) {
+      if (event.kind == EventKind::token)
+        tokens.push_back(event.id);
+    };
+    ContinuousScheduler scheduler(cfg, backend);
+    for (int i = 0; i < 4; ++i)
+      scheduler.enqueue({"fair-P" + std::to_string(i), {i + 1}, 2});
+    for (int i = 0; i < 4; ++i)
+      expect(scheduler.tick() == 2, "parallel fairness tick dispatches exact quantum");
+    expect(tokens == std::vector<std::string>({
+             "fair-P0", "fair-P1", "fair-P2", "fair-P3",
+             "fair-P0", "fair-P1", "fair-P2", "fair-P3"}),
+           "parallel fairness FIFO round-robin with quantum smaller than active");
+    expect(backend.peak_inflight == 2 && backend.opens == backend.closes &&
+           scheduler.metrics().parallel_dispatched_steps_total == 8 &&
+           scheduler.metrics().parallel_waves_total == 4,
+           "parallel fairness thread bound, waves and state lifetime");
+  }
+  // Partial backend failures must terminate ONLY the bad state, after all
+  // workers have joined; no failed state may be retried or sampled.
+  for (int mode = 0; mode < 3; ++mode) {
+    ParallelProbeBackend backend;
+    if (mode == 0) backend.fail_serial = 2;
+    if (mode == 1) backend.nan_serial = 2;
+    if (mode == 2) backend.throw_serial = 2;
+    auto cfg = config();
+    cfg.enable_parallel_steps = true;
+    cfg.max_active = 4;
+    cfg.max_queued = 4;
+    cfg.steps_per_tick = 4;
+    cfg.queue_timeout = seconds(60);
+    std::vector<std::string> terminal;
+    cfg.on_event = [&](const SchedulerEvent& e) {
+      if (e.kind == EventKind::terminal) terminal.push_back(e.id);
+    };
+    ContinuousScheduler scheduler(cfg, backend);
+    for (int i = 0; i < 4; ++i)
+      scheduler.enqueue({"fail-P" + std::to_string(i), {i + 1}, 1});
+    expect(scheduler.tick() == 4 &&
+           has_status(scheduler, "fail-P1", JobStatus::failed) &&
+           scheduler.metrics().failed_total == 1,
+           "parallel backend error/nonfinite/throw isolated to one request");
+    expect(has_status(scheduler, "fail-P0", JobStatus::completed, 1) &&
+           has_status(scheduler, "fail-P2", JobStatus::completed, 1) &&
+           has_status(scheduler, "fail-P3", JobStatus::completed, 1) &&
+           backend.opens == 4 && backend.closes == 4,
+           "parallel sibling requests survive one poisoned state and close all states");
+    expect(terminal == std::vector<std::string>({
+             "fail-P0", "fail-P1", "fail-P2", "fail-P3"}),
+           "parallel terminal event order independent of host worker completion");
+  }
+  // Cancel in-flight while four states each have an outstanding GPU step.
+  // The cancelled output must never leak into SSE or be processed twice.
+  {
+    ParallelProbeBackend backend;
+    backend.latency = milliseconds(1);
+    std::mutex gate_mutex;
+    std::condition_variable gate_cv;
+    bool release = false;
+    std::atomic<int> entered{0};
+    backend.after_enter = [&](int) {
+      entered.fetch_add(1);
+      gate_cv.notify_all();
+      std::unique_lock<std::mutex> guard(gate_mutex);
+      gate_cv.wait(guard, [&] { return release; });
+    };
+    auto cfg = config();
+    cfg.enable_parallel_steps = true;
+    cfg.max_active = 4;
+    cfg.max_queued = 4;
+    cfg.steps_per_tick = 4;
+    cfg.queue_timeout = seconds(60);
+    std::vector<std::string> token_events, terminal_events;
+    cfg.on_event = [&](const SchedulerEvent& event) {
+      if (event.kind == EventKind::token) token_events.push_back(event.id);
+      if (event.kind == EventKind::terminal) terminal_events.push_back(event.id);
+    };
+    ContinuousScheduler scheduler(cfg, backend);
+    for (int i = 0; i < 4; ++i)
+      scheduler.enqueue({"cancel-P" + std::to_string(i), {i + 1}, 2});
+    std::atomic<std::size_t> first_steps{99};
+    std::thread pump([&] { first_steps = scheduler.tick(); });
+    {
+      std::unique_lock<std::mutex> guard(gate_mutex);
+      const bool all_started = gate_cv.wait_for(
+          guard, seconds(2), [&] { return entered.load() == 4; });
+      expect(all_started, "parallel cancel test overlaps all four backend calls");
+    }
+    expect(scheduler.cancel("cancel-P1"),
+           "parallel cancelling one in-flight request is responsive");
+    {
+      std::lock_guard<std::mutex> guard(gate_mutex);
+      release = true;
+    }
+    gate_cv.notify_all();
+    pump.join();
+    expect(first_steps == 4 &&
+           has_status(scheduler, "cancel-P1", JobStatus::cancelled, 0) &&
+           scheduler.metrics().active == 3,
+           "parallel in-flight cancel discards only selected request logits");
+    expect(scheduler.tick() == 3 &&
+           scheduler.metrics().completed_total == 3 &&
+           scheduler.metrics().cancelled_total == 1 &&
+           backend.opens == 4 && backend.closes == 4,
+           "parallel cancel continues three independent requests without leaks");
+    expect(std::count(token_events.begin(), token_events.end(), "cancel-P1") == 0 &&
+           std::count(terminal_events.begin(), terminal_events.end(), "cancel-P1") == 1,
+           "parallel cancellation produces zero token and one terminal for cancelled state");
+  }
+  // Same shutdown ordering as the existing serial gate: immediately reject
+  // new requests while a full wave is blocked in backend_.step(), then
+  // join, discard any results and close exactly once.
+  {
+    ParallelProbeBackend backend;
+    backend.latency = milliseconds(1);
+    std::mutex gate_mutex;
+    std::condition_variable gate_cv;
+    bool release = false;
+    std::atomic<int> entered{0};
+    backend.after_enter = [&](int) {
+      entered.fetch_add(1);
+      gate_cv.notify_all();
+      std::unique_lock<std::mutex> guard(gate_mutex);
+      gate_cv.wait(guard, [&] { return release; });
+    };
+    auto cfg = config();
+    cfg.enable_parallel_steps = true;
+    cfg.max_active = 4;
+    cfg.max_queued = 5;
+    cfg.steps_per_tick = 4;
+    cfg.queue_timeout = seconds(60);
+    std::vector<SchedulerEvent> events;
+    cfg.on_event = [&](const SchedulerEvent& event) {
+      events.push_back(event);
+    };
+    ContinuousScheduler scheduler(cfg, backend);
+    for (int i = 0; i < 4; ++i)
+      scheduler.enqueue({"stop-P" + std::to_string(i), {i + 1}, 3});
+    scheduler.enqueue({"stop-wait", {5}, 1});
+    std::atomic<std::size_t> first_steps{99};
+    std::thread pump([&] { first_steps = scheduler.tick(); });
+    {
+      std::unique_lock<std::mutex> guard(gate_mutex);
+      const bool all_started = gate_cv.wait_for(
+          guard, seconds(2), [&] { return entered.load() == 4; });
+      expect(all_started, "parallel shutdown test overlaps all active states");
+    }
+    std::thread stopping([&] { scheduler.shutdown(); });
+    bool flagged = false;
+    for (int i = 0; i < 2000 && !flagged; ++i) {
+      flagged = scheduler.metrics().stopping;
+      if (!flagged) std::this_thread::sleep_for(milliseconds(1));
+    }
+    expect(flagged, "parallel stop flag visible before wave finishes");
+    if (flagged)
+      expect(scheduler.enqueue({"stop-late", {1}, 1}).code == SubmitCode::stopped,
+             "parallel shutdown refuses late enqueue while backend blocked");
+    {
+      std::lock_guard<std::mutex> guard(gate_mutex);
+      release = true;
+    }
+    gate_cv.notify_all();
+    pump.join();
+    stopping.join();
+    expect(first_steps == 4 && backend.opens == 4 && backend.closes == 4 &&
+           scheduler.metrics().active == 0 && scheduler.metrics().queued == 0 &&
+           scheduler.metrics().cancelled_total == 5,
+           "parallel shutdown waits for four steps, releases all states and queue");
+    std::size_t admitted = 0, tokens = 0, terminal = 0;
+    for (const auto& event : events) {
+      admitted += event.kind == EventKind::admitted;
+      tokens += event.kind == EventKind::token;
+      terminal += event.kind == EventKind::terminal;
+    }
+    expect(admitted == 4 && tokens == 0 && terminal == 5 &&
+           scheduler.tick() == 0 && backend.inflight == 0,
+           "parallel shutdown yields no post-stop token and one terminal per request");
+  }
   // Stateful seeded prefill consumes the full prompt on the SAME newly
   // allocated backend state, emits only the LAST prompt logit's greedy token,
   // and resumes the normal decoder at absolute position T (never replays).

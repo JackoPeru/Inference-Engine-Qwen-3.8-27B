@@ -67,6 +67,7 @@ struct Config {
   int gpu1_start_limit_mib = 2500;
   bool continuous_scheduler = false; // Experimental opt-in; legacy is default.
   bool batched_prefill = false;       // Opt-in seeded PP2 prefill for prompts of <=64.
+  bool parallel_steps = false;        // Opt-in distinct-state concurrent scheduler waves.
 };
 
 void usage(FILE* out) {
@@ -76,6 +77,7 @@ void usage(FILE* out) {
     "Optional: --tokenizer FILE --gguf-dump FILE --python FILE --model-id ID\n"
     "Experimental: --continuous-scheduler (single-owner PP2 scheduler, opt-in)\n"
     "Experimental: --batched-prefill (seed fresh PP2 state for prompts of 1..64 tokens)\n"
+    "Experimental: --parallel-steps (continuous scheduler ONLY; requires HERMES_PP2_ASYNC_STREAMS=1; no seeded prefill)\n"
     "Greedy text-only PP2; context defaults to 128. Unsupported sampling/tools are rejected.\n");
 }
 
@@ -95,6 +97,7 @@ bool parse_args(int argc, char** argv, Config& cfg, bool& show_help) {
     if (arg == "--help" || arg == "-h") { usage(stdout); show_help = true; return false; }
     if (arg == "--continuous-scheduler") { cfg.continuous_scheduler = true; continue; }
     if (arg == "--batched-prefill") { cfg.batched_prefill = true; continue; }
+    if (arg == "--parallel-steps") { cfg.parallel_steps = true; continue; }
     if (i + 1 >= argc) { std::fprintf(stderr, "missing value for %s\n", arg.c_str()); return false; }
     const char* value = argv[++i];
     if (arg == "--model") cfg.model = value;
@@ -366,6 +369,12 @@ class ServerContinuousBackend final : public pp2batch::StepBackend {
                               position, error);
     return !logits.empty();
   }
+  bool supports_parallel_steps() const noexcept override {
+    // CPU fake PP2 backs this adapter only in the dedicated test build.
+    // Preserve the same explicit admission condition as real PP2.
+    const char* value = std::getenv("HERMES_PP2_ASYNC_STREAMS");
+    return value && std::strcmp(value, "1") == 0;
+  }
   pp2batch::PrefillResult prefill(
       void* state, const std::vector<int>& prompt,
       std::vector<float>& last_logits, std::string& error) override {
@@ -408,6 +417,7 @@ class Scheduler {
       options.queue_timeout = std::chrono::seconds(cfg.queue_timeout_sec);
       options.max_retained = 64;
       options.enable_batched_prefill = cfg.batched_prefill;
+      options.enable_parallel_steps = cfg.parallel_steps;
       options.on_event = [this](const pp2batch::SchedulerEvent& event) {
         continuous_event(event);
       };
@@ -478,6 +488,7 @@ class Scheduler {
     std::uint64_t prefill_seeded = metrics_.prefill_seeded.load();
     std::uint64_t prefill_failed = metrics_.prefill_failed.load();
     std::uint64_t prefill_tokens = metrics_.prefill_prompt_tokens.load();
+    std::size_t parallel_waves = 0, parallel_dispatched_steps = 0;
     {
       std::lock_guard<std::mutex> lock(mutex_);
       if (!continuous_) { queued = queue_.size(); active = active_.size(); }
@@ -490,6 +501,8 @@ class Scheduler {
       prefill_seeded = current.prefill_seeded_total;
       prefill_failed = current.prefill_failed_total;
       prefill_tokens = current.prefill_prompt_tokens_total;
+      parallel_waves = current.parallel_waves_total;
+      parallel_dispatched_steps = current.parallel_dispatched_steps_total;
     }
     size_t used0 = 0, used1 = 0;
     pp2batch::vram_used(used0, used1);
@@ -506,6 +519,8 @@ class Scheduler {
     out += "# TYPE hermes_prefill_seeded_total counter\nhermes_prefill_seeded_total " + std::to_string(prefill_seeded) + "\n";
     out += "# TYPE hermes_prefill_failed_total counter\nhermes_prefill_failed_total " + std::to_string(prefill_failed) + "\n";
     out += "# TYPE hermes_prefill_prompt_tokens_total counter\nhermes_prefill_prompt_tokens_total " + std::to_string(prefill_tokens) + "\n";
+    out += "# TYPE hermes_parallel_waves_total counter\nhermes_parallel_waves_total " + std::to_string(parallel_waves) + "\n";
+    out += "# TYPE hermes_parallel_dispatched_steps_total counter\nhermes_parallel_dispatched_steps_total " + std::to_string(parallel_dispatched_steps) + "\n";
     out += "# TYPE hermes_inference_errors_total counter\nhermes_inference_errors_total " + std::to_string(m.errors.load()) + "\n";
     out += "# TYPE hermes_requests_active gauge\nhermes_requests_active " + std::to_string(active) + "\n";
     out += "# TYPE hermes_requests_queued gauge\nhermes_requests_queued " + std::to_string(queued) + "\n";
@@ -1310,6 +1325,16 @@ int main(int argc, char** argv) {
   Config cfg;
   bool show_help = false;
   if (!parse_args(argc, argv, cfg, show_help)) return show_help ? 0 : 2;
+  if (cfg.parallel_steps) {
+    const char* async_flag = std::getenv("HERMES_PP2_ASYNC_STREAMS");
+    if (!cfg.continuous_scheduler || cfg.batched_prefill ||
+        !async_flag || std::strcmp(async_flag, "1") != 0) {
+      std::fprintf(stderr,
+          "--parallel-steps requires --continuous-scheduler, "
+          "HERMES_PP2_ASYNC_STREAMS=1, and forbids --batched-prefill (fail-closed)\n");
+      return 2;
+    }
+  }
   if (cfg.batched_prefill) {
     const char* bf16 = std::getenv("HERMES_PP2_PREFILL_BF16");
     if (bf16 && std::strcmp(bf16, "1") == 0) {

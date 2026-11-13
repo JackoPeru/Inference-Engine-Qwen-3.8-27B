@@ -13,7 +13,8 @@ PORT="${HERMES_TEST_PORT:-18127}"
 MODE="${HERMES_TEST_MODE:-async}"
 SCHEDULER="${HERMES_TEST_SCHEDULER:-legacy}"
 PREFILL="${HERMES_TEST_BATCHED_PREFILL:-0}"
-LOG="${ROOT}/http-smoke-${MODE}-${SCHEDULER}-seed${PREFILL}.log"
+PARALLEL="${HERMES_TEST_PARALLEL_STEPS:-0}"
+LOG="${ROOT}/http-smoke-${MODE}-${SCHEDULER}-seed${PREFILL}-parallel${PARALLEL}.log"
 SERVER_PID=""
 
 for file in "${BUILD}/hermes_server" "${BUILD}/gguf_dump" "${SOURCE}/serving/tokenizer_bridge.py" "${SOURCE}/serving/smoke.py" "${MODEL}" "${TOKENIZER}" "${PYTHON}"; do
@@ -36,6 +37,15 @@ if [[ "$SCHEDULER" != "continuous" && "$SCHEDULER" != "legacy" ]]; then
 fi
 if [[ "$PREFILL" != 0 && "$PREFILL" != 1 ]]; then
   echo "BLOCKED: HERMES_TEST_BATCHED_PREFILL must be 0 or 1" >&2
+  exit 77
+fi
+if [[ "$PARALLEL" != 0 && "$PARALLEL" != 1 ]]; then
+  echo "BLOCKED: HERMES_TEST_PARALLEL_STEPS must be 0 or 1" >&2
+  exit 77
+fi
+if [[ "$PARALLEL" == 1 ]] &&
+   { [[ "$MODE" != "async" ]] || [[ "$SCHEDULER" != "continuous" ]] || [[ "$PREFILL" != 0 ]]; }; then
+  echo "BLOCKED: parallel-steps requires async continuous scheduler without seeded prefill" >&2
   exit 77
 fi
 if ss -ltnH "( sport = :${PORT} )" | grep -q .; then
@@ -76,6 +86,9 @@ fi
 if [[ "$PREFILL" == 1 ]]; then
   scheduler_args+=(--batched-prefill)
 fi
+if [[ "$PARALLEL" == 1 ]]; then
+  scheduler_args+=(--parallel-steps)
+fi
 
 cleanup() {
   if [[ -n "$SERVER_PID" ]]; then
@@ -113,7 +126,7 @@ if [[ "$ready" != 1 ]]; then
   tail -n 40 "$LOG" >&2
   exit 1
 fi
-echo "SCRATCH SERVER READY mode=$MODE scheduler=$SCHEDULER batched_prefill=$PREFILL port=$PORT"
+echo "SCRATCH SERVER READY mode=$MODE scheduler=$SCHEDULER batched_prefill=$PREFILL parallel_steps=$PARALLEL port=$PORT"
 timeout --signal=TERM --kill-after=10 175 "$PYTHON" -B "${SOURCE}/serving/smoke.py" \
   --base-url "http://127.0.0.1:${PORT}" --model hermes-27
 metrics="$(curl --fail --silent --max-time 10 "http://127.0.0.1:${PORT}/metrics")"
@@ -135,6 +148,18 @@ if (( failed != 0 )) ||
   exit 1
 fi
 echo "REAL HTTP PREFILL COUNTERS: PASS seeded=$seeded failed=$failed tokens=$prompt_tokens flag=$PREFILL"
+parallel_dispatched="$(metric_value hermes_parallel_dispatched_steps_total)"
+parallel_waves="$(metric_value hermes_parallel_waves_total)"
+if [[ ! "$parallel_dispatched" =~ ^[0-9]+$ || ! "$parallel_waves" =~ ^[0-9]+$ ]]; then
+  echo "FAIL: missing numeric parallel scheduler counters" >&2
+  exit 1
+fi
+if { [[ "$PARALLEL" == 1 ]] && (( parallel_dispatched < 1 || parallel_waves < 1 )); } ||
+   { [[ "$PARALLEL" == 0 ]] && (( parallel_dispatched != 0 || parallel_waves != 0 )); }; then
+  echo "FAIL: parallel counters do not match opt-in policy (waves=$parallel_waves steps=$parallel_dispatched flag=$PARALLEL)" >&2
+  exit 1
+fi
+echo "REAL HTTP PARALLEL COUNTERS: PASS waves=$parallel_waves steps=$parallel_dispatched flag=$PARALLEL"
 echo "SCRATCH HTTP GPU SMOKE: PASS mode=$MODE scheduler=$SCHEDULER batched_prefill=$PREFILL"
 if [[ "${HERMES_TEST_LOAD:-0}" == 1 ]]; then
   if [[ "${HERMES_TEST_LOAD_STYLE:-arithmetic}" == "explain" ]]; then

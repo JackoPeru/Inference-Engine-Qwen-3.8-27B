@@ -73,6 +73,9 @@ void vram_used(size_t& used0_MiB, size_t& used1_MiB);
 // Backend calls are made outside the scheduler metadata mutex, so cancel()
 // remains responsive while a GPU decode_step is running. Cancellation takes
 // effect after the current non-interruptible decode_step returns.
+// Optional parallel dispatch uses at most max_active host threads per wave,
+// one independent request state per thread, and deterministic pump-side
+// token/event commits AFTER joining. No second scheduler owns those states.
 using SchedulerClock = std::chrono::steady_clock;
 
 struct ScheduledRequest {
@@ -124,6 +127,11 @@ struct SchedulerConfig {
   // for a single T-token PP2 stateful prefill when 1 <= prompt.size() <= 64.
   // Default false preserves the incremental prompt loop exactly.
   bool enable_batched_prefill = false;
+  // Strict OPT-IN. Run at most one decode_step per active request per wave,
+  // concurrently on distinct backend states. Requires backend capability
+  // supports_parallel_steps() and (for PP2) HERMES_PP2_ASYNC_STREAMS=1.
+  // Default false retains the original one-step-at-a-time scheduling path.
+  bool enable_parallel_steps = false;
   // Synchronous, optional event sink: no callbacks under metadata lock.
   // Must be thread-safe: queued cancellation calls it from the canceller,
   // admission, tokens and other terminal events from the pump. May call
@@ -144,6 +152,8 @@ struct SchedulerMetrics {
   std::size_t expired_total = 0;
   std::size_t failed_total = 0;
   std::size_t decode_steps_total = 0;
+  std::size_t parallel_waves_total = 0;
+  std::size_t parallel_dispatched_steps_total = 0;
   std::size_t prefill_attempts_total = 0;
   std::size_t prefill_seeded_total = 0;
   std::size_t prefill_unsupported_total = 0;
@@ -162,6 +172,10 @@ class StepBackend {
   virtual bool open(int capacity, void*& state, std::string& error) = 0;
   virtual bool step(void* state, int token, long position,
                     std::vector<float>& logits, std::string& error) = 0;
+  // Must be explicitly true before opt-in can dispatch overlapping calls on
+  // *distinct* states. Backend must be thread-safe across states; concurrent
+  // calls for the SAME state remain forbidden. Default fail-closed.
+  virtual bool supports_parallel_steps() const noexcept { return false; }
   // Optional single-pass seeded prefill on THE SAME fresh open() state.
   // Output contains only the final token's VOC logits; state must be ready
   // for continuation at absolute position prompt.size() on 'seeded'.
@@ -210,6 +224,10 @@ class ContinuousScheduler {
   void emit_event(const std::shared_ptr<Job>& job, EventKind kind, int token_id = -1);
   bool closed(JobStatus status) const;
   void trim_finished_locked();
+  // Called with pump_mutex_ held. Never holds mutex_ across backend calls;
+  // callbacks and frees are pump-owned and occur only after wave joins.
+  std::size_t tick_parallel(SchedulerClock::time_point now,
+                            SchedulerClock::time_point entered_at);
 
   SchedulerConfig config_;
   StepBackend& backend_;
@@ -234,6 +252,7 @@ class PP2StepBackend final : public StepBackend {
   PrefillResult prefill(void* state, const std::vector<int>& prompt,
                        std::vector<float>& last_logits,
                        std::string& error) override;
+  bool supports_parallel_steps() const noexcept override;
   void close(void* state) noexcept override;
 };
 #endif

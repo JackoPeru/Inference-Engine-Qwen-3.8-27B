@@ -5,6 +5,7 @@
 #include "pp2_batch.hpp"
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstdio>
 #include <limits>
 #include <memory>
@@ -228,6 +229,10 @@ ContinuousScheduler::ContinuousScheduler(SchedulerConfig config, StepBackend& ba
       config.eos_token_id < -1 ||
       config.eos_token_id >= config.vocab_size) {
     throw std::invalid_argument("invalid continuous scheduler configuration");
+  }
+  if (config_.enable_parallel_steps && !backend_.supports_parallel_steps()) {
+    throw std::invalid_argument(
+        "parallel PP2 steps require explicit thread-safe async backend capability");
   }
 }
 
@@ -568,6 +573,7 @@ void ContinuousScheduler::promote(std::size_t& remaining_admissions,
 std::size_t ContinuousScheduler::tick(SchedulerClock::time_point now) {
   std::lock_guard<std::mutex> pump(pump_mutex_);
   const auto entered_at = SchedulerClock::now();
+  if (config_.enable_parallel_steps) return tick_parallel(now, entered_at);
   // Advance even an injected deterministic clock by actual time spent in
   // backend calls. A long decode must not make a queued request appear
   // unexpired until the next separate tick() invocation.
@@ -680,6 +686,202 @@ std::size_t ContinuousScheduler::tick(SchedulerClock::time_point now) {
   return decoded;
 }
 
+std::size_t ContinuousScheduler::tick_parallel(
+    SchedulerClock::time_point now, SchedulerClock::time_point entered_at) {
+  // The caller owns pump_mutex_, so no second tick() can touch these states.
+  // Only backend_.step() runs on helper threads: state bookkeeping, all
+  // callbacks, token selection and GPU state release belong to this pump.
+  const auto effective_now = [&]() {
+    return now + (SchedulerClock::now() - entered_at);
+  };
+  struct Work {
+    std::shared_ptr<Job> job;
+    int token = -1;
+    long position = -1;
+    std::vector<float> logits;
+    std::string error;
+    bool ok = false;
+    bool launched = false;
+  };
+  std::size_t decoded = 0;
+  std::size_t remaining_admissions = 16;
+  while (decoded < config_.steps_per_tick) {
+    {
+      std::lock_guard<std::mutex> guard(mutex_);
+      if (stopping_) break;
+    }
+    expire_waiting(effective_now());
+    // Allocations/seeded prefill stay serial and always precede wave launch.
+    // A failed/partly seeded state is never dispatched for decoding.
+    promote(remaining_admissions, now, entered_at);
+    std::vector<Work> wave;
+    std::vector<std::shared_ptr<Job>> cancelled_before_launch;
+    {
+      std::lock_guard<std::mutex> guard(mutex_);
+      if (stopping_) break;
+      // Exactly ONE step per distinct state in the wave. Rotating the deque
+      // by the selected count preserves the same FIFO/round-robin priority
+      // as the serial scheduler across successive waves.
+      const std::size_t selected = std::min(
+          {running_.size(), config_.max_active, config_.steps_per_tick - decoded});
+      wave.reserve(selected);
+      for (std::size_t i = 0; i < selected; ++i) {
+        auto job = running_.front();
+        running_.pop_front();
+        running_.push_back(job);
+        if (job->cancel_requested) {
+          cancelled_before_launch.push_back(std::move(job));
+          continue;
+        }
+        Work work;
+        work.job = job;
+        if (job->prompt_consumed < job->request.prompt.size()) {
+          work.position = static_cast<long>(job->prompt_consumed);
+          work.token = job->request.prompt[job->prompt_consumed];
+        } else {
+          // A seeded prefill commits the first sampled completion token
+          // before a job reaches this branch.
+          work.position = static_cast<long>(
+              job->request.prompt.size() + job->generated.size() - 1);
+          work.token = job->generated.back();
+        }
+        wave.push_back(std::move(work));
+      }
+    }
+    for (const auto& job : cancelled_before_launch)
+      finish(job, JobStatus::cancelled);
+    if (wave.empty()) {
+      // If all selected jobs were cancelled, they were removed by finish().
+      // Re-evaluate the next ready group, never spin on an unchanged state.
+      if (cancelled_before_launch.empty()) break;
+      continue;
+    }
+
+    // At most max_active threads; each job/state appears only once in wave.
+    // After the join barrier, all logs/events are committed in selection
+    // order, not in nondeterministic CUDA completion order.
+    std::vector<std::thread> workers;
+    bool dispatch_failed = false;
+    std::string dispatch_error;
+    try {
+      workers.reserve(wave.size());
+      for (std::size_t i = 0; i < wave.size(); ++i) {
+        bool cancelled;
+        {
+          std::lock_guard<std::mutex> guard(mutex_);
+          cancelled = stopping_ || wave[i].job->cancel_requested;
+        }
+        if (cancelled) continue;
+        workers.emplace_back([this, &wave, i]() {
+          auto& work = wave[i];
+          try {
+            work.ok = backend_.step(work.job->state, work.token, work.position,
+                                    work.logits, work.error);
+          } catch (const std::exception& e) {
+            work.error = e.what();
+          } catch (...) {
+            work.error = "backend parallel step threw an unknown exception";
+          }
+        });
+        wave[i].launched = true;
+      }
+    } catch (const std::exception& e) {
+      dispatch_failed = true;
+      dispatch_error = e.what();
+    } catch (...) {
+      dispatch_failed = true;
+      dispatch_error = "unknown host thread creation exception";
+    }
+    // Never allow a GPU state to be closed or reused while its host thread
+    // may still be enqueueing/reading CUDA work, even after dispatch failure.
+    for (auto& worker : workers) if (worker.joinable()) worker.join();
+    {
+      std::lock_guard<std::mutex> guard(mutex_);
+      if (!workers.empty()) ++counters_.parallel_waves_total;
+      counters_.parallel_dispatched_steps_total += workers.size();
+      counters_.decode_steps_total += workers.size();
+    }
+    decoded += workers.size();
+    for (auto& work : wave) {
+      bool cancelled;
+      {
+        std::lock_guard<std::mutex> guard(mutex_);
+        cancelled = stopping_ || work.job->cancel_requested;
+      }
+      if (cancelled) {
+        finish(work.job, JobStatus::cancelled);
+        continue;
+      }
+      if (!work.launched) {
+        if (dispatch_failed) {
+          finish(work.job, JobStatus::failed,
+                 "parallel host dispatch failed before step: " + dispatch_error);
+        }
+        // Otherwise cancellation was detected before launch and finish()
+        // will be requested on the next branch/tick.
+        continue;
+      }
+      if (!work.ok || work.logits.size() != static_cast<std::size_t>(config_.vocab_size)) {
+        finish(work.job, JobStatus::failed,
+               "PP2 parallel decode failed: " +
+               (work.error.empty() ? "wrong logits size or empty output" : work.error));
+        continue;
+      }
+      int best_id = -1;
+      float best = -std::numeric_limits<float>::infinity();
+      for (std::size_t i = 0; i < work.logits.size(); ++i) {
+        if (!std::isfinite(work.logits[i])) {
+          best_id = -1;
+          work.error = "non-finite logit";
+          break;
+        }
+        if (work.logits[i] > best) {
+          best = work.logits[i];
+          best_id = static_cast<int>(i);
+        }
+      }
+      if (best_id < 0) {
+        finish(work.job, JobStatus::failed, "invalid logits: " + work.error);
+        continue;
+      }
+      bool done = false, produced_token = false;
+      {
+        std::lock_guard<std::mutex> guard(mutex_);
+        if (work.job->prompt_consumed < work.job->request.prompt.size()) {
+          ++work.job->prompt_consumed;
+          if (work.job->prompt_consumed == work.job->request.prompt.size()) {
+            work.job->generated.push_back(best_id);
+            produced_token = true;
+          }
+        } else {
+          work.job->generated.push_back(best_id);
+          produced_token = true;
+        }
+        done = !work.job->generated.empty() &&
+               (work.job->generated.back() == config_.eos_token_id ||
+                work.job->generated.size() >=
+                    static_cast<std::size_t>(work.job->request.max_new_tokens));
+      }
+      if (produced_token) emit_event(work.job, EventKind::token, best_id);
+      // Token callbacks may request cancellation for a full SSE queue.
+      // Do not issue another decode step for that request; promptly reap it.
+      bool cancelled_after_event;
+      {
+        std::lock_guard<std::mutex> guard(mutex_);
+        cancelled_after_event = stopping_ || work.job->cancel_requested;
+      }
+      if (done || cancelled_after_event)
+        finish(work.job, cancelled_after_event ? JobStatus::cancelled
+                                              : JobStatus::completed);
+    }
+    // A partial host-thread creation failure is a strict per-request
+    // terminal failure (not an unsafe fallback to sync decode after some
+    // unknown subset has already advanced CUDA state).
+    if (dispatch_failed) break;
+  }
+  return decoded;
+}
+
 void ContinuousScheduler::shutdown() {
   // Fail closed promptly while the pump is blocked on a noninterruptible
   // CUDA step: prevent new enqueue and flag active requests before joining.
@@ -751,6 +953,14 @@ bool PP2StepBackend::step(void* state, int token, long position,
   }
   logits = pp2::decode_step(token, ds, position, error);
   return !logits.empty();
+}
+
+bool PP2StepBackend::supports_parallel_steps() const noexcept {
+  // This adapter is provably per-request stream/private-pinned only in
+  // async mode. The sync fallback may use g_pinned and the legacy stream;
+  // do not advertise it as a throughput-safe parallel backend.
+  const char* flag = std::getenv("HERMES_PP2_ASYNC_STREAMS");
+  return flag && flag[0] == '1' && flag[1] == '\0';
 }
 
 PrefillResult PP2StepBackend::prefill(void* state,
