@@ -77,6 +77,15 @@ prompt processing is still token-by-token and long contexts are slow.
   timing benchmark across the four scalar/Warp4/head/async combinations;
   use `--self-test` without GPUs or run with `--engine`/`--gguf` during an
   exclusive GPU window.
+- `reports/HANDOFF_2026-11-13.md`: verified end-to-end status, regressions,
+  measurement limits and next engineering milestones.
+- `kernels/tests/BLOCK0_CORRECTED_REF.md`: how to regenerate the versioned
+  checkpoint-bound CPU reference required by `test_p1_block0`; the test fails
+  closed when the fixture is absent or does not match the GGUF.
+- `kernels/tests/PREFILL_QUALITY_GATE.md`: requirements before enabling
+  experimental CUTLASS W4A4 prefill; quality gate is currently **NO-GO**.
+- `distributed/BATCH_STREAM_PLAN.md`: proposed per-request GPU0/GPU1 stream
+  pipeline; isolated synthetic two-GPU test passes, real runtime not wired.
 
 Three strictly optional CUDA switches can be combined:
 
