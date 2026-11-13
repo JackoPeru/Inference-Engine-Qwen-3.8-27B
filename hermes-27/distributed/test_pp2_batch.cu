@@ -3,7 +3,8 @@
 // Prompt B = reverse(A) [13,6059,27053,1147,9911,1374,17,220,303,161421,6205] (stessa lunghezza 11,
 // contesto diverso, pos allineate per batch_step stessa pos).
 // Prompt C = rotl(A,3), D = rotl(A,6) per N=4 (documentati in P5_BATCH.md).
-// Uso: test_pp2_batch [g1|g2|all] (default all, ferma al gate fallito)
+// Uso: test_pp2_batch [admission|g1|g2|all]
+// CPU-only: g++ -DHERMES_ADMISSION_CPU_ONLY -x c++ pp2_batch.cu test_pp2_batch.cu
 #include "pp2_batch.hpp"
 #include "pp2_fwd.hpp"
 #include <cstdio>
@@ -11,7 +12,38 @@
 #include <string>
 #include <cmath>
 #include <chrono>
+#ifndef HERMES_ADMISSION_CPU_ONLY
 #include <cuda_runtime.h>
+#endif
+
+// Test host-only della stessa admit_check usata da serving, senza CUDA context.
+// Questi sono esiti del budget statico, NON cap di throughput misurati su GPU.
+static int run_admission_tests(){
+  struct Case { int n, ctx; bool expected; };
+  const Case checks[]={
+    {0,1024,false}, {17,1024,false}, {1,0,false}, {1,8193,false},
+    {2,32768,false}, {1,8192,true}, {4,8192,true}, {5,8192,false},
+    {4,1024,true}, {16,8192,false}, {1,1,true}
+  };
+  bool pass=true;
+  for(const auto& test : checks){
+    std::string detail;
+    bool actual=pp2batch::admit_check(test.n,test.ctx,detail);
+    bool ok=(actual==test.expected && !detail.empty());
+    if(test.n==1 && test.ctx==8192)
+      ok=ok && detail.find("64KiB/token/GPU")!=std::string::npos;
+    printf("ADMISSION N=%d context=%d got=%s expected=%s %s | %s\n",
+           test.n,test.ctx,actual?"ADMIT":"REJECT",test.expected?"ADMIT":"REJECT",
+           ok?"PASS":"FAIL",detail.c_str());
+    if(!ok) pass=false;
+  }
+  printf("ADMISSION CPU GATE %s (static memory policy, no GPU benchmark)\n",pass?"PASS":"FAIL");
+  return pass?0:1;
+}
+
+#ifdef HERMES_ADMISSION_CPU_ONLY
+int main(){ return run_admission_tests(); }
+#else
 
 static int argmax_v(const std::vector<float>& v){
   int bi=0; float bv=v[0];
@@ -63,6 +95,7 @@ static bool single_ref(const std::vector<int>& prompt,
 
 int main(int argc,char** argv){
   std::string only=argc>1?argv[1]:"all";
+  if(only=="admission") return run_admission_tests();
   printf("P5 PP2 batch N-richeste only=%s\n",only.c_str()); fflush(stdout);
   bool do_g1=(only=="all"||only=="g1"), do_g2=(only=="all"||only=="g2");
 
@@ -308,16 +341,7 @@ int main(int argc,char** argv){
           (labs((long)uv0c-(long)uv0)<50 && labs((long)uv1c-(long)uv1)<50)?"NO":"CHECK"); fflush(stdout);
       }
     }
-    // admit caps extra (16@1K OK, 17@1K REJECT, 8@8K OK, 2@32K OK, 4@32K REJECT)
-    {
-      std::string d; bool a;
-      a=pp2batch::admit_check(16,1024,d); printf("ADMIT 16@1K %s %s\n",d.c_str(),a?"ADMIT":"REJECT");
-      a=pp2batch::admit_check(17,1024,d); printf("ADMIT 17@1K %s %s\n",d.c_str(),a?"ADMIT":"REJECT");
-      a=pp2batch::admit_check(8,8192,d);  printf("ADMIT 8@8K %s %s\n",d.c_str(),a?"ADMIT":"REJECT");
-      a=pp2batch::admit_check(2,32768,d); printf("ADMIT 2@32K %s %s\n",d.c_str(),a?"ADMIT":"REJECT");
-      a=pp2batch::admit_check(4,32768,d); printf("ADMIT 4@32K %s %s\n",d.c_str(),a?"ADMIT":"REJECT");
-      fflush(stdout);
-    }
+    if(run_admission_tests()!=0) return 2;
     printf("GATE2 DONE (numeri sopra, baseline 1.53 tok/s)\n"); fflush(stdout);
     if(only=="g2") return 0;
   }
@@ -325,3 +349,4 @@ int main(int argc,char** argv){
   printf("P5 DONE\n"); fflush(stdout);
   return 0;
 }
+#endif // HERMES_ADMISSION_CPU_ONLY

@@ -2,7 +2,8 @@
 // HERMES-27 P5 batch concorrente PP2 (N richieste, stati separati, overlap pipeline).
 // Ri riuso: pesi upload + kernel esistenti via pp2::decode_step (nessuna duplicazione pesi).
 // DecodeState attuale = 1 richiesta -> qui BatchState = N DecodeState indipendenti
-// (S/CS/KV per request, stessa VRAM budget: 16KB/tok/req/GPU KV + ~75MB/req/GPU GDN).
+// (S/CS/KV per request; KV attualmente FP32, 64KiB/tok/req/GPU,
+// piu` ~75MiB/req/GPU per stati GDN/conv e workspace).
 #include "pp2_fwd.hpp"
 #include <vector>
 #include <string>
@@ -44,9 +45,11 @@ std::vector<std::vector<float>> batch_step_parallel(const std::vector<int>& toks
                                                     BatchState& b, long pos,
                                                     std::string& err);
 
-// Ammissione target da reports/VRAM_BUDGET_V2.md:
-// need/GPU = Tctx*16KB + 75MB (+78/72MB split PP-B, qui 75MB medio).
-// Cap: max 16 @<=1K, 8 @<=8K, 2 @32K. Ritorna false con detail se oltre cap.
+// Ammissione statica (conservativa) per PP2 corrente: 64KiB/tok/GPU KV FP32,
+// stati GDN/conv + arene/step, N=1..16, Tctx=1..MAX_CONTEXT (8192).
+// Budget basato su VRAM steady P3 con 1GiB/GPU riservato; non conferma
+// disponibilita` VRAM live e non garantisce throughput per N ammessi.
+// Il chiamante deve mantenere il preflight live tramite cudaMemGetInfo/decode_init.
 bool admit_check(int N, int Tctx, std::string& detail);
 
 // VRAM usata per GPU (MiB) via cudaMemGetInfo, per report no-leak.

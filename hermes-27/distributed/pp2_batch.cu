@@ -6,10 +6,13 @@
 #include <cstdio>
 #include <thread>
 #include <mutex>
+#ifndef HERMES_ADMISSION_CPU_ONLY
 #include <cuda_runtime.h>
+#endif
 
 namespace pp2batch {
 
+#ifndef HERMES_ADMISSION_CPU_ONLY
 bool batch_init(BatchState& b, int N, std::string& err) {
   if (N <= 0 || N > 16) { err = "bad N (1..16)"; return false; }
   b.N = N;
@@ -105,24 +108,59 @@ std::vector<std::vector<float>> batch_step_parallel(const std::vector<int>& toks
   std::vector<long> poss((size_t)b.N, pos);
   return batch_step_parallel(toks, b, poss, err);
 }
+#endif // HERMES_ADMISSION_CPU_ONLY
 
 bool admit_check(int N, int Tctx, std::string& detail) {
-  // Budget V2 §3-§4: 16KB/tok/GPU + 75MB/req/GPU, cap 16@1K / 8@8K / 2@32K.
-  int cap = 0;
-  if (Tctx <= 1024) cap = 16;
-  else if (Tctx <= 8192) cap = 8;
-  else if (Tctx <= 32768) cap = 2;
-  else cap = 0;
-  double need_MB_per_gpu = N * (Tctx * 16.0 / 1024.0 / 1024.0 + 75.0);
+  // Static admission envelope for the current PP2 FP32 state layout.
+  // Each GPU holds 24 GDN layers and 8 full-attention layers (see decode_init).
+  // Kc + Vc: 8 layers * 2 tensors * 1024 floats * 4 bytes = 64 KiB/token/GPU.
+  // No FP8 KV exists in this implementation. The old 16 KiB/token was wrong.
+  constexpr size_t MiB = 1024u * 1024u;
+  constexpr size_t GDN = 24u * (48u * 128u * 128u + 10240u * 3u) * sizeof(float);
+  constexpr size_t WS = 568064u;
+  constexpr size_t STEP0 = sizeof(int) + 5120u * sizeof(float);
+  constexpr size_t STEP1 = 2u * 5120u * sizeof(float) + 248320u * sizeof(float);
+  constexpr size_t KV_BYTES_PER_TOKEN = 8u * 2u * 1024u * sizeof(float);
+
+  // Baseline P3 post-upload/warm: GPU0 9856 MiB, GPU1 11470 MiB used.
+  // These baselines already include a single state, so projecting all N states
+  // on top is conservative. Reserve an extra 1 GiB/GPU for runtime variance.
+  // Live VRAM is checked separately by serving::admit + decode_init preflight.
+  constexpr size_t LIMIT_MIB = 15360u;
+  constexpr size_t BASE0_MIB = 9856u;
+  constexpr size_t BASE1_MIB = 11470u;
+  constexpr size_t SAFETY_MIB = 1024u;
+  constexpr int MAX_REQUESTS = 16; // policy limit, not a validated throughput cap
+  constexpr size_t BUDGET0 = (LIMIT_MIB - BASE0_MIB - SAFETY_MIB) * MiB;
+  constexpr size_t BUDGET1 = (LIMIT_MIB - BASE1_MIB - SAFETY_MIB) * MiB;
+
+  if (N < 1 || N > MAX_REQUESTS || Tctx < 1 || Tctx > pp2::DecodeState::MAX_CONTEXT) {
+    char reason[256];
+    snprintf(reason, sizeof(reason),
+             "admit N=%d Tctx=%d REJECT bounds N=1..%d context=1..%d (FP32 KV)",
+             N, Tctx, MAX_REQUESTS, pp2::DecodeState::MAX_CONTEXT);
+    detail = reason;
+    return false;
+  }
+
+  const size_t per0 = GDN + KV_BYTES_PER_TOKEN * (size_t)Tctx + WS + STEP0;
+  const size_t per1 = GDN + KV_BYTES_PER_TOKEN * (size_t)Tctx + WS + STEP1;
+  const size_t total0 = (size_t)N * per0;
+  const size_t total1 = (size_t)N * per1;
+  const bool admitted = total0 <= BUDGET0 && total1 <= BUDGET1;
   char buf[512];
   snprintf(buf, sizeof(buf),
-           "admit N=%d Tctx=%d need=%.1f MB/GPU cap=%d %s",
-           N, Tctx, need_MB_per_gpu, cap, (N <= cap && cap > 0) ? "ADMIT" : "REJECT");
+           "admit N=%d Tctx=%d projected0=%.1fMiB projected1=%.1fMiB "
+           "budget0=%.0fMiB budget1=%.0fMiB (FP32 KV 64KiB/token/GPU, "
+           "P3 baseline + 1GiB safety, static estimate, not GPU-validated) %s",
+           N, Tctx, (double)total0/MiB, (double)total1/MiB,
+           (double)BUDGET0/MiB, (double)BUDGET1/MiB,
+           admitted ? "ADMIT" : "REJECT");
   detail = buf;
-  if (cap <= 0) return false;
-  return N <= cap;
+  return admitted;
 }
 
+#ifndef HERMES_ADMISSION_CPU_ONLY
 void vram_used(size_t& used0_MiB, size_t& used1_MiB) {
   size_t f0 = 0, t0 = 0, f1 = 0, t1 = 0;
   cudaSetDevice(0); cudaMemGetInfo(&f0, &t0);
@@ -130,5 +168,6 @@ void vram_used(size_t& used0_MiB, size_t& used1_MiB) {
   used0_MiB = (t0 - f0) / 1048576;
   used1_MiB = (t1 - f1) / 1048576;
 }
+#endif // HERMES_ADMISSION_CPU_ONLY
 
 } // namespace pp2batch

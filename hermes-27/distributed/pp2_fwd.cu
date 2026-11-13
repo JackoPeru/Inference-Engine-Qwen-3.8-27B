@@ -6,6 +6,7 @@
 #include "hermes/gguf.hpp"
 #include "hermes/rmsnorm.hpp"
 #include "hermes/nvfp4_gemv.hpp"
+#include "hermes/head_bf16_optimized.hpp"
 #include "hermes/nvfp4_gemm.hpp"
 #include "hermes/gdn_step.hpp"
 #include <cuda_runtime.h>
@@ -272,6 +273,15 @@ static void gemv_batch(const uint16_t* d_in, const uint8_t* d_W, float* d_out, i
   }();
   for(int t=0;t<T;++t)
     nvfp4_gemv_cuda_variant(d_in+(size_t)t*H,d_W,d_out+(size_t)t*N,H,N,variant);
+}
+
+static bool use_head_bf16_warp(){
+  // Strict opt-in; scalar FP64 head remains the safe default.
+  static const bool enabled=[] {
+    const char* v=std::getenv("HERMES_HEAD_BF16");
+    return v && std::strcmp(v,"warp4")==0;
+  }();
+  return enabled;
 }
 
 static bool run_gdn_layer(int li, float* d_x, int T, std::string& err){
@@ -590,7 +600,16 @@ std::vector<float> prefill(const std::vector<int>& ids, Stats& st, std::string& 
     float* d_xn=nullptr; cudaMalloc(&d_xn,nH*4);
     rms_f32_k<<<T,512,(size_t)512*4>>>(d_xn,d_x1,(float*)itn->second.d,T,HID);
     float* d_log=nullptr; cudaMalloc(&d_log,(size_t)T*VOC*4);
-    head_bf16_k<<<(int)(((size_t)T*VOC+255)/256),256>>>(d_log,d_xn,(uint16_t*)itw->second.d,T);
+    if(use_head_bf16_warp()){
+      cudaError_t launch_err=hermes::head_bf16_warp_cuda(
+        d_log,d_xn,(uint16_t*)itw->second.d,T,HID,VOC);
+      if(launch_err!=cudaSuccess){
+        err="head_bf16_warp prefill launch: "+std::string(cudaGetErrorString(launch_err));
+        cudaFree(d_xn); cudaFree(d_log); cudaFree(d_x1); return {};
+      }
+    } else {
+      head_bf16_k<<<(int)(((size_t)T*VOC+255)/256),256>>>(d_log,d_xn,(uint16_t*)itw->second.d,T);
+    }
     cudaDeviceSynchronize();
     std::vector<float> logits((size_t)T*VOC);
     cudaMemcpy(logits.data(),d_log,(size_t)T*VOC*4,cudaMemcpyDeviceToHost);
@@ -917,6 +936,16 @@ __global__ void sdpa_gqa_decode_k(const float* Q, const float* Kc, const float* 
   ATT[(size_t)hq*256+tid]=a;
 }
 
+static bool decode_skip_layer_sync(){
+  // Strict opt-in. Kernel launches and GEMV use the ordered default stream.
+  // decode_step keeps the blocking D2H/H2D boundary and final logits D2H.
+  static const bool skip = []{
+    const char* value=std::getenv("HERMES_DECODE_SKIP_LAYER_SYNC");
+    return value && std::strcmp(value,"1")==0;
+  }();
+  return skip;
+}
+
 static bool run_gdn_decode_layer(int li, float* d_x, DecodeState& ds, std::string& err){
   char Pb[16]; snprintf(Pb,16,"blk.%d.",li); std::string P=Pb;
   WEntry *wNorm=find_w(P+"attn_norm.weight"), *wQkv=find_w(P+"attn_qkv.weight"),
@@ -989,7 +1018,7 @@ static bool run_gdn_decode_layer(int li, float* d_x, DecodeState& ds, std::strin
   f32_to_bf16_k<<<(int)(((size_t)FFN+255)/256),256>>>(d_hidb,d_hid,(int)((size_t)FFN));
   gemv_batch(d_hidb,(uint8_t*)wFd->d,d_down,FFN,HID,T);
   add_k<<<(int)((nH+255)/256),256>>>(d_x,d_down,(int)nH);
-  cudaDeviceSynchronize();
+  if(!decode_skip_layer_sync()) cudaDeviceSynchronize();
   // P6: nessun free (arena persistente ds.ws0/ws1).
   return true;
 }
@@ -1055,7 +1084,7 @@ static bool run_full_decode_layer(int li, float* d_x, DecodeState& ds, long pos,
   f32_to_bf16_k<<<(int)(((size_t)FFN+255)/256),256>>>(d_hidb,d_hid,(int)((size_t)FFN));
   gemv_batch(d_hidb,(uint8_t*)wFd->d,d_down,FFN,HID,T);
   add_k<<<(int)((nH+255)/256),256>>>(d_x,d_down,(int)nH);
-  cudaDeviceSynchronize();
+  if(!decode_skip_layer_sync()) cudaDeviceSynchronize();
   ds.klen[li]=L+1;
   // P6: nessun free (arena persistente ds.ws0/ws1).
   return true;
@@ -1218,7 +1247,16 @@ std::vector<float> decode_step(int tok, DecodeState& ds, long pos, std::string& 
     float* d_xn = ds.xnbuf;
     rms_f32_k<<<T,512,(size_t)512*4>>>(d_xn,d_x1,(float*)itn->second.d,T,HID);
     float* d_log = ds.logbuf;
-    head_bf16_k<<<(int)(((size_t)VOC+255)/256),256>>>(d_log,d_xn,(uint16_t*)itw->second.d,T);
+    if(use_head_bf16_warp()){
+      cudaError_t launch_err=hermes::head_bf16_warp_cuda(
+        d_log,d_xn,(uint16_t*)itw->second.d,T,HID,VOC);
+      if(launch_err!=cudaSuccess){
+        err="head_bf16_warp decode launch: "+std::string(cudaGetErrorString(launch_err));
+        return {};
+      }
+    } else {
+      head_bf16_k<<<(int)(((size_t)VOC+255)/256),256>>>(d_log,d_xn,(uint16_t*)itw->second.d,T);
+    }
     cudaDeviceSynchronize();
     std::vector<float> logits((size_t)VOC);
     cudaMemcpy(logits.data(),d_log,(size_t)VOC*4,cudaMemcpyDeviceToHost);
