@@ -30,3 +30,14 @@ Stato server verificato prima di agire: golden E1 diretto rigenerato, E2 rebuild
 ## Corrispondenza Windows <-> server
 - Sincronizzati: CMakeLists, model_fwd hpp/cpp, gdn_step.cu, nvfp4_gemm hpp/cu, test_model_fwd/mtp_accept/logits_dump, KERNEL_AUDIT, tutti i reports, tutti gli scripts/, MTP_WIRING_AUDIT, M3_PP2_PLAN, e1_runner.py.
 - Eccezione nota: root contiene helper locali (test_*.cpp, *_dump.py, patch_*.py) non nel repo server — intenzionale, non parte del runtime.
+
+## P4 GPU decode — CHIUSO (2026-11-13)
+- Causa radice del FAIL iniziale (0.387 vs 2e-3): i due kernel conv GDN
+  (batched vs incremental) generavano FMA in modo diverso (1 ulp a tok3,
+  primo window pieno; amplificato a 1.6e-4 layer26 e 0.1-0.5 ai logit).
+  Fix: catene `__fmaf_rn` esplicite identiche in entrambi (stesso ordine j).
+- Verifiche post-fix (GPU1, pesi reali): bisect11 11/11 BIT-EXACT vs prefill;
+  layerbisect 0/64 divergenze; greedy 4 tok [220,17,1374,220] tutti finite,
+  ~654ms/step, VRAM stabile (no leak); GATE3 top5 MATCH E2; GATE4 invariato
+  (maxerr 6.55, argmax 9/11: rumore bf16-activation+W4A4, non regressione).
+- Dettagli: `distributed/P4_DECODE.md` sez. 6.
