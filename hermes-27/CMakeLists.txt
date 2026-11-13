@@ -47,9 +47,23 @@ if(Python3_Interpreter_FOUND)
   add_test(NAME layer0_downstream_capture_manifest_cpu
     COMMAND ${Python3_EXECUTABLE} -B
       ${CMAKE_SOURCE_DIR}/tests/reliability_layer0_downstream_callback_verify.py --selftest)
+  # Strict staging-only contracts. All three tests are host-only and never
+  # open network sockets, initialize CUDA or modify installed services.
+  add_test(NAME http_soak_harness_cpu
+    COMMAND ${Python3_EXECUTABLE} -B -m unittest
+      scripts.tests.test_scratch_http_soak)
+  add_test(NAME ingress_drain_staging_cpu
+    COMMAND ${Python3_EXECUTABLE} -B -m unittest
+      ops.tests.test_ingress_drain_gate_staging)
+  add_test(NAME gpu_owner_attestor_staging_cpu
+    COMMAND ${Python3_EXECUTABLE} -B -m unittest
+      ops.tests.test_gpu_owner_attestor_staging)
   set_tests_properties(logit_comparator_cpu release_harness_cpu async_stream_contract_cpu prefill_integration_contract_cpu
     PROPERTIES TIMEOUT 60)
   set_tests_properties(layer0_downstream_capture_manifest_cpu PROPERTIES TIMEOUT 60)
+  set_tests_properties(http_soak_harness_cpu ingress_drain_staging_cpu
+    gpu_owner_attestor_staging_cpu PROPERTIES
+    TIMEOUT 60 WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 endif()
 add_executable(test_gguf_synth model/tests/test_gguf_synth.cpp)
 target_link_libraries(test_gguf_synth PRIVATE hermes_gguf)
