@@ -1,24 +1,29 @@
 #!/usr/bin/env python3
 """Opt-in HERMES-27 maintenance supervisor. No action without `run --authorized`.
 
-The existing Tabby endpoint is a protected rollback target. GPU Manager does
-not currently expose a Hermes maintenance lease, so this tool requires a
-verified external ingress drain before it stops the manager and Tabby.
+The existing Tabby endpoint is a protected rollback target. GPU Manager must
+explicitly attest an active, auto-renewed maintenance lease that suppresses
+Tabby restarts. The currently deployed manager lacks this contract: NO-GO.
 """
 
 from __future__ import annotations
 
 import argparse
-import fcntl
+try:
+    import fcntl
+except ImportError:  # offline simulation/tests on Windows; deployment remains Linux-only
+    fcntl = None
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
+import secrets
 import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -29,6 +34,9 @@ class DeploymentError(RuntimeError):
 
 
 STOP_REQUESTED = False
+LEASE_OWNER = "hermes-27"
+LEASE_MIN_REMAINING_SEC = 25
+LEASE_MAX_REMAINING_SEC = 180
 
 
 def log(message: str) -> None:
@@ -50,6 +58,8 @@ def read_config(path: Path) -> dict:
         "gguf_dump_sha256", "tokenizer_bridge_sha256", "python_path", "model_id",
         "manager_status_url", "manager_token_file", "tabby_health_url",
         "drain_command", "drain_check_command", "restore_command", "state_dir",
+        "manager_lease_acquire_command", "manager_lease_renew_command",
+        "manager_lease_release_command",
     )
     for key in required:
         if key not in data or not data[key]:
@@ -58,7 +68,9 @@ def read_config(path: Path) -> dict:
                 "gguf_dump_sha256", "tokenizer_bridge_sha256"):
         if not isinstance(data[key], str) or not re.fullmatch(r"[0-9a-fA-F]{64}", data[key]):
             raise DeploymentError(f"{key} must be a full 64-digit SHA256 digest")
-    for key in ("drain_command", "drain_check_command", "restore_command"):
+    for key in ("drain_command", "drain_check_command", "restore_command",
+                "manager_lease_acquire_command", "manager_lease_renew_command",
+                "manager_lease_release_command"):
         command = data[key]
         if not isinstance(command, list) or not command or not all(isinstance(x, str) and x for x in command):
             raise DeploymentError(f"{key} must be a nonempty argv array (no shell)")
@@ -89,6 +101,7 @@ def read_config(path: Path) -> dict:
                                    ("hermes_start_timeout_sec", 10, 1800, 240),
                                    ("tabby_restore_timeout_sec", 1, 1800, 240),
                                    ("manager_restore_timeout_sec", 1, 1800, 180),
+                                   ("manager_lease_renew_every_sec", 1, 10, 8),
                                    ("max_other_gpu_used_mib", 500, 8000, 3000)):
         n = data.get(key, default)
         if type(n) is not int or not low <= n <= high:
@@ -106,6 +119,10 @@ def check_sha256(path: Path, expected: str) -> None:
             digest.update(chunk)
     if digest.hexdigest().lower() != expected.lower():
         raise DeploymentError(f"SHA256 mismatch for {path}")
+
+
+def token_file_private(path: Path) -> bool:
+    return (path.stat().st_mode & 0o007) == 0
 
 
 def check_static(cfg: dict, verify_hash: bool) -> None:
@@ -126,14 +143,16 @@ def check_static(cfg: dict, verify_hash: bool) -> None:
     # must check the *deployed* binary behavior; a successful build elsewhere
     # does not make stale artifacts under ~/hermes-27/build safe to start.
     check_build_contract(cfg)
-    for key in ("drain_command", "drain_check_command", "restore_command"):
+    for key in ("drain_command", "drain_check_command", "restore_command",
+                "manager_lease_acquire_command", "manager_lease_renew_command",
+                "manager_lease_release_command"):
         executable = Path(cfg[key][0])
         if not executable.is_file() or not os.access(executable, os.X_OK):
             raise DeploymentError(f"missing or nonexecutable ingress hook: {key}")
     token = Path(cfg["manager_token_file"])
     if not token.is_file() or not token.read_text(encoding="utf-8").strip():
         raise DeploymentError("GPU Manager status token unavailable")
-    if token.stat().st_mode & 0o007:
+    if not token_file_private(token):
         raise DeploymentError("GPU Manager token file must not be accessible to other users")
     if verify_hash:
         log("validating full GGUF and tokenizer SHA256")
@@ -237,22 +256,148 @@ def request_json(url: str, token_file: str = "", timeout: float = 5.0) -> dict:
         return payload
 
 
-def manager_guard(cfg: dict) -> dict:
-    status = request_json(cfg["manager_status_url"], cfg["manager_token_file"], 25)
+def manager_status(cfg: dict) -> dict:
+    status = request_json(cfg["manager_status_url"], cfg["manager_token_file"], 12)
+    # This is a proposed versioned integration contract. The running manager
+    # does not yet implement it and must be rejected before any service stop.
+    if status.get("watchdog_lease_contract_version") != 1 or "maintenance_lease" not in status:
+        raise DeploymentError("GPU Manager has no watchdog-safe Hermes maintenance lease contract (NO-GO)")
+    instance = status.get("manager_instance_id")
+    if not isinstance(instance, str) or re.fullmatch(r"[0-9a-f]{32}", instance) is None:
+        raise DeploymentError("GPU Manager did not attest a stable manager_instance_id")
     if status.get("desired_mode") not in ("AUTO", "LLM"):
         raise DeploymentError("GPU Manager is not in AUTO/LLM mode")
-    if status.get("current_state") != "LLM_READY":
-        raise DeploymentError("GPU Manager is not stable in LLM_READY")
-    if status.get("llm_serving") is not True or status.get("llm_online") is not True:
-        raise DeploymentError("Tabby baseline not serving according to GPU Manager")
     if status.get("queue_length") != 0 or status.get("current_job") is not None:
         raise DeploymentError("GPU Manager has active/queued work")
     if status.get("direct_active") or status.get("gaming_active") or status.get("character_training"):
         raise DeploymentError("GPU Manager has competing workload")
     age = status.get("worker_alive_s")
-    if not isinstance(age, (float, int)) or age > 120 or age < 0:
+    if type(age) not in (float, int) or age > 30 or age < 0:
         raise DeploymentError("GPU Manager worker freshness unverified")
     return status
+
+
+def manager_guard(cfg: dict, *, active_lease: dict | None = None) -> dict:
+    status = manager_status(cfg)
+    if status.get("current_state") != "LLM_READY":
+        raise DeploymentError("GPU Manager is not stable in LLM_READY")
+    if status.get("llm_serving") is not True or status.get("llm_online") is not True:
+        raise DeploymentError("Tabby baseline not serving according to GPU Manager")
+    if active_lease is None:
+        if status["maintenance_lease"] is not None:
+            raise DeploymentError("another maintenance lease exists; refusing cutover")
+    else:
+        validate_lease(status, active_lease)
+    return status
+
+
+def validate_lease(status: dict, state: dict) -> dict:
+    if status["manager_instance_id"] != state.get("manager_instance_id"):
+        raise DeploymentError("GPU Manager restarted: maintenance lease cannot be trusted")
+    lease = status.get("maintenance_lease")
+    if not isinstance(lease, dict):
+        raise DeploymentError("GPU Manager no longer attests the active lease")
+    if (lease.get("id") != state.get("lease_id") or
+            lease.get("owner") != LEASE_OWNER or lease.get("status") != "active" or
+            lease.get("scope") != "tabby-restart-and-mode-transition" or
+            lease.get("watchdog_restart_suppressed") is not True):
+        raise DeploymentError("GPU Manager lease ownership, scope or restart inhibition invalid")
+    token = lease.get("fencing_token")
+    if type(token) is not int or token < 1:
+        raise DeploymentError("GPU Manager maintenance lease missing fencing token")
+    if state.get("fencing_token") is not None and token != state["fencing_token"]:
+        raise DeploymentError("GPU Manager fencing token changed")
+    expiry = lease.get("expires_at_unix")
+    if type(expiry) not in (int, float) or not (LEASE_MIN_REMAINING_SEC <= expiry - time.time() <= LEASE_MAX_REMAINING_SEC):
+        raise DeploymentError("GPU Manager maintenance lease expired, too short or implausibly long")
+    return lease
+
+
+def lease_guard(cfg: dict, state: dict) -> dict:
+    if not service_active("hermes-gpu-manager.service"):
+        raise DeploymentError("GPU Manager is no longer active while Hermes holds GPUs")
+    status = manager_status(cfg)
+    expected_state = ("LLM_READY" if service_active("hermes-tabby.service")
+                      else "HERMES_MAINTENANCE")
+    if status.get("current_state") != expected_state:
+        raise DeploymentError("GPU Manager has not acknowledged the leased maintenance state")
+    return validate_lease(status, state)
+
+
+def lease_adapter(cfg: dict, action: str, state: dict) -> None:
+    if action not in ("acquire", "renew", "release"):
+        raise DeploymentError("unsupported maintenance lease adapter operation")
+    payload = {"protocol": "hermes-manager-lease-v1", "action": action,
+               "owner": LEASE_OWNER, "lease_id": state["lease_id"],
+               "manager_instance_id": state["manager_instance_id"],
+               "fencing_token": state.get("fencing_token")}
+    try:
+        result = subprocess.run(cfg[f"manager_lease_{action}_command"],
+                                input=json.dumps(payload), capture_output=True,
+                                text=True, timeout=10, check=True)
+        reply = json.loads(result.stdout)
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        # Adapter stderr can contain credentials. Never forward subprocess
+        # output or untrusted exception content to production logs.
+        raise DeploymentError(f"maintenance lease {action} adapter failed") from None
+    if (not isinstance(reply, dict) or reply.get("protocol") != payload["protocol"] or
+            reply.get("action") != action or reply.get("lease_id") != state["lease_id"] or
+            reply.get("ok") is not True):
+        raise DeploymentError(f"maintenance lease {action} adapter returned invalid acknowledgement")
+
+
+class LeaseKeeper:
+    """Renew a manager-attested lease during slow GPU uploads and rollback."""
+
+    def __init__(self, cfg: dict, state: dict):
+        self.cfg = cfg
+        self.state = state
+        self.event = threading.Event()
+        self.failure: str | None = None
+        self.thread = threading.Thread(target=self._loop, name="hermes-lease-renew", daemon=True)
+
+    def start(self) -> None:
+        self.thread.start()
+
+    def _loop(self) -> None:
+        while not self.event.wait(self.cfg.get("manager_lease_renew_every_sec", 8)):
+            try:
+                self.refresh()
+            except Exception as exc:
+                self.failure = str(exc)
+                self.event.set()
+                return
+
+    def refresh(self) -> None:
+        lease_adapter(self.cfg, "renew", self.state)
+        lease_guard(self.cfg, self.state)
+
+    def check(self) -> None:
+        if self.failure:
+            raise DeploymentError(f"manager lease renewal failed: {self.failure}")
+        lease_guard(self.cfg, self.state)
+
+    def stop(self) -> None:
+        self.event.set()
+        if self.thread.ident is not None:
+            self.thread.join(timeout=15)
+            if self.thread.is_alive():
+                raise DeploymentError("lease renew thread has not stopped; cannot safely release")
+
+
+def begin_lease(cfg: dict, state: dict, journal: Path) -> LeaseKeeper:
+    state["lease_id"] = secrets.token_hex(16)
+    state["lease_pending"] = True
+    state["phase"] = "lease-acquire"
+    save_state(journal, state)
+    lease_adapter(cfg, "acquire", state)
+    observed = lease_guard(cfg, state)
+    state["fencing_token"] = observed["fencing_token"]
+    state["phase"] = "lease-active"
+    save_state(journal, state)
+    keeper = LeaseKeeper(cfg, state)
+    keeper.start()
+    return keeper
 
 
 def command(argv: list[str], timeout: int = 45, capture: bool = True) -> subprocess.CompletedProcess:
@@ -308,11 +453,13 @@ def machine_guard() -> None:
     log(f"GPU baseline used MiB: {gpus[0][2]}, {gpus[1][2]}")
 
 
-def free_gpu_guard(cfg: dict) -> None:
+def free_gpu_guard(cfg: dict, check=None) -> None:
     limit = cfg.get("max_other_gpu_used_mib", 3000)
     if type(limit) is not int or not (500 <= limit <= 8000):
         raise DeploymentError("max_other_gpu_used_mib outside conservative bounds")
     for _ in range(30):
+        if check is not None:
+            check()
         usage = gpu_snapshot()
         if all(used <= limit for _, _, used in usage):
             return
@@ -332,16 +479,41 @@ def run_hook(argv: list[str], timeout: int = 30) -> str:
     return command(argv, timeout).stdout.strip()
 
 
+def ingress_state(cfg: dict) -> dict:
+    try:
+        state = json.loads(run_hook(cfg["drain_check_command"]))
+    except ValueError as exc:
+        raise DeploymentError("ingress drain checker emitted invalid JSON") from exc
+    if (not isinstance(state, dict) or state.get("scope") != "all-tabby-clients" or
+            type(state.get("blocked")) is not bool or
+            type(state.get("inflight")) is not int or state["inflight"] < 0 or
+            type(state.get("observed_at_unix")) not in (int, float) or
+            abs(time.time() - state["observed_at_unix"]) > 10):
+        raise DeploymentError("ingress proof missing complete scope, fresh timestamp or valid counters")
+    return state
+
+
+def require_ingress_closed(cfg: dict) -> None:
+    state = ingress_state(cfg)
+    if not state["blocked"] or state["inflight"] != 0:
+        raise DeploymentError("ingress is no longer blocked or has in-flight Tabby requests")
+
+
+def guarded_ingress(cfg: dict, state: dict, journal: Path) -> None:
+    try:
+        require_ingress_closed(cfg)
+    except Exception:
+        # A broken ingress fence while Hermes may own VRAM is a security and
+        # availability incident. Prevent automatic reopening during rollback.
+        state["unsafe_ingress_detected"] = True
+        save_state(journal, state)
+        raise
+
+
 def wait_ingress_closed(cfg: dict) -> None:
     deadline = time.monotonic() + cfg.get("drain_timeout_sec", 90)
     while time.monotonic() < deadline:
-        raw = run_hook(cfg["drain_check_command"])
-        try:
-            state = json.loads(raw)
-        except ValueError as exc:
-            raise DeploymentError("ingress drain checker emitted invalid JSON") from exc
-        if not isinstance(state, dict) or type(state.get("blocked")) is not bool or type(state.get("inflight")) is not int:
-            raise DeploymentError("ingress drain checker must emit blocked:bool and inflight:int")
+        state = ingress_state(cfg)
         if state["blocked"] and state["inflight"] == 0:
             return
         time.sleep(2)
@@ -404,7 +576,7 @@ def stop_child(state: dict, cfg: dict) -> None:
         return
 
 
-def restore(cfg: dict, journal: Path) -> None:
+def restore(cfg: dict, journal: Path, keeper: LeaseKeeper | None = None) -> None:
     if not journal.exists():
         log("no active cutover journal; nothing to recover")
         return
@@ -412,6 +584,10 @@ def restore(cfg: dict, journal: Path) -> None:
     if state.get("config_path") != str(Path(cfg["_path"]).resolve()):
         raise DeploymentError("recovery config does not match cutover journal")
     errors: list[str] = []
+    if state.get("phase") == "hermes-start" and not state.get("server_pid"):
+        # Process creation may have succeeded immediately before the guardian
+        # crashed, without time to persist the PID. Do not risk VRAM overlap.
+        raise DeploymentError("ambiguous Hermes spawn without journal PID; manual process audit required")
     try:
         stop_child(state, cfg)
     except Exception as exc:
@@ -454,16 +630,52 @@ def restore(cfg: dict, journal: Path) -> None:
         last_error = "unknown"
         while time.monotonic() < deadline:
             try:
-                manager_guard(cfg)
+                status = manager_status(cfg)
+                if state.get("lease_pending") and status["maintenance_lease"] is not None:
+                    manager_guard(cfg, active_lease=state)
+                else:
+                    manager_guard(cfg)
                 break
             except Exception as exc:
                 last_error = str(exc)
                 time.sleep(min(3, max(0, deadline - time.monotonic())))
         else:
             errors.append(f"GPU Manager health timeout: {last_error}")
+    if not errors and keeper is not None:
+        try:
+            keeper.stop()
+            if keeper.failure:
+                raise DeploymentError(f"lease renewal had failed: {keeper.failure}")
+        except Exception as exc:
+            errors.append(f"maintenance lease renewal shutdown: {exc}")
+    if not errors and state.get("lease_pending"):
+        try:
+            if state.get("unsafe_ingress_detected"):
+                # The only safe recovery is to re-block before any release.
+                run_hook(cfg["drain_command"], 45)
+                wait_ingress_closed(cfg)
+                raise DeploymentError("ingress fence breached during Hermes; manual review required")
+            require_ingress_closed(cfg)
+            state["phase"] = "lease-release"
+            save_state(journal, state)
+            lease_adapter(cfg, "release", state)
+            manager_guard(cfg)  # manager attests it can resume Tabby watchdog
+            state["lease_pending"] = False
+            save_state(journal, state)
+        except Exception as exc:
+            errors.append(f"maintenance lease release: {exc}")
     if not errors and state.get("ingress_pending"):
         try:
-            run_hook(cfg["restore_command"], 45)
+            proof = ingress_state(cfg)
+            if proof["blocked"]:
+                if proof["inflight"] != 0:
+                    raise DeploymentError("ingress has active requests before reopening")
+                state["phase"] = "ingress-restore"
+                save_state(journal, state)
+                run_hook(cfg["restore_command"], 45)
+                proof = ingress_state(cfg)
+            if proof["blocked"]:
+                raise DeploymentError("ingress restore hook did not reopen clients")
         except Exception as exc:
             errors.append(f"ingress restore: {exc}")
     if errors:
@@ -486,28 +698,31 @@ def check_hermes(cfg: dict) -> None:
 def supervise(cfg: dict, journal: Path) -> None:
     if not service_active("hermes-gpu-manager.service") or not service_active("hermes-tabby.service"):
         raise DeploymentError("both original services must be active before cutover")
-    manager_guard(cfg)
+    manager = manager_guard(cfg)
     request_json(cfg["tabby_health_url"], cfg.get("tabby_token_file", ""), 8)
     port_available(cfg.get("port", 18127))
     state = {
         "config_path": str(Path(cfg["_path"]).resolve()),
         "manager_was_active": True, "tabby_was_active": True,
+        "manager_instance_id": manager["manager_instance_id"],
         "ingress_pending": True, "server_pid": None, "phase": "draining",
     }
     save_state(journal, state)  # write ahead of the first mutation
+    keeper: LeaseKeeper | None = None
     try:
         log("requesting external ingress drain (no direct Tabby API drain exists)")
         run_hook(cfg["drain_command"], 45)
         wait_ingress_closed(cfg)
         manager_guard(cfg)
-        log("ingress closed/inflight=0; suspending GPU Manager")
-        state["phase"] = "manager-stop"
-        save_state(journal, state)
-        change_service("stop", "hermes-gpu-manager.service")
+        log("ingress closed; acquiring a manager-attested watchdog inhibition lease")
+        keeper = begin_lease(cfg, state, journal)
+        keeper.check()
+        guarded_ingress(cfg, state, journal)
         state["phase"] = "tabby-stop"
         save_state(journal, state)
         change_service("stop", "hermes-tabby.service")
-        free_gpu_guard(cfg)
+        keeper.check()
+        free_gpu_guard(cfg, keeper.check)
         state["phase"] = "hermes-start"
         save_state(journal, state)
         args = [cfg["server_path"], "--model", cfg["model_path"],
@@ -525,6 +740,10 @@ def supervise(cfg: dict, journal: Path) -> None:
             save_state(journal, state)
             deadline = time.monotonic() + cfg.get("hermes_start_timeout_sec", 240)
             while time.monotonic() < deadline and child.poll() is None and not STOP_REQUESTED:
+                keeper.check()
+                guarded_ingress(cfg, state, journal)
+                if service_active("hermes-tabby.service"):
+                    raise DeploymentError("Tabby unexpectedly restarted during Hermes startup")
                 try:
                     check_hermes(cfg)
                     break
@@ -535,10 +754,12 @@ def supervise(cfg: dict, journal: Path) -> None:
             log("Hermes serving on isolated loopback endpoint; health watchdog active")
             consecutive_failures = 0
             while not STOP_REQUESTED:
+                keeper.check()
+                guarded_ingress(cfg, state, journal)
                 if child.poll() is not None:
                     raise DeploymentError(f"Hermes exited with code {child.returncode}")
-                if service_active("hermes-tabby.service") or service_active("hermes-gpu-manager.service"):
-                    raise DeploymentError("original GPU services unexpectedly restarted during Hermes cutover")
+                if service_active("hermes-tabby.service"):
+                    raise DeploymentError("Tabby restarted despite manager lease; aborting")
                 try:
                     check_hermes(cfg)
                     consecutive_failures = 0
@@ -549,10 +770,16 @@ def supervise(cfg: dict, journal: Path) -> None:
                 time.sleep(5)
     finally:
         log("releasing Hermes allocation and restoring Tabby")
-        restore(cfg, journal)
+        try:
+            restore(cfg, journal, keeper)
+        finally:
+            if keeper is not None:
+                keeper.stop()
 
 
 def with_lock(cfg: dict):
+    if fcntl is None:
+        raise DeploymentError("production cutover locking requires Linux fcntl")
     lock, _ = state_paths(cfg)
     lock.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     descriptor = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
@@ -602,8 +829,8 @@ def main() -> int:
             request_json(cfg["tabby_health_url"], cfg.get("tabby_token_file", ""), 8)
             port_available(cfg.get("port", 18127))
         if args.operation == "dry-run":
-            log("DRY-RUN: files, hashes (unless --skip-hash) and hook executables verified; NO service/network/GPU changes")
-            log("planned: verify authenticated manager + Tabby status; drain external ingress; wait inflight=0; stop manager; stop Tabby; verify GPU free; supervise Hermes; restore Tabby + manager; reopen ingress")
+            log("PREPARED DRY-RUN: files, hashes (unless --skip-hash), lease hook paths verified; NO service/network/GPU changes")
+            log("planned: manager contract v1 -> drain all ingress -> acquire manager watchdog lease -> stop Tabby -> monitor Hermes and renew lease -> restore Tabby -> release lease -> reopen ingress")
         elif args.operation == "preflight":
             log("PREFLIGHT PASS: hashes, CPU/GPU, authenticated service status, original endpoint and isolated port")
         else:

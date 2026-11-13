@@ -18,12 +18,24 @@ for verified host details, prerequisites, security, limitations and test evidenc
   replace each with the SHA256 from a reviewed and tested deployed build.
 - `systemd/hermes-27-cutover.service.example` — **disabled template only**.
 - `tests/test_production_deploy.py` — CPU-only simulated failure/rollback tests.
+- `production_simulate.py` — 20 full-lifecycle failure-injection/recovery scenarios
+  using a fake manager/ingress/systemd/GPU/process, without external calls.
+- `MANAGER_LEASE_CONTRACT.md` — mandatory **proposed** watchdog lease and
+  ingress contract; both interfaces are absent on the current server.
+- `manager_lease_REVIEW.md` — detailed manager-side staged prototype with
+  original-source SHA256 pin, installed-manager hook inventory and exact
+  offline integration/recovery gaps.
+- `manager_lease_{core,runtime,adapter,patch}.py`,
+  `manager_lease_v1_proposal.patch` — **new, uninstalled** manager-side
+  implementation prototype and reviewable source diff. No service side effects
+  occur from importing these modules or viewing the generated patch.
 - `../scripts/production_smoke.sh` — Python compile, unittest and Bash syntax.
 
 ## Dry-run and preflight (non-destructive)
 
 ```bash
 bash scripts/production_smoke.sh
+python3 ops/production_simulate.py --scenario all
 python3 ops/production_deploy.py dry-run --config /etc/hermes/hermes-27.json --skip-hash
 python3 ops/production_deploy.py preflight --config /etc/hermes/hermes-27.json
 ```
@@ -52,16 +64,17 @@ python3 ops/production_deploy.py run --config /etc/hermes/hermes-27.json --autho
 python3 ops/production_deploy.py recover --config /etc/hermes/hermes-27.json --authorized
 ```
 
-The supervisor writes a private journal before invoking the ingress drain
-hook; requires confirmed ingress blocking and zero in-flight requests;
-authenticates against the real GPU Manager `/status`; stops the manager and
-Tabby in order; starts HERMES exclusively on `127.0.0.1:18127`; monitors
-health and model identity; and restores the original services before reopening
-ingress. On rollback failure it leaves the journal for manual recovery and
-keeps ingress blocked. Stop the supervisor with SIGTERM/SIGINT for graceful
-release. The systemd template adds `ExecStopPost` recovery if its process exits.
+The supervisor writes a private journal before ingress drain, requires a fresh
+all-client drain proof and authenticated GPU Manager `/status` with the **v1
+maintenance lease contract**, acquires the lease, then stops Tabby while
+**keeping GPU Manager active**. It renews and checks the lease throughout the
+isolated Hermes run. The rollback stops HERMES, restores Tabby, verifies the
+manager and releases the lease before reopening ingress. Unsafe failures
+retain the journal and ingress block for manual recovery. The systemd
+template adds `ExecStopPost` recovery if its process exits.
 
 The manager currently has **no HERMES lease** and can automatically restart
-Tabby. Thus a fully integrated always-on production deployment is blocked
-until GPU Manager and the upstream routing path support an explicit lease/
-handoff. The current flow is only for coordinated maintenance windows.
+Tabby; the configured lease adapters and ingress hooks do not exist either.
+The current real system therefore fails the readiness gate. The simulated
+tests prove software guard behavior only; see `MANAGER_LEASE_CONTRACT.md` for
+the required integration and manager-side fail-closed lease-expiry semantics.

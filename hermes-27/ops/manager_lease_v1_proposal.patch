@@ -1,0 +1,177 @@
+--- a/manager.py
++++ b/manager.py
+@@ -1284,6 +1284,8 @@
+
+
+ async def systemctl(action: str, unit: str, timeout: int = 180) -> bool:
++    if _hermes_lease_v1.blocked_operation():
++        return False
+     code, out = await _run_async(
+         ["sudo", "-n", "systemctl", action, unit], timeout=timeout
+     )
+@@ -1306,6 +1308,8 @@
+
+
+ async def systemctl_user(action: str, unit: str, timeout: int = 180) -> bool:
++    if _hermes_lease_v1.blocked_operation():
++        return False
+     code, out = await _run_async(_user_systemctl_cmd(action, unit), timeout=timeout)
+     if code != 0:
+         log.warning("systemctl --user %s %s rc=%d: %s", action, unit, code, out[-300:])
+@@ -1321,6 +1325,8 @@
+
+
+ async def unload_llm() -> bool:
++    if _hermes_lease_v1.blocked_operation():
++        return False
+     code, body = await _http_async("POST", llm_base() + "/v1/model/unload", {}, timeout=120)
+     if code == 200:
+         log.info("TabbyAPI unload accepted")
+@@ -1426,6 +1432,8 @@
+     (unit cgroup, covers forked TP workers and --user units) are NEVER
+     strays; only truly orphaned runtime processes are killed.
+     """
++    if _hermes_lease_v1.blocked_operation():
++        return 0
+     killed = 0
+     skipped_owned = 0
+     me = os.getpid()
+@@ -1560,6 +1568,8 @@
+
+ def create_job(kind: str, workflow: dict, preset: str = "", backend: str = "",
+                model: str = "", params: dict | None = None) -> dict:
++    if _hermes_lease_v1.fenced:
++        raise HTTPException(423, "GPU Manager lease fence active")
+     jid = uuid.uuid4().hex[:12]
+     now = time.time()
+     db = _db_conn()
+@@ -2112,6 +2122,8 @@
+
+ async def transition_to_media() -> bool:
+     """LLM_READY -> MEDIA_READY. Returns True when ComfyUI serves."""
++    if _hermes_lease_v1.blocked_operation():
++        return False
+     cfg = CONFIG["switching"]
+     set_state("LLM_UNLOADING")
+     # Entering agent media from anywhere: the direct backend must go first,
+@@ -2155,6 +2167,8 @@
+
+ async def transition_to_llm() -> bool:
+     """MEDIA_* -> LLM_READY with health check. Returns True on success."""
++    if _hermes_lease_v1.blocked_operation():
++        return False
+     set_state("MEDIA_STOPPING")
+     await systemctl("stop", str(CONFIG["media"]["service"]))
+     await systemctl("stop", direct_service_name())
+@@ -2196,6 +2210,8 @@
+
+
+ async def restore_llm_with_retries(context: str) -> bool:
++    if _hermes_lease_v1.blocked_operation():
++        return False
+     _emit("llm", "restore attempt", data={"context": context})
+     try:
+         if not _force_llm_active() and await _tabby_recent_progress():
+@@ -2329,6 +2345,8 @@
+ async def transition_to_direct() -> bool:
+     """Enter direct-Comfy mode: LLM unloaded, ComfyUI exposed for the user,
+     worker parked. Returns True when the direct backend serves."""
++    if _hermes_lease_v1.blocked_operation():
++        return False
+     direct = CONFIG.get("direct", {})
+     service = direct_service_name()
+     set_state("LLM_UNLOADING")
+@@ -2480,6 +2498,8 @@
+ async def transition_to_gaming() -> bool:
+     """Enter gaming mode: LLM unloaded, game stack unit started for the user,
+     worker parked. Returns True when the game backend serves."""
++    if _hermes_lease_v1.blocked_operation():
++        return False
+     gaming = CONFIG.get("gaming", {})
+     service = gaming_service_name()
+     set_state("LLM_UNLOADING")
+@@ -2938,6 +2958,8 @@
+     """One reconciliation step. Called in a loop; never raises."""
+     now = time.monotonic()
+     _state["last_drive_ts"] = now
++    if await _hermes_lease_v1.heartbeat():
++        return
+     # Wall-clock prima dell'hold: i training scaduti vanno cancellati ora,
+     # cosi l'hold sotto vede lo stato post-cancel e libera le GPU.
+     _enforce_training_wallclock()
+@@ -2986,6 +3008,8 @@
+     tabby is actually generating, and     require 4 consecutive failures
+     (2 min, longer than any legit restart) before restoring.
+     """
++    if _hermes_lease_v1.fenced:
++        return
+     if _character_training_hold():
+         return  # trainer attivo: mai restore LLM (guerra VRAM)
+     now = time.monotonic()
+@@ -3566,6 +3590,10 @@
+     logger.propagate = False
+
+
++from manager_lease_runtime import install_manager_lease
++_hermes_lease_v1 = install_manager_lease(globals())
++
++
+ @app.get("/")
+ async def root() -> dict:
+     return {"service": APP_NAME, "status": "/status"}
+@@ -3619,8 +3647,9 @@
+     if cooldown_left > 0 and desired == "AUTO":
+         hint = f"media cooling down ({cooldown_left:.0f}s left, chat stays up): jobs wait"
+     return {
++        **_hermes_lease_v1.status_fields(),
+         "desired_mode": desired,
+-        "current_state": state,
++        "current_state": await _hermes_lease_v1.current_state(state),
+         "hint": hint,
+         "media_consec_failures": int(_state.get("media_consec_failures", 0)),
+         "media_cooldown_s": round(cooldown_left, 1),
+@@ -3662,6 +3691,8 @@
+
+
+ def _set_desired(mode: str) -> dict:
++    if _hermes_lease_v1.fenced:
++        raise HTTPException(423, "GPU Manager lease fence active")
+     if _state["desired_mode"] == mode:
+         return {"desired_mode": mode, "unchanged": True}
+     _state["desired_mode"] = mode
+@@ -3809,6 +3840,8 @@
+     blocker (finestra LLM inclusa) -> sveglia il driver in un task di sfondo.
+     Ritorna sempre `{"ok": ...}`; mode non valida -> 422; recovery assente -> 503.
+     """
++    if _hermes_lease_v1.fenced:
++        raise HTTPException(423, "GPU Manager lease fence active")
+     if recovery is None or getattr(recovery, "normalize_mode", None) is None:
+         raise HTTPException(503, "recovery non disponibile: force non possibile")
+     mode = _force_normalize_mode(req.mode)
+@@ -3924,6 +3957,8 @@
+     # Check+create atomici sotto _submit_lock: senza, N submit concorrenti
+     # superano max_queued di N (overshoot).
+     async with _submit_lock:
++        if _hermes_lease_v1.fenced:
++            raise HTTPException(423, "GPU Manager lease fence active")
+         max_queued = int(CONFIG["media"].get("max_queued", 10))
+         backlog = len(queued_jobs()) + (1 if _state.get("current_job") else 0)
+         if backlog >= max_queued:
+@@ -4030,6 +4065,8 @@
+     # Gate atomico check+create sotto _submit_lock: ricontrolla backlog e
+     # training dopo triage/LLM (finestra di secondi) per non fare overshoot.
+     async with _submit_lock:
++        if _hermes_lease_v1.fenced:
++            raise HTTPException(423, "GPU Manager lease fence active")
+         max_queued = int(CONFIG["media"].get("max_queued", 10))
+         backlog = len(queued_jobs()) + (1 if _state.get("current_job") else 0)
+         if backlog >= max_queued:
+@@ -4528,6 +4565,7 @@
+         log.error("api_key non configurata: rotte protette disabilitate (500). "
+                   "Impostare api_key in gpu-manager.yaml o HERMES_GPU_MANAGER_KEY.")
+     _db_conn()
+-    cleanup_old_artifacts()
++    if not _hermes_lease_v1.fenced:
++        cleanup_old_artifacts()
+     _worker_task = asyncio.create_task(worker_loop())
+     log.info("hermes-gpu-manager starting, desired=%s", _state["desired_mode"])
