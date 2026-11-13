@@ -103,6 +103,22 @@ __global__ void conv_silu_k(const float* qkv, const float* Wc, float* cv, int T,
   for(int j=0;j<4;++j){ int tt=t-(3-j); float xv=(tt<0)?0.f:qkv[(size_t)tt*C+c]; acc=__fmaf_rn(xv,Wc[(size_t)c*4+j],acc); } // FMA esplicito: identico a conv_decode_k
   cv[idx]=acc/(1.f+expf(-acc)); // SiLU division form: acc*sigmoid(acc)
 }
+// Experimental chunk continuation: the three predecessor QKV tokens are
+// preserved in CS[c*3+0..2], oldest first. This kernel READS CS only; the
+// append happens in a separate ordered kernel after convolution completes.
+__global__ void conv_silu_chunk_k(const float* qkv,const float* Wc,
+                                  const float* CS,float* cv,int T,int C){
+  int idx=int(blockIdx.x*blockDim.x+threadIdx.x);
+  if(idx>=T*C)return;
+  int t=idx/C,c=idx%C;
+  float acc=0.f;
+  for(int j=0;j<4;++j){
+    int tt=t-(3-j);
+    float v=(tt<0)?CS[(size_t)c*3+(tt+3)]:qkv[(size_t)tt*C+c];
+    acc=__fmaf_rn(v,Wc[(size_t)c*4+j],acc);
+  }
+  cv[idx]=acc/(1.f+expf(-acc));
+}
 __global__ void wa_gemm_k(const float* h, const float* Wa, float* ar, int T, int N, int K){
   int idx=(int)(blockIdx.x*blockDim.x+threadIdx.x);
   if(idx>=T*N) return;
@@ -170,7 +186,7 @@ __global__ void silu_mul_k(const float* gg, const float* uu, float* hid, int N){
   float g=gg[i]; hid[i]=(g/(1.f+expf(-g)))*uu[i];
 }
 // full-attn riuso da P1 block3
-__global__ void q_norm_rope_k(const float* qqkv, const float* qn, float* Q, int T){
+__global__ void q_norm_rope_k(const float* qqkv, const float* qn, float* Q, int T,int pos0=0){
   int bh=(int)blockIdx.x; int t=bh/24, head=bh%24; int tid=(int)threadIdx.x;
   __shared__ float sh[256]; __shared__ float sq[256];
   float v=qqkv[(size_t)t*12288+(size_t)head*512+tid];
@@ -182,13 +198,13 @@ __global__ void q_norm_rope_k(const float* qqkv, const float* qn, float* Q, int 
   float y;
   if(tid<64){ int i=tid<32?tid:tid-32;
     float fr=1.f/powf(10000000.f,(float)(2*i)/64.f);
-    float ang=(float)t*fr, cc=cosf(ang), ss=sinf(ang);
+    float ang=(float)(pos0+t)*fr, cc=cosf(ang), ss=sinf(ang);
     float a=sq[i], b=sq[32+i];
     y=(tid<32)?(a*cc-b*ss):(a*ss+b*cc);
   } else y=qnrm;
   Q[((size_t)t*24+head)*256+tid]=y;
 }
-__global__ void k_norm_rope_k(const float* kk, const float* kn, float* K_, int T){
+__global__ void k_norm_rope_k(const float* kk, const float* kn, float* K_, int T,int pos0=0){
   int bh=(int)blockIdx.x; int t=bh/4, head=bh%4; int tid=(int)threadIdx.x;
   __shared__ float sh[256]; __shared__ float sq[256];
   float v=kk[(size_t)t*1024+(size_t)head*256+tid];
@@ -200,7 +216,7 @@ __global__ void k_norm_rope_k(const float* kk, const float* kn, float* K_, int T
   float y;
   if(tid<64){ int i=tid<32?tid:tid-32;
     float fr=1.f/powf(10000000.f,(float)(2*i)/64.f);
-    float ang=(float)t*fr, cc=cosf(ang), ss=sinf(ang);
+    float ang=(float)(pos0+t)*fr, cc=cosf(ang), ss=sinf(ang);
     float a=sq[i], b=sq[32+i];
     y=(tid<32)?(a*cc-b*ss):(a*ss+b*cc);
   } else y=qnrm;
@@ -224,6 +240,41 @@ __global__ void sdpa_gqa_k(const float* Q, const float* K_, const float* V, floa
   }
   __syncthreads();
   float a=0; for(int t2=0;t2<=t;++t2) a+=scores[t2]*V[((size_t)t2*4+g)*256+tid];
+  ATT[((size_t)t*24+hq)*256+tid]=a;
+}
+// Chunked causal attention over persistent KV. Same reduction/softmax order as
+// sdpa_gqa_decode_k for each absolute token, with bounded dynamic shared
+// memory (MAX_CONTEXT+256 floats = 33792 B at capacity 8192).
+// One block = (local token, query head). Never materializes T*context scores.
+__global__ void sdpa_gqa_chunk_k(const float* Q,const float* Kc,const float* Vc,
+                                 float* ATT,int pos0){
+  int b=int(blockIdx.x),t=b/24,hq=b%24,g=hq/6,tid=int(threadIdx.x);
+  int L=pos0+t;
+  extern __shared__ float sh[];
+  float* scores=sh;
+  float* tmp=scores+(L+1);
+  float qv=Q[((size_t)t*24+hq)*256+tid];
+  for(int p=0;p<=L;++p){
+    float kv=Kc[(size_t)p*1024+g*256+tid];
+    tmp[tid]=qv*kv; __syncthreads();
+    for(int s=128;s>0;s>>=1){
+      if(tid<s)tmp[tid]+=tmp[tid+s];
+      __syncthreads();
+    }
+    if(tid==0)scores[p]=tmp[0]*(1.f/16.f);
+    __syncthreads();
+  }
+  if(tid==0){
+    float mx=-1e30f;
+    for(int p=0;p<=L;++p)if(scores[p]>mx)mx=scores[p];
+    float den=0;
+    for(int p=0;p<=L;++p){scores[p]=expf(scores[p]-mx);den+=scores[p];}
+    for(int p=0;p<=L;++p)scores[p]/=den;
+  }
+  __syncthreads();
+  float a=0;
+  for(int p=0;p<=L;++p)
+    a+=scores[p]*Vc[(size_t)p*1024+g*256+tid];
   ATT[((size_t)t*24+hq)*256+tid]=a;
 }
 __global__ void gate_k(const float* att, const float* graw, float* gated, int N){
@@ -412,9 +463,27 @@ __global__ void seed_conv_tail_k(float* conv_state,const float* qkv,int T,int C)
     conv_state[(size_t)c*3+j]=(t<0)?0.f:qkv[(size_t)t*C+c];
   }
 }
+__global__ void append_conv_tail_k(float* CS,const float* qkv,int T,int C){
+  int c=int(blockIdx.x*blockDim.x+threadIdx.x);
+  if(c>=C)return;
+  // Load ALL predecessor slots before writing any slot, since T may be 1/2.
+  float old0=CS[(size_t)c*3],old1=CS[(size_t)c*3+1],old2=CS[(size_t)c*3+2];
+  if(T==1){
+    CS[(size_t)c*3]=old1;
+    CS[(size_t)c*3+1]=old2;
+    CS[(size_t)c*3+2]=qkv[c];
+  }else if(T==2){
+    CS[(size_t)c*3]=old2;
+    CS[(size_t)c*3+1]=qkv[c];
+    CS[(size_t)c*3+2]=qkv[(size_t)C+c];
+  }else{
+    for(int j=0;j<3;++j)
+      CS[(size_t)c*3+j]=qkv[(size_t)(T-3+j)*C+c];
+  }
+}
 
 static bool run_gdn_layer(int li, float* d_x, int T, std::string& err,
-                          DecodeState* seed=nullptr){
+                          DecodeState* seed=nullptr,int pos0=0){
   char Pb[16]; snprintf(Pb,16,"blk.%d.",li); std::string P=Pb;
   WEntry *wNorm=find_w(P+"attn_norm.weight"), *wQkv=find_w(P+"attn_qkv.weight"),
          *wGate=find_w(P+"attn_gate.weight"), *wBeta=find_w(P+"ssm_beta.weight"),
@@ -453,14 +522,20 @@ static bool run_gdn_layer(int li, float* d_x, int T, std::string& err,
   f32_to_bf16_k<<<(int)((nH+255)/256),256>>>(d_hb,d_h,(int)nH);
   // 2 linears GEMV
   gemv_batch(d_hb,(uint8_t*)wQkv->d,d_qkv,HID,CC,T);
-  if(seed){
+  if(seed && pos0==0){
     seed_conv_tail_k<<<(CC+255)/256,256>>>(seed->CS[li],d_qkv,T,CC);
   }
   gemv_batch(d_hb,(uint8_t*)wGate->d,d_zl,HID,VDD,T);
   gemv_batch(d_hb,(uint8_t*)wBeta->d,d_b,HID,HV,T);
   wa_gemm_k<<<(int)((T*HV+255)/256),256>>>(d_h,(float*)wAlpha->d,d_ar,T,HV,HID);
   // 3 conv
-  conv_silu_k<<<(int)(((size_t)T*CC+255)/256),256>>>(d_qkv,(float*)wC->d,d_cv,T,CC);
+  if(seed && pos0>0){
+    conv_silu_chunk_k<<<(int)(((size_t)T*CC+255)/256),256>>>(
+      d_qkv,(float*)wC->d,seed->CS[li],d_cv,T,CC);
+    append_conv_tail_k<<<(CC+255)/256,256>>>(seed->CS[li],d_qkv,T,CC);
+  }else{
+    conv_silu_k<<<(int)(((size_t)T*CC+255)/256),256>>>(d_qkv,(float*)wC->d,d_cv,T,CC);
+  }
   // 4 split
   {
     size_t nq=(size_t)T*HV*KHD, nv=(size_t)T*HV*VHD;
@@ -507,7 +582,7 @@ static bool run_gdn_layer(int li, float* d_x, int T, std::string& err,
 }
 
 static bool run_full_layer(int li, float* d_x, int T, std::string& err,
-                           DecodeState* seed=nullptr){
+                           DecodeState* seed=nullptr,int pos0=0){
   char Pb[16]; snprintf(Pb,16,"blk.%d.",li); std::string P=Pb;
   WEntry *wNorm=find_w(P+"attn_norm.weight"),
          *wQ=find_w(P+"attn_q.weight"), *wK=find_w(P+"attn_k.weight"), *wV=find_w(P+"attn_v.weight"),
@@ -537,16 +612,22 @@ static bool run_full_layer(int li, float* d_x, int T, std::string& err,
   gemv_batch(d_hb,(uint8_t*)wQ->d,d_qq,HID,NQQ,T);
   gemv_batch(d_hb,(uint8_t*)wK->d,d_kk,HID,NKK,T);
   gemv_batch(d_hb,(uint8_t*)wV->d,d_vv,HID,NKK,T);
-  q_norm_rope_k<<<(T*NQ),256>>>(d_qq,(float*)wQn->d,d_Q,T);
-  k_norm_rope_k<<<(T*NKV),256>>>(d_kk,(float*)wKn->d,d_K,T);
+  q_norm_rope_k<<<(T*NQ),256>>>(d_qq,(float*)wQn->d,d_Q,T,pos0);
+  k_norm_rope_k<<<(T*NKV),256>>>(d_kk,(float*)wKn->d,d_K,T,pos0);
   cudaMemcpy(d_V,d_vv,(size_t)T*NKK*4,cudaMemcpyDeviceToDevice);
   if(seed){
-    if(!seed->Kc[li] || !seed->Vc[li] || seed->capacity<T){
-      err="prefill full layer K/V cache missing or too short li="+std::to_string(li);
+    if(!seed->Kc[li] || !seed->Vc[li] ||
+       pos0<0 || pos0>seed->capacity || T>seed->capacity-pos0 ||
+       seed->klen[li]!=pos0){
+      err="prefill full layer KV capacity/offset mismatch li="+
+          std::to_string(li)+" pos0="+std::to_string(pos0)+
+          " klen="+std::to_string(seed->klen[li]);
       return false;
     }
-    cudaError_t e=cudaMemcpy(seed->Kc[li],d_K,(size_t)T*NKK*4,cudaMemcpyDeviceToDevice);
-    if(e==cudaSuccess)e=cudaMemcpy(seed->Vc[li],d_V,(size_t)T*NKK*4,cudaMemcpyDeviceToDevice);
+    cudaError_t e=cudaMemcpy(seed->Kc[li]+(size_t)pos0*NKK,d_K,
+                              (size_t)T*NKK*4,cudaMemcpyDeviceToDevice);
+    if(e==cudaSuccess)e=cudaMemcpy(seed->Vc[li]+(size_t)pos0*NKK,d_V,
+                              (size_t)T*NKK*4,cudaMemcpyDeviceToDevice);
     if(e!=cudaSuccess){err="prefill K/V seeding "+std::to_string(li)+": "+cudaGetErrorString(e);return false;}
   }
   // G raw = second half of qqkv per head: qq[hd*512+256+d]
@@ -569,7 +650,15 @@ static bool run_full_layer(int li, float* d_x, int T, std::string& err,
       G[((size_t)t*24+hd)*256+d]=qq[(size_t)t*NQQ+hd*512+256+d];
     cudaMemcpy(d_G,G.data(),(size_t)T*NQHD*4,cudaMemcpyHostToDevice);
   }
-  sdpa_gqa_k<<<(T*NQ),256>>>(d_Q,d_K,d_V,d_att,T);
+  if(seed && pos0>0){
+    const size_t shared_bytes=(size_t)(pos0+T+256)*sizeof(float);
+    // Each block needs at most pos0+T scores and 256 reduction elements.
+    // 8192-token maximum uses 33 KiB, below the normal CUDA 48-KiB limit.
+    sdpa_gqa_chunk_k<<<(T*NQ),256,shared_bytes>>>(
+      d_Q,seed->Kc[li],seed->Vc[li],d_att,pos0);
+  }else{
+    sdpa_gqa_k<<<(T*NQ),256>>>(d_Q,d_K,d_V,d_att,T);
+  }
   gate_k<<<(int)(((size_t)T*NQHD+255)/256),256>>>(d_att,d_G,d_G,(int)((size_t)T*NQHD));
   f32_to_bf16_k<<<(int)(((size_t)T*NQHD+255)/256),256>>>(d_gb,d_G,(int)((size_t)T*NQHD));
   gemv_batch(d_gb,(uint8_t*)wO->d,d_core,NQHD,HID,T);
@@ -587,7 +676,7 @@ static bool run_full_layer(int li, float* d_x, int T, std::string& err,
     err="full prefill layer "+std::to_string(li)+": "+cudaGetErrorString(layer_result);
     return false;
   }
-  if(seed) seed->klen[li]=T;
+  if(seed) seed->klen[li]=pos0+T;
   return true;
 }
 
@@ -728,10 +817,14 @@ struct PrefillPinned {
 
 static std::vector<float> prefill_impl(const std::vector<int>& ids, Stats& st,
                                       std::string& err, std::vector<float>* h_last_out,
-                                      DecodeState* seed, bool private_staging){
+                                      DecodeState* seed, bool private_staging,
+                                      int pos0=0, bool last_only=false){
   if(!g_up){ err="not uploaded"; return {}; }
   int T=(int)ids.size();
   if(T<=0||T>(int)PIN_TMAX){ err="bad T"; return {}; }
+  if(pos0<0 || (seed && (pos0>seed->capacity || T>seed->capacity-pos0))){
+    err="prefill position/capacity out of bounds"; return {};
+  }
   auto tp0=std::chrono::high_resolution_clock::now();
   size_t nH=(size_t)T*HID;
   PrefillFrameBuffers allocations;
@@ -757,7 +850,7 @@ static std::vector<float> prefill_impl(const std::vector<int>& ids, Stats& st,
   }
   for(int li=0;li<=SPLIT_LAST0;++li){
     bool is_full=(li%4==3);
-    bool ok = is_full? run_full_layer(li,d_x0,T,err,seed) : run_gdn_layer(li,d_x0,T,err,seed);
+    bool ok = is_full? run_full_layer(li,d_x0,T,err,seed,pos0) : run_gdn_layer(li,d_x0,T,err,seed,pos0);
     if(!ok) return {};
     if(li%8==0||li==SPLIT_LAST0){
       std::vector<float> hx(nH); cudaMemcpy(hx.data(),d_x0,nH*4,cudaMemcpyDeviceToHost);
@@ -788,7 +881,7 @@ static std::vector<float> prefill_impl(const std::vector<int>& ids, Stats& st,
   // GPU1
   for(int li=SPLIT_LAST0+1;li<NL;++li){
     bool is_full=(li%4==3);
-    bool ok = is_full? run_full_layer(li,d_x1,T,err,seed) : run_gdn_layer(li,d_x1,T,err,seed);
+    bool ok = is_full? run_full_layer(li,d_x1,T,err,seed,pos0) : run_gdn_layer(li,d_x1,T,err,seed,pos0);
     if(!ok) return {};
     if(li%8==0||li==NL-1){
       std::vector<float> hx(nH); cudaMemcpy(hx.data(),d_x1,nH*4,cudaMemcpyDeviceToHost);
@@ -807,28 +900,31 @@ static std::vector<float> prefill_impl(const std::vector<int>& ids, Stats& st,
     auto itn=g_w1.find("output_norm.weight");
     auto itw=g_w1.find("output.weight");
     if(itn==g_w1.end()||itw==g_w1.end()){ err="no head"; return {}; }
+    const int output_T=last_only?1:T;
+    const float* output_x=last_only?(d_x1+(size_t)(T-1)*HID):d_x1;
     float* d_xn=nullptr;
-    if(!allocations.alloc(1,d_xn,nH*4,err)) return {};
-    rms_f32_k<<<T,512,(size_t)512*4>>>(d_xn,d_x1,(float*)itn->second.d,T,HID);
+    if(!allocations.alloc(1,d_xn,(size_t)output_T*HID*4,err)) return {};
+    rms_f32_k<<<output_T,512,(size_t)512*4>>>(d_xn,output_x,(float*)itn->second.d,output_T,HID);
     float* d_log=nullptr;
-    if(!allocations.alloc(1,d_log,(size_t)T*VOC*4,err)) return {};
+    if(!allocations.alloc(1,d_log,(size_t)output_T*VOC*4,err)) return {};
     if(use_head_bf16_warp()){
       cudaError_t launch_err=hermes::head_bf16_warp_cuda(
-        d_log,d_xn,(uint16_t*)itw->second.d,T,HID,VOC);
+        d_log,d_xn,(uint16_t*)itw->second.d,output_T,HID,VOC);
       if(launch_err!=cudaSuccess){
         err="head_bf16_warp prefill launch: "+std::string(cudaGetErrorString(launch_err));
         return {};
       }
     } else {
-      head_bf16_k<<<(int)(((size_t)T*VOC+255)/256),256>>>(d_log,d_xn,(uint16_t*)itw->second.d,T);
+      head_bf16_k<<<(int)(((size_t)output_T*VOC+255)/256),256>>>(d_log,d_xn,(uint16_t*)itw->second.d,output_T);
     }
     cudaError_t head_sync_err=cudaDeviceSynchronize();
     if(head_sync_err!=cudaSuccess){
       err="output head prefill sync: "+std::string(cudaGetErrorString(head_sync_err));
       return {};
     }
-    std::vector<float> logits((size_t)T*VOC);
-    cudaError_t head_copy_err=cudaMemcpy(logits.data(),d_log,(size_t)T*VOC*4,cudaMemcpyDeviceToHost);
+    std::vector<float> logits((size_t)output_T*VOC);
+    cudaError_t head_copy_err=cudaMemcpy(logits.data(),d_log,
+                              (size_t)output_T*VOC*4,cudaMemcpyDeviceToHost);
     if(head_copy_err!=cudaSuccess){
       err="output head prefill logits copy: "+std::string(cudaGetErrorString(head_copy_err));
       return {};
@@ -1674,6 +1770,131 @@ std::vector<float> prefill_into_decode_state(
     return logits;
   } catch(const std::exception& e){
     err="seeded prefill exception: "+std::string(e.what());
+    return fail();
+  }
+}
+
+std::vector<float> prefill_chunks_into_decode_state(
+    const std::vector<int>& ids, DecodeState& ds, Stats& st,
+    std::string& err, int chunk_tokens, std::vector<float>* h_last_out){
+  if(!ds.inited){
+    err="chunked prefill requires initialized, empty DecodeState";
+    return {};
+  }
+  auto* ctx=static_cast<AsyncDecodeContext*>(ds.async_ctx);
+  std::unique_lock<std::mutex> state_lock;
+  if(ctx){
+    state_lock=std::unique_lock<std::mutex>(ctx->step_mutex,std::try_to_lock);
+    if(!state_lock.owns_lock()){
+      err="chunked prefill request has async decode in flight";
+      return {};
+    }
+  }
+  auto fail=[&]()->std::vector<float>{
+    if(ctx)ctx->poisoned=true;
+    if(h_last_out)h_last_out->clear();
+    if(state_lock.owns_lock())state_lock.unlock();
+    decode_free(ds);
+    return {};
+  };
+  const char* opt=std::getenv("HERMES_PP2_CHUNKED_PREFILL");
+  if(!opt || std::strcmp(opt,"1")!=0){
+    err="chunked prefill disabled; require HERMES_PP2_CHUNKED_PREFILL=1";
+    return fail();
+  }
+  const char* bf16=std::getenv("HERMES_PP2_PREFILL_BF16");
+  if(bf16 && std::strcmp(bf16,"1")==0){
+    err="chunked prefill BF16 disabled: full-model numeric gate failed";
+    return fail();
+  }
+  if(std::getenv("HERMES_L26")){
+    err="chunked prefill incompatible with HERMES_L26 debug";
+    return fail();
+  }
+  const char* gemv_variant=std::getenv("HERMES_NVFP4_GEMV");
+  if(gemv_variant && std::strcmp(gemv_variant,"packed4")==0){
+    // Existing packed4 default-stream launch failure aborts the process.
+    // Until its error contract is request-local, reject this new API.
+    err="chunked prefill rejects experimental packed4 GEMV fail-stop path";
+    return fail();
+  }
+  const size_t T=ids.size();
+  if(!g_up || T<=PIN_TMAX || T>DecodeState::MAX_CONTEXT ||
+     T>(size_t)ds.capacity || chunk_tokens<1 || chunk_tokens>(int)PIN_TMAX ||
+     ds.ever_advanced || (ctx && ctx->poisoned)){
+    err="chunked prefill requires 65..8192 tokens, fresh state, "
+        "capacity>=T and chunk_tokens=1..64";
+    return fail();
+  }
+  for(int id:ids){
+    if(id<0 || id>=VOC){err="chunked prefill token id out of range";return fail();}
+  }
+  for(int li=0;li<NL;++li){
+    if(ds.klen[li]!=0){
+      err="chunked prefill requires empty K/V caches";
+      return fail();
+    }
+    if(li%4==3){
+      if(!ds.Kc[li] || !ds.Vc[li]){
+        err="chunked prefill missing K/V cache";return fail();
+      }
+    }else if(!ds.S[li] || !ds.CS[li]){
+      err="chunked prefill missing GDN state";return fail();
+    }
+  }
+  // Head logits for one token, chunk activations <=64 tokens and KV
+  // allocated once by decode_init(capacity). No T*VOC host/device growth.
+  // Reserve 512 MiB for a single bounded chunk's temporary allocations.
+  for(int dev=0;dev<2;++dev){
+    cudaError_t e=cudaSetDevice(dev);
+    size_t free_bytes=0,total_bytes=0;
+    if(e==cudaSuccess)e=cudaMemGetInfo(&free_bytes,&total_bytes);
+    if(e!=cudaSuccess || free_bytes<512ULL*1024*1024){
+      err="chunked prefill VRAM headroom GPU"+std::to_string(dev)+
+          " free="+std::to_string(free_bytes)+" required=536870912";
+      return fail();
+    }
+  }
+  st.prefill_ms=0;
+  st.xfer_ms=0;
+  std::vector<float> logits;
+  try{
+    for(size_t offset=0;offset<T;offset+=(size_t)chunk_tokens){
+      const size_t count=std::min((size_t)chunk_tokens,T-offset);
+      // Bounded host token staging (at most 64 ints) per chunk.
+      std::vector<int> chunk(ids.begin()+offset,ids.begin()+offset+count);
+      Stats chunk_stats{};
+      std::vector<float>* last_hidden=(offset+count==T)?h_last_out:nullptr;
+      logits=prefill_impl(chunk,chunk_stats,err,last_hidden,&ds,true,
+                          (int)offset,true);
+      if(logits.size()!=(size_t)VOC){
+        if(err.empty())err="chunked prefill logits incomplete at offset="+
+                         std::to_string(offset);
+        return fail();
+      }
+      for(float value:logits){
+        if(!std::isfinite(value)){
+          err="chunked prefill nonfinite logits at offset="+
+              std::to_string(offset);
+          return fail();
+        }
+      }
+      const int expected=(int)(offset+count);
+      for(int li=3;li<NL;li+=4){
+        if(ds.klen[li]!=expected){
+          err="chunked prefill KV length mismatch li="+std::to_string(li)+
+              " got="+std::to_string(ds.klen[li])+
+              " expected="+std::to_string(expected);
+          return fail();
+        }
+      }
+      st.prefill_ms+=chunk_stats.prefill_ms;
+      st.xfer_ms+=chunk_stats.xfer_ms;
+    }
+    ds.ever_advanced=true;
+    return logits;
+  }catch(const std::exception& e){
+    err="chunked prefill exception: "+std::string(e.what());
     return fail();
   }
 }

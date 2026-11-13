@@ -9,6 +9,7 @@ option(HERMES_BUILD_MTP_GENERATOR "Build verified greedy MTP diagnostic CLI (not
 option(HERMES_BUILD_W4A4_PROTOTYPE "Build unapproved CUTLASS NVFP4 activation-requantizing W4A4 prototype" OFF)
 option(HERMES_BUILD_REAL_GEMV_ORACLE "Build real GGUF same-X/W Scalar/Warp4/Packed4 oracle (GPU execution manual only)" OFF)
 option(HERMES_BUILD_REAL_PREFILL_TEST "Build real GGUF batched prefill state/cache/continuation gate (GPU execution manual only)" OFF)
+option(HERMES_BUILD_CHUNK_PREFILL_TEST "Build experimental T65..8192 PP2 chunked prefill test (manual GPU execution only)" OFF)
 option(HERMES_REGISTER_GPU_TESTS "Register CUDA tests in CTest (run ONLY during exclusive GPU maintenance)" OFF)
 option(HERMES_REGISTER_HEAVY_CPU_TESTS "Register full-GGUF CPU reference tests (up to ~20min each)" OFF)
 option(HERMES_REGISTER_EXTERNAL_FIXTURE_TESTS "Register CPU GDN test requiring /tmp/gdn_tiny.bin fixture" OFF)
@@ -207,6 +208,18 @@ if(HERMES_BUILD_REAL_PREFILL_TEST)
   target_link_libraries(test_prefill_integration_real PRIVATE
     hermes_pp2 hermes_kernels hermes_gguf CUDA::cublas Threads::Threads)
   # Not registered with CTest: an explicit prime-owned GPU window is required.
+endif()
+if(HERMES_BUILD_CHUNK_PREFILL_TEST)
+  add_executable(test_prefill_chunk_real distributed/test_prefill_chunk_real.cu)
+  target_include_directories(test_prefill_chunk_real PRIVATE distributed)
+  target_link_libraries(test_prefill_chunk_real PRIVATE
+    hermes_pp2 hermes_kernels hermes_gguf CUDA::cublas Threads::Threads)
+  # Only offline CPU checks may run in CTest without GPU exclusivity.
+  if(Python3_Interpreter_FOUND)
+    add_test(NAME prefill_chunk_cpu COMMAND
+      ${Python3_EXECUTABLE} -B ${CMAKE_SOURCE_DIR}/distributed/test_prefill_chunk_cpu.py)
+    set_tests_properties(prefill_chunk_cpu PROPERTIES TIMEOUT 60)
+  endif()
 endif()
 add_executable(hermes_generate tools/hermes_generate.cpp)
 target_link_libraries(hermes_generate PRIVATE hermes_pp2)

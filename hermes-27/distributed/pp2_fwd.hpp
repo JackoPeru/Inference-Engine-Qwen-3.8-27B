@@ -88,6 +88,19 @@ std::vector<float> prefill_into_decode_state(
     const std::vector<int>& ids, DecodeState& ds, Stats& st, std::string& err,
     std::vector<float>* h_last_out = nullptr);
 
+// EXPERIMENTAL ONLY, STRICT OPT-IN: HERMES_PP2_CHUNKED_PREFILL=1.
+// Processes 65..8192 tokens in independently bounded 1..64-token chunks,
+// preserving per-request GDN S, CS and absolute-RoPE K/V across chunks.
+// Caller supplies an EMPTY decode_init state with capacity>=ids.size().
+// Returns only LAST token's logits[VOC] to avoid materializing T*VOC logits.
+// T<=64 uses the previously verified prefill_into_decode_state API instead.
+// BF16 projection mode is REJECTED: full-model T64 gate failed in real GGUF.
+// On any error, destroys the partial DecodeState (caller must not reuse it).
+// Not wired into production or serving; GPU parity gates still required.
+std::vector<float> prefill_chunks_into_decode_state(
+    const std::vector<int>& ids, DecodeState& ds, Stats& st, std::string& err,
+    int chunk_tokens = 64, std::vector<float>* h_last_out = nullptr);
+
 // Alloca/stati zero su GPU proprietaria (richiede upload già fatto). Ritorna false su errore/OOM.
 bool decode_init(DecodeState& ds, std::string& err);
 // Explicit KV/attention capacity in tokens (1..MAX_CONTEXT).

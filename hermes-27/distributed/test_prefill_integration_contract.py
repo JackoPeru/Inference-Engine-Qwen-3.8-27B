@@ -59,11 +59,17 @@ def function(start, end):
 
 def check_source_contract():
     guard("prefill_into_decode_state(" in HEADER, "seeded public API absent")
-    guard("cudaError_t e=cudaMemcpy(seed->Kc[li],d_K," in PP2,
-          "K seed must derive from prefill post-RoPE keys")
-    guard("cudaMemcpy(seed->Vc[li],d_V," in PP2,
-          "V seed must derive from prefill value projection")
-    guard("seed->klen[li]=T;" in PP2, "host KV length must advance to T")
+    # With chunked prefill, both K and V must append at the absolute
+    # per-layer position. When pos0=0 these checks cover the original
+    # single-pass seeded API; for pos0>0 they prevent a silent overwrite.
+    guard("cudaMemcpy(seed->Kc[li]+(size_t)pos0*NKK,d_K," in PP2,
+          "K seed must append post-RoPE keys at pos0")
+    guard("cudaMemcpy(seed->Vc[li]+(size_t)pos0*NKK,d_V," in PP2,
+          "V seed must append values at pos0")
+    guard("seed->klen[li]!=pos0" in PP2,
+          "KV append must require previous length pos0")
+    guard("seed->klen[li]=pos0+T;" in PP2,
+          "host KV length must advance by chunk length")
     guard("d_S=seed->S[li];" in PP2, "GDN must use persistent request state")
     guard("seed_conv_tail_k<<<" in PP2, "conv queue tail kernel is absent")
     guard("seed->CS[li],d_qkv,T,CC" in PP2, "conv tail source is wrong")
