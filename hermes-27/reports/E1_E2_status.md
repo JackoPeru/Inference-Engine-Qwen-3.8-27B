@@ -1,4 +1,4 @@
-# E1/E2 — Full-model su checkpoint reale (stato 2026-11-13: MATCH diretto, full-logits, MTP ACCEPT)
+# E1/E2 — Full-model su checkpoint reale (stato 2026-11-13: MATCH diretto, 2 prompt, MTP ACCEPT)
 
 ## Golden vigente (convenzione diretta `rms(x)*w`, cfr `NORM_CONVENTION.md`)
 - E1 torch CPU fp32, prefill 11 token (`Spiega in 2 frasi la gravita.`):
@@ -6,6 +6,9 @@
   mean -1.902 std 2.027. Golden precedente (1+w) `[898,...]` INVALIDATO.
 - Script: `scripts/e1_runner.py` (+`E1_SAVE_LOGITS` salva `/tmp/e1_logits.pt`).
   Decode con carry E1: crash shape noto, non bloccante (carry validato su E2 vs prefill E1).
+- Secondo prompt (EN storia, 13 tok `Summarize the causes...`): E1==E2
+  top5 `[2250,279,271,8323,198]`, full-logits maxerr 7.12e-03 (floor fp16),
+  meanerr 4.42e-04, argmax 13/13 SAME, top50 50/50 ovunque.
 
 ## E2 (C++ `ModelFwd`)
 - `test_model_fwd` top5 identici al golden → **MATCH E1 PASS** (log `/tmp/e2_full_direct.log`).
