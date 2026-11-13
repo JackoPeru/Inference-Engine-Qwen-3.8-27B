@@ -84,3 +84,15 @@ add_test(NAME mtp_accept COMMAND test_mtp_accept)
 add_executable(test_logits_dump architecture/tests/test_logits_dump.cpp)
 target_link_libraries(test_logits_dump PRIVATE hermes_arch hermes_gguf)
 # NOT in ctest: heavy full-prefill saver, run only explicitly in queue.
+# P2 PP2 forward (distributed, GEMV preciso, single-copy raw GGUF residente)
+add_library(hermes_pp2 STATIC
+  distributed/pp2_fwd.cu
+)
+target_include_directories(hermes_pp2 PUBLIC distributed kernels/include model/include
+  ${CMAKE_SOURCE_DIR}/thirdparty/cutlass/include
+  ${CMAKE_SOURCE_DIR}/thirdparty/cutlass/tools/util/include)
+set_target_properties(hermes_pp2 PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+target_link_libraries(hermes_pp2 PUBLIC hermes_gguf hermes_kernels)
+add_executable(test_pp2_fwd distributed/test_pp2_fwd.cu)
+target_link_libraries(test_pp2_fwd PRIVATE hermes_pp2 hermes_gguf hermes_kernels)
+add_test(NAME pp2_fwd COMMAND test_pp2_fwd)
