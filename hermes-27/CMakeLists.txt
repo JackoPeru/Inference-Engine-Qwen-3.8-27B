@@ -42,8 +42,14 @@ if(Python3_Interpreter_FOUND)
     COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_SOURCE_DIR}/distributed/test_async_stream_contract.py)
   add_test(NAME prefill_integration_contract_cpu
     COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_SOURCE_DIR}/distributed/test_prefill_integration_contract.py)
+  # Independent llama callback capture manifest verification uses only
+  # synthetic files: no GGUF model load, CUDA, or live inference.
+  add_test(NAME layer0_downstream_capture_manifest_cpu
+    COMMAND ${Python3_EXECUTABLE} -B
+      ${CMAKE_SOURCE_DIR}/tests/reliability_layer0_downstream_callback_verify.py --selftest)
   set_tests_properties(logit_comparator_cpu release_harness_cpu async_stream_contract_cpu prefill_integration_contract_cpu
     PROPERTIES TIMEOUT 60)
+  set_tests_properties(layer0_downstream_capture_manifest_cpu PROPERTIES TIMEOUT 60)
 endif()
 add_executable(test_gguf_synth model/tests/test_gguf_synth.cpp)
 target_link_libraries(test_gguf_synth PRIVATE hermes_gguf)
