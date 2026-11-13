@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cmath>
+#include <climits>
 
 namespace mtp_gpu {
 
@@ -92,7 +93,10 @@ __global__ void extract_G_k(const float* qq, float* G, int N){
 }
 __global__ void sdpa_gqa_decode_k(const float* Q, const float* Kc, const float* Vc, float* ATT, int L){
   int b=(int)blockIdx.x; int hq=b; int g=hq/6; int tid=(int)threadIdx.x;
-  __shared__ float scores[128]; __shared__ float tmp[256];
+  // Dynamic scores: L can exceed 127 with extended MTP state. Caller launches
+  // with (L+1)*sizeof(float) shared bytes; max 8192 entries fits SM120 limits.
+  extern __shared__ float scores[];
+  __shared__ float tmp[256];
   float qv=Q[(size_t)hq*256+tid];
   for(int t2=0;t2<=L;++t2){
     float kv=Kc[(size_t)t2*1024+g*256+tid];
@@ -129,71 +133,119 @@ static bool wptr(const std::string& n, void*& d, int* ne0=nullptr, int* ne1=null
                  int* gt=nullptr, int* dev=nullptr){
   return pp2::get_weight_ptr(n, d, ne0, ne1, gt, dev);
 }
+static bool checked_weight(const char* n, void*& d, int ne0_want,
+                           int ne1_want, int dtype_want, int dev_want,
+                           std::string& err){
+  int ne0=-1,ne1=-1,gt=-1,device=-1;
+  if(!wptr(n,d,&ne0,&ne1,&gt,&device)||!d){
+    err=std::string("missing MTP weight ")+n;
+    return false;
+  }
+  if(ne0!=ne0_want||ne1!=ne1_want||gt!=dtype_want||device!=dev_want){
+    err=std::string("MTP weight shape/type/device mismatch ")+n+
+      " got="+std::to_string(ne0)+"x"+std::to_string(ne1)+
+      " type="+std::to_string(gt)+" dev="+std::to_string(device);
+    return false;
+  }
+  return true;
+}
 
-bool init(MtpState& st, std::string& err){
-  if(st.inited) return true;
-  st.Kc=nullptr; st.Vc=nullptr; st.len=0;
-  cudaSetDevice(1);
-  size_t bytes=(size_t)MAXL*1024*4;
+bool init(MtpState& st, std::string& err){ return init(st, err, MAXL); }
+
+bool init(MtpState& st, std::string& err, int capacity){
+  if(capacity<1 || capacity>MAX_CONTEXT){ err="mtp capacity must be 1..8192"; return false; }
+  if(st.inited){
+    if(st.capacity!=capacity){ err="mtp already initialized with different capacity"; return false; }
+    return true;
+  }
+  st.Kc=nullptr; st.Vc=nullptr; st.len=0; st.first_pos=-1; st.capacity=capacity;
+  cudaError_t ce=cudaSetDevice(1);
+  if(ce!=cudaSuccess){ err="mtp cudaSetDevice(1): "+std::string(cudaGetErrorString(ce)); return false; }
+  size_t bytes=(size_t)capacity*1024*4;
   float *k=nullptr,*v=nullptr;
   if(cudaMalloc(&k,bytes)!=cudaSuccess){ err="OOM MtpState Kc"; return false; }
   if(cudaMalloc(&v,bytes)!=cudaSuccess){ cudaFree(k); err="OOM MtpState Vc"; return false; }
-  cudaMemset(k,0,bytes); cudaMemset(v,0,bytes);
-  st.Kc=k; st.Vc=v; st.len=0; st.inited=true;
+  ce=cudaMemset(k,0,bytes);
+  if(ce==cudaSuccess) ce=cudaMemset(v,0,bytes);
+  if(ce!=cudaSuccess){ err="mtp KV init failed: "+std::string(cudaGetErrorString(ce)); cudaFree(k); cudaFree(v); return false; }
+  st.Kc=k; st.Vc=v; st.len=0; st.first_pos=-1; st.inited=true;
   return true;
 }
-void reset(MtpState& st){ if(st.inited){ st.len=0; } }
+void reset(MtpState& st){ if(st.inited){ st.len=0; st.first_pos=-1; } }
+
+bool rewind(MtpState& st, int keep_len, std::string& err){
+  if(!st.inited){ err="mtp rewind uninitialized"; return false; }
+  if(keep_len<0 || keep_len>st.len){ err="mtp rewind outside committed range"; return false; }
+  st.len=keep_len;
+  if(keep_len==0) st.first_pos=-1;
+  return true;
+}
 void free_state(MtpState& st){
   if(!st.inited) return;
   cudaSetDevice(1);
   if(st.Kc){ cudaFree(st.Kc); st.Kc=nullptr; }
   if(st.Vc){ cudaFree(st.Vc); st.Vc=nullptr; }
-  st.len=0; st.inited=false;
+  st.len=0; st.first_pos=-1; st.capacity=MAXL; st.inited=false;
 }
 
 static inline float bf2f_cpu(uint16_t b){ uint32_t u=(uint32_t)b<<16; float f; memcpy(&f,&u,4); return f; }
 
 std::vector<float> draft_step(const float* h_last, int tok, MtpState& st, long pos,
                               std::string& err){
+  err.clear();
   if(!st.inited){ err="mtp not inited"; return {}; }
   if(!h_last){ err="null h_last"; return {}; }
   if(tok<0||tok>=VOC){ err="tok OOB"; return {}; }
-  if(st.len<0||st.len>=MAXL){ err="mtp len OOB"; return {}; }
+  if(st.len<0||st.capacity<1||st.capacity>MAX_CONTEXT||st.len>=st.capacity){ err="mtp len OOB"; return {}; }
+  if(pos<0||pos>INT_MAX || (st.len>0 && pos!=st.first_pos+st.len)){
+    err="mtp pos not consecutive with draft KV (reset or rewind required)"; return {};
+  }
+  if(st.len>0 && st.first_pos<0){ err="mtp invalid first_pos"; return {}; }
+  // Strictly this accepts the GGUF 65-layer checkpoint, not any arbitrary
+  // converted weights with a similar name. Tensor dtype/dims/dev checked below.
   // ---- pesi residenti (tutti su GPU1 tranne emb su GPU0) ----
   void *d_hn_w=nullptr,*d_en_w=nullptr,*d_eh_w=nullptr,
        *d_an_w=nullptr,*d_q_w=nullptr,*d_qn_w=nullptr,*d_k_w=nullptr,*d_kn_w=nullptr,
        *d_v_w=nullptr,*d_o_w=nullptr,*d_post_w=nullptr,
        *d_fg_w=nullptr,*d_fu_w=nullptr,*d_fd_w=nullptr,
        *d_shn_w=nullptr,*d_head_w=nullptr,*d_emb=nullptr;
-  int e0=0,e1=0,gt=0,dv=0;
-  if(!wptr("blk.64.nextn.hnorm.weight",d_hn_w)){ err="missing hnorm"; return {}; }
-  if(!wptr("blk.64.nextn.enorm.weight",d_en_w)){ err="missing enorm"; return {}; }
-  if(!wptr("blk.64.nextn.eh_proj.weight",d_eh_w,&e0,&e1,&gt,&dv)||e0!=10240||e1!=5120||gt!=30){ err="bad eh_proj"; return {}; }
-  if(!wptr("blk.64.attn_norm.weight",d_an_w)){ err="missing attn_norm"; return {}; }
-  if(!wptr("blk.64.attn_q.weight",d_q_w,&e0,&e1,&gt,&dv)||e0!=5120||e1!=12288||gt!=30){ err="bad attn_q"; return {}; }
-  if(!wptr("blk.64.attn_q_norm.weight",d_qn_w)){ err="missing qn"; return {}; }
-  if(!wptr("blk.64.attn_k.weight",d_k_w,&e0,&e1,&gt,&dv)||e0!=5120||e1!=1024||gt!=30){ err="bad attn_k"; return {}; }
-  if(!wptr("blk.64.attn_k_norm.weight",d_kn_w)){ err="missing kn"; return {}; }
-  if(!wptr("blk.64.attn_v.weight",d_v_w,&e0,&e1,&gt,&dv)||e0!=5120||e1!=1024||gt!=30){ err="bad attn_v"; return {}; }
-  if(!wptr("blk.64.attn_output.weight",d_o_w,&e0,&e1,&gt,&dv)||e0!=6144||e1!=5120||gt!=30){ err="bad attn_o"; return {}; }
-  if(!wptr("blk.64.post_attention_norm.weight",d_post_w)){ err="missing post"; return {}; }
-  if(!wptr("blk.64.ffn_gate.weight",d_fg_w,&e0,&e1,&gt,&dv)||e0!=5120||e1!=17408||gt!=30){ err="bad ffn_gate"; return {}; }
-  if(!wptr("blk.64.ffn_up.weight",d_fu_w,&e0,&e1,&gt,&dv)||e0!=5120||e1!=17408||gt!=30){ err="bad ffn_up"; return {}; }
-  if(!wptr("blk.64.ffn_down.weight",d_fd_w,&e0,&e1,&gt,&dv)||e0!=17408||e1!=5120||gt!=30){ err="bad ffn_down"; return {}; }
-  if(!wptr("blk.64.nextn.shared_head_norm.weight",d_shn_w)){ err="missing shn"; return {}; }
-  if(!wptr("output.weight",d_head_w,&e0,&e1,&gt,&dv)||e0!=5120||e1!=248320||gt!=30){ err="bad head"; return {}; }
-  if(!wptr("token_embd.weight",d_emb,&e0,&e1,&gt,&dv)||e0!=5120||e1!=248320||gt!=30){ err="bad emb"; return {}; }
+  struct Spec{ const char* name; void** pointer; int n0,n1,type,device; };
+  const Spec specs[]={
+    {"blk.64.nextn.hnorm.weight",&d_hn_w,5120,1,0,1},
+    {"blk.64.nextn.enorm.weight",&d_en_w,5120,1,0,1},
+    {"blk.64.nextn.eh_proj.weight",&d_eh_w,10240,5120,30,1},
+    {"blk.64.attn_norm.weight",&d_an_w,5120,1,0,1},
+    {"blk.64.attn_q.weight",&d_q_w,5120,12288,30,1},
+    {"blk.64.attn_q_norm.weight",&d_qn_w,256,1,0,1},
+    {"blk.64.attn_k.weight",&d_k_w,5120,1024,30,1},
+    {"blk.64.attn_k_norm.weight",&d_kn_w,256,1,0,1},
+    {"blk.64.attn_v.weight",&d_v_w,5120,1024,30,1},
+    {"blk.64.attn_output.weight",&d_o_w,6144,5120,30,1},
+    {"blk.64.post_attention_norm.weight",&d_post_w,5120,1,0,1},
+    {"blk.64.ffn_gate.weight",&d_fg_w,5120,17408,30,1},
+    {"blk.64.ffn_up.weight",&d_fu_w,5120,17408,30,1},
+    {"blk.64.ffn_down.weight",&d_fd_w,17408,5120,30,1},
+    {"blk.64.nextn.shared_head_norm.weight",&d_shn_w,5120,1,0,1},
+    {"output.weight",&d_head_w,5120,248320,30,1},
+    {"token_embd.weight",&d_emb,5120,248320,30,0}
+  };
+  for(const auto& spec:specs){
+    if(!checked_weight(spec.name,*spec.pointer,spec.n0,spec.n1,
+                       spec.type,spec.device,err))return {};
+  }
 
   // ---- embedding tok: riga BF16 da GPU0 -> fp32 host (leggero, 5120 elem) ----
   static thread_local uint16_t emb_row[5120];
   static thread_local float e_fp32[5120];
-  cudaSetDevice(0);
+  cudaError_t ce=cudaSetDevice(0);
+  if(ce!=cudaSuccess){ err="mtp embedding device0: "+std::string(cudaGetErrorString(ce)); return {}; }
   if(cudaMemcpy(emb_row,(uint16_t*)d_emb+(size_t)tok*5120,5120*2,cudaMemcpyDeviceToHost)!=cudaSuccess){
     err="emb D2H fail"; return {}; }
   for(int i=0;i<5120;++i) e_fp32[i]=bf2f_cpu(emb_row[i]);
 
   // ---- upload su GPU1 ----
-  cudaSetDevice(1);
+  ce=cudaSetDevice(1);
+  if(ce!=cudaSuccess){ err="mtp device1: "+std::string(cudaGetErrorString(ce)); return {}; }
   float *d_hl=nullptr,*d_e=nullptr,*d_hn=nullptr,*d_en=nullptr,*d_eh=nullptr,
         *d_x=nullptr,*d_h=nullptr,*d_qq=nullptr,*d_kk=nullptr,*d_vv=nullptr,
         *d_Q=nullptr,*d_K1=nullptr,*d_G=nullptr,*d_att=nullptr,*d_core=nullptr,
@@ -245,7 +297,7 @@ std::vector<float> draft_step(const float* h_last, int tok, MtpState& st, long p
     int L=st.len;
     MTP_CK(cudaMemcpy(st.Kc+(size_t)L*1024,d_K1,1024*4,cudaMemcpyDeviceToDevice),err,fail);
     MTP_CK(cudaMemcpy(st.Vc+(size_t)L*1024,d_vv,1024*4,cudaMemcpyDeviceToDevice),err,fail);
-    sdpa_gqa_decode_k<<<24,256>>>(d_Q,st.Kc,st.Vc,d_att,L);
+    sdpa_gqa_decode_k<<<24,256,((size_t)L+1)*sizeof(float)>>>(d_Q,st.Kc,st.Vc,d_att,L);
   }
   cudaFree(d_Q); d_Q=nullptr; cudaFree(d_K1); d_K1=nullptr; cudaFree(d_vv); d_vv=nullptr;
   gate_sig_k<<<(6144+255)/256,256>>>(d_att,d_G,d_G,6144);
@@ -289,10 +341,11 @@ std::vector<float> draft_step(const float* h_last, int tok, MtpState& st, long p
   cudaFree(d_xn); d_xn=nullptr;
   bf16_gemv_k<<<(248320+255)/256,256>>>(d_log,(uint16_t*)d_head_w,d_xnb,5120,248320);
   cudaFree(d_xnb); d_xnb=nullptr;
-  cudaDeviceSynchronize();
+  MTP_CK(cudaDeviceSynchronize(),err,fail);
   out.resize(248320);
   MTP_CK(cudaMemcpy(out.data(),d_log,(size_t)248320*4,cudaMemcpyDeviceToHost),err,fail);
   cudaFree(d_log); d_log=nullptr;
+  if(st.len==0) st.first_pos=pos;
   st.len++;
   return out;
 fail:
@@ -313,6 +366,7 @@ fail:
 }
 
 int argmax_v(const std::vector<float>& lg){
+  if(lg.empty()) return -1;
   int bi=0; float bv=lg[0];
   for(size_t i=1;i<lg.size();++i) if(lg[i]>bv){bv=lg[i];bi=(int)i;}
   return bi;
@@ -335,6 +389,7 @@ int top5_overlap(const std::vector<float>& a, const std::vector<float>& b){
   return n;
 }
 bool finite_all(const std::vector<float>& v, double& mn, double& mx, double& mean){
+  if(v.empty()){ mn=mx=mean=0; return false; }
   mn=v[0]; mx=v[0]; mean=0; bool fin=true;
   for(auto x:v){ if(!std::isfinite(x)) fin=false; if(x<mn)mn=x; if(x>mx)mx=x; mean+=x; }
   mean/=v.size();

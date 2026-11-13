@@ -12,6 +12,11 @@
 #include <string>
 #include <cmath>
 #include <chrono>
+#include <algorithm>
+#include <functional>
+#include <limits>
+#include <stdexcept>
+#include <thread>
 #ifndef HERMES_ADMISSION_CPU_ONLY
 #include <cuda_runtime.h>
 #endif
@@ -42,7 +47,398 @@ static int run_admission_tests(){
 }
 
 #ifdef HERMES_ADMISSION_CPU_ONLY
-int main(){ return run_admission_tests(); }
+namespace {
+struct FakeBackend final : pp2batch::StepBackend {
+  struct State { int serial, capacity, next_pos; };
+  struct Call { int serial, token; long pos; };
+  int opens = 0, closes = 0, live = 0, peak_live = 0;
+  bool fail_next_open = false, fail_next_step = false, wrong_logits = false;
+  bool nan_logits = false, throw_step = false;
+  std::vector<Call> calls;
+  std::function<void()> during_open;
+  std::function<void()> during_step;
+
+  bool open(int capacity, void*& state, std::string& error) override {
+    state = nullptr;
+    if (fail_next_open) {
+      fail_next_open = false;
+      error = "injected open OOM";
+      return false;
+    }
+    State* s = new State{++opens, capacity, 0};
+    state = s;
+    ++live;
+    peak_live = std::max(peak_live, live);
+    if (during_open) during_open();
+    return true;
+  }
+  bool step(void* p, int token, long position,
+            std::vector<float>& logits, std::string& error) override {
+    auto* s = static_cast<State*>(p);
+    calls.push_back({s->serial, token, position});
+    if (position != s->next_pos || position < 0 || position >= s->capacity) {
+      error = "position not monotonic or exceeds allocated KV capacity";
+      return false;
+    }
+    ++s->next_pos;
+    if (during_step) during_step();
+    if (throw_step) throw std::runtime_error("injected step exception");
+    if (fail_next_step) {
+      fail_next_step = false;
+      error = "injected decode failure";
+      return false;
+    }
+    logits.assign(wrong_logits ? 3u : 8u, -1.f);
+    if (nan_logits) logits[0] = std::numeric_limits<float>::quiet_NaN();
+    logits[2] = 1.f; // deterministic greedy token; EOS=7 never selected
+    return true;
+  }
+  void close(void* p) noexcept override {
+    delete static_cast<State*>(p);
+    ++closes;
+    --live;
+  }
+};
+
+int checks = 0, failures = 0;
+void expect(bool pass, const char* name) {
+  ++checks;
+  if (!pass) { ++failures; std::printf("SCHEDULER FAIL %s\n", name); }
+}
+pp2batch::SchedulerConfig config() {
+  pp2batch::SchedulerConfig c;
+  c.max_active = 2;
+  c.max_queued = 3;
+  c.steps_per_tick = 1;
+  c.max_retained = 8;
+  c.vocab_size = 8;
+  c.eos_token_id = 7;
+  c.max_context = 12;
+  c.queue_timeout = std::chrono::milliseconds(1000);
+  return c;
+}
+bool has_status(pp2batch::ContinuousScheduler& s, const std::string& id,
+                pp2batch::JobStatus status, size_t n_gen = 0) {
+  pp2batch::JobSnapshot snapshot;
+  return s.inspect(id, snapshot) && snapshot.status == status &&
+         snapshot.generated.size() == n_gen;
+}
+
+int run_scheduler_tests() {
+  using namespace pp2batch;
+  using namespace std::chrono;
+  // Static mixed-context projection is exact for the FP32 per-state layout.
+  std::string why;
+  expect(admit_mixed({1, 8192, 1}, why) && !why.empty(), "mixed contexts allowed");
+  expect(admit_mixed({8192, 8192, 8192, 8192}, why), "four 8K states admitted");
+  expect(!admit_mixed({8192, 8192, 8192, 8192, 8192}, why), "five 8K states rejected");
+  expect(!admit_mixed({}, why), "empty mixed context rejected");
+  expect(!admit_mixed({0}, why), "zero context rejected");
+  expect(!admit_mixed({8193}, why), "too long context rejected");
+  expect(!admit_mixed(std::vector<int>(17, 1), why), "too many states rejected");
+
+  // Invalid contexts must fail before any backend allocation, and a full
+  // waiting queue must reject immediately with no unbounded memory growth.
+  {
+    FakeBackend backend;
+    auto cfg = config();
+    cfg.max_context = 4;
+    cfg.max_queued = 2;
+    int cancel_events = 0;
+    cfg.on_event = [&](const SchedulerEvent& event) {
+      if (event.kind == EventKind::terminal &&
+          event.status == JobStatus::cancelled) ++cancel_events;
+    };
+    ContinuousScheduler s(cfg, backend);
+    expect(s.enqueue({"", {1}, 1}).code == SubmitCode::invalid, "empty ID");
+    expect(s.enqueue({"blank", {}, 1}).code == SubmitCode::invalid, "empty prompt");
+    expect(s.enqueue({"negative", {-1}, 1}).code == SubmitCode::invalid, "negative token");
+    expect(s.enqueue({"vocab", {8}, 1}).code == SubmitCode::invalid, "out of vocab");
+    expect(s.enqueue({"zero", {1}, 0}).code == SubmitCode::invalid, "zero generation");
+    expect(s.enqueue({"long", {1, 2, 3, 4}, 2}).code == SubmitCode::invalid,
+           "prompt+generation over capacity");
+    expect(s.enqueue({"huge", {1}, std::numeric_limits<int>::max()}).code ==
+           SubmitCode::invalid, "huge generation overflow");
+    expect(s.enqueue({"a", {1}, 1}).code == SubmitCode::accepted, "queue a");
+    expect(s.enqueue({"a", {1}, 1}).code == SubmitCode::duplicate, "duplicate ID");
+    expect(s.enqueue({"b", {1}, 1}).code == SubmitCode::accepted, "queue b");
+    expect(s.enqueue({"c", {1}, 1}).code == SubmitCode::queue_full, "bounded waiting");
+    expect(s.metrics().queued == 2 && s.metrics().active == 0 &&
+           backend.opens == 0, "no implicit GPU initialization");
+    expect(s.cancel("b") && has_status(s, "b", JobStatus::cancelled),
+           "queued cancellation immediate");
+    expect(cancel_events == 1, "queued cancellation event once");
+    expect(s.metrics().queued == 1, "cancel releases waiting slot");
+    expect(s.enqueue({"c", {1}, 1}).code == SubmitCode::accepted,
+           "queue space restored");
+    s.shutdown();
+    expect(s.metrics().active == 0 && s.metrics().queued == 0 && backend.live == 0,
+           "shutdown drains waiting");
+    expect(cancel_events == 3, "shutdown sends two terminal callbacks");
+    expect(s.enqueue({"d", {1}, 1}).code == SubmitCode::stopped,
+           "enqueue after shutdown denied");
+  }
+  // Round-robin uses one decode_step per request turn. The states have
+  // different prompt lengths, KV capacities, positions and generation limits.
+  {
+    FakeBackend backend;
+    auto cfg = config();
+    cfg.queue_timeout = seconds(60);
+    std::vector<SchedulerEvent> events;
+    cfg.on_event = [&](const SchedulerEvent& event) { events.push_back(event); };
+    ContinuousScheduler s(cfg, backend);
+    const auto start = SchedulerClock::time_point{};
+    expect(s.enqueue({"A", {1, 3, 5}, 2}, start).code == SubmitCode::accepted, "fair A");
+    expect(s.enqueue({"B", {4}, 2}, start).code == SubmitCode::accepted, "fair B");
+    expect(s.enqueue({"C", {6}, 1}, start).code == SubmitCode::accepted, "fair C");
+    int executed = 0;
+    for (int i = 0; i < 8; ++i) executed += int(s.tick(start));
+    const std::vector<int> serials = {1, 2, 1, 2, 1, 3, 1};
+    std::vector<int> actual;
+    for (const auto& call : backend.calls) actual.push_back(call.serial);
+    expect(actual == serials, "fair scheduler interleaves A B C");
+    expect(backend.calls.size() == 7 && executed == 7, "seven exact GPU steps");
+    const std::vector<long> positions = {0, 0, 1, 1, 2, 0, 3};
+    std::vector<long> actual_pos;
+    for (const auto& call : backend.calls) actual_pos.push_back(call.pos);
+    expect(actual_pos == positions, "separate per-request positions");
+    expect(has_status(s, "A", JobStatus::completed, 2), "A completed");
+    expect(has_status(s, "B", JobStatus::completed, 2), "B completed");
+    expect(has_status(s, "C", JobStatus::completed, 1), "C completed");
+    expect(backend.peak_live == 2 && backend.live == 0 &&
+           backend.opens == backend.closes, "active GPU state cap and cleanup");
+    auto m = s.metrics();
+    expect(m.active == 0 && m.queued == 0 && m.completed_total == 3 &&
+           m.decode_steps_total == 7, "completed counters and no active leak");
+    std::vector<std::string> event_signature;
+    for (const auto& event : events)
+      event_signature.push_back(event.id + (event.kind == EventKind::token ? ":token" : ":end"));
+    expect(event_signature == std::vector<std::string>({
+           "B:token", "B:token", "B:end", "A:token",
+           "C:token", "C:end", "A:token", "A:end"}),
+           "exact token and terminal events in generation order");
+    expect(events[2].generated == std::vector<int>({2, 2}) &&
+           events[5].generated == std::vector<int>({2}) &&
+           events[7].generated == std::vector<int>({2, 2}),
+           "terminal callback owns complete generated output");
+    JobSnapshot removed;
+    expect(s.retire("A") && !s.inspect("A", removed), "retire terminal state");
+  }
+  // EOS is a sampled output after the final prompt step; that output must not
+  // cause an extra model step. Single-token EOS finalizes after one step.
+  {
+    FakeBackend backend;
+    auto cfg = config();
+    cfg.eos_token_id = 2;
+    ContinuousScheduler s(cfg, backend);
+    s.enqueue({"eos", {1, 2, 3}, 9});
+    expect(s.tick() == 1 && s.tick() == 1 && s.tick() == 1, "EOS prompt processed");
+    expect(has_status(s, "eos", JobStatus::completed, 1) &&
+           backend.calls.size() == 3 && backend.live == 0, "EOS early stop");
+  }
+  // Backend can call cancel() synchronously within decode_step: scheduler
+  // holds no metadata mutex across CUDA and discards cancelled step output.
+  {
+    FakeBackend backend;
+    auto cfg = config();
+    ContinuousScheduler s(cfg, backend);
+    s.enqueue({"inflight", {1}, 3});
+    backend.during_step = [&]() {
+      expect(s.cancel("inflight"), "inflight cancellation responsive");
+    };
+    expect(s.tick() == 1, "inflight decode step returned");
+    backend.during_step = {};
+    expect(has_status(s, "inflight", JobStatus::cancelled) &&
+           backend.live == 0 && backend.calls.size() == 1, "cancel no partial output");
+    expect(!s.cancel("inflight"), "terminal cancel idempotent");
+  }
+  // A request can be cancelled while PP2 decode_init is still allocating.
+  // Admission must not resurrect a cancelled job or leak a newly opened state.
+  {
+    FakeBackend backend;
+    auto cfg = config();
+    ContinuousScheduler s(cfg, backend);
+    s.enqueue({"opening", {1}, 2});
+    backend.during_open = [&]() {
+      expect(s.cancel("opening"), "cancellation during state allocation");
+    };
+    expect(s.tick() == 0, "cancelled opening never decoded");
+    backend.during_open = {};
+    expect(has_status(s, "opening", JobStatus::cancelled) &&
+           backend.live == 0 && backend.opens == backend.closes,
+           "cancelled opening state immediately freed");
+  }
+  // Queue deadline runs even when all active slots are occupied.
+  {
+    FakeBackend backend;
+    auto cfg = config();
+    cfg.max_active = 1;
+    ContinuousScheduler s(cfg, backend);
+    const auto t0 = SchedulerClock::time_point{};
+    s.enqueue({"current", {1, 1, 1, 1}, 1}, t0);
+    s.enqueue({"wait", {2}, 1}, t0);
+    s.tick(t0);
+    expect(s.metrics().active == 1 && s.metrics().queued == 1, "one active slot");
+    s.tick(t0 + milliseconds(1001));
+    expect(has_status(s, "wait", JobStatus::expired) &&
+           s.metrics().expired_total == 1, "queued request expires under pressure");
+    expect(s.metrics().queued == 0 && backend.opens == 1, "expired never opens state");
+  }
+  // The clock also advances within a single tick. A slow backend step must
+  // not admit an already expired waiting job on the next iteration.
+  {
+    FakeBackend backend;
+    auto cfg = config();
+    cfg.max_active = 1;
+    cfg.steps_per_tick = 2;
+    cfg.queue_timeout = milliseconds(2);
+    ContinuousScheduler s(cfg, backend);
+    const auto t0 = SchedulerClock::time_point{};
+    s.enqueue({"slow", {1, 2}, 1}, t0);
+    s.enqueue({"deadline", {3}, 1}, t0);
+    backend.during_step = [] { std::this_thread::sleep_for(milliseconds(10)); };
+    expect(s.tick(t0) == 2, "two steps in a slow pump");
+    expect(has_status(s, "deadline", JobStatus::expired) &&
+           backend.opens == 1 && backend.live == 0,
+           "timeout evaluated between steps of one tick");
+  }
+  // Admission uses the sum of all active FP32 capacities. Five full 8K
+  // requests are allowed to queue, but at most four GPU states may open
+  // under the conservative budget. A cancelled state frees an admission slot.
+  {
+    FakeBackend backend;
+    auto cfg = config();
+    cfg.max_active = 5; // larger than the static FP32 GPU1 memory envelope
+    cfg.max_context = 8192;
+    cfg.max_queued = 5;
+    cfg.queue_timeout = hours(1);
+    ContinuousScheduler s(cfg, backend);
+    for (int i = 0; i < 5; ++i)
+      expect(s.enqueue({"big" + std::to_string(i), {1}, 8192}).code ==
+             SubmitCode::accepted, "8K request queued");
+    s.tick();
+    expect(s.metrics().active == 4 && s.metrics().queued == 1 &&
+           backend.opens == 4, "aggregate FP32 memory admission limits slots");
+    expect(s.cancel("big0"), "cancel active 8K state");
+    for (int i = 0; i < 5; ++i) s.tick();
+    expect(s.metrics().active == 4 && s.metrics().queued == 0 &&
+           backend.opens == 5 && backend.peak_live == 4,
+           "freed state admits waiting 8K request");
+    s.shutdown();
+    expect(backend.live == 0 && backend.opens == backend.closes,
+           "mixed 8K admission no state leak");
+  }
+  // State allocation and decode failures must not poison later requests.
+  {
+    FakeBackend backend;
+    auto cfg = config();
+    cfg.max_active = 1;
+    ContinuousScheduler s(cfg, backend);
+    s.enqueue({"oom", {1}, 1});
+    s.enqueue({"next", {2}, 1});
+    backend.fail_next_open = true;
+    s.tick();
+    expect(has_status(s, "oom", JobStatus::failed) &&
+           has_status(s, "next", JobStatus::completed, 1), "failed open frees admission");
+    expect(backend.opens == 1 && backend.closes == 1, "open failure no GPU leak");
+    backend.nan_logits = true;
+    s.enqueue({"nan", {3}, 1});
+    s.tick();
+    expect(has_status(s, "nan", JobStatus::failed) && backend.live == 0,
+           "NaN logits fail closed");
+    backend.nan_logits = false;
+    backend.wrong_logits = true;
+    s.enqueue({"bad-size", {3}, 1});
+    s.tick();
+    expect(has_status(s, "bad-size", JobStatus::failed) && backend.live == 0,
+           "wrong logits size fail closed");
+    backend.wrong_logits = false;
+    backend.throw_step = true;
+    s.enqueue({"throw", {4}, 1});
+    s.tick();
+    expect(has_status(s, "throw", JobStatus::failed) && backend.live == 0,
+           "decode exceptions release GPU state");
+  }
+  // Completion must reach its consumer without depending on retained history.
+  // Throwing consumer callbacks are observable but cannot leak GPU state.
+  {
+    FakeBackend backend;
+    auto cfg = config();
+    cfg.max_retained = 0;
+    int tokens = 0, terminal = 0, cancelled = 0;
+    cfg.on_event = [&](const SchedulerEvent& event) {
+      if (event.kind == EventKind::token) ++tokens;
+      if (event.kind == EventKind::terminal &&
+          event.status == JobStatus::completed &&
+          event.generated == std::vector<int>({2})) ++terminal;
+      if (event.kind == EventKind::terminal &&
+          event.status == JobStatus::cancelled) ++cancelled;
+    };
+    ContinuousScheduler s(cfg, backend);
+    s.enqueue({"zero-history", {1}, 1});
+    s.tick();
+    JobSnapshot j;
+    expect(tokens == 1 && terminal == 1, "callback delivers terminal without history");
+    expect(!s.inspect("zero-history", j) && s.metrics().retained == 0,
+           "zero terminal retention still bounded");
+    expect(backend.live == 0, "zero-history release");
+    expect(s.enqueue({"queued-zero", {1}, 1}).code == SubmitCode::accepted,
+           "zero-history queued request");
+    expect(s.cancel("queued-zero") && cancelled == 1 &&
+           !s.inspect("queued-zero", j) && s.metrics().retained == 0,
+           "zero-history queued cancellation no use-after-free");
+  }
+  {
+    FakeBackend backend;
+    auto cfg = config();
+    cfg.on_event = [](const SchedulerEvent&) {
+      throw std::runtime_error("injected consumer exception");
+    };
+    ContinuousScheduler s(cfg, backend);
+    s.enqueue({"throws-cb", {1}, 1});
+    s.tick();
+    expect(has_status(s, "throws-cb", JobStatus::completed, 1) &&
+           s.metrics().callback_errors_total == 2 && backend.live == 0,
+           "callback exception accounted without model state leak");
+  }
+  // Terminal snapshots have a configured finite bound, preventing retaining
+  // every finished request indefinitely in a long-running server.
+  {
+    FakeBackend backend;
+    auto cfg = config();
+    cfg.max_retained = 2;
+    ContinuousScheduler s(cfg, backend);
+    s.enqueue({"one", {1}, 1});
+    s.tick();
+    s.enqueue({"two", {1}, 1});
+    s.tick();
+    s.enqueue({"three", {1}, 1});
+    s.tick();
+    JobSnapshot j;
+    expect(!s.inspect("one", j) && s.inspect("two", j) &&
+           s.inspect("three", j), "bounded terminal snapshots");
+    expect(s.metrics().retained == 2, "bounded metadata total");
+    expect(s.retire("two") && s.metrics().retained == 1, "explicit terminal retire");
+  }
+  bool threw = false;
+  try {
+    auto cfg = config();
+    cfg.max_active = 0;
+    FakeBackend b;
+    ContinuousScheduler s(cfg, b);
+  } catch (const std::invalid_argument&) { threw = true; }
+  expect(threw, "bad scheduler config rejected");
+  std::printf("SCHEDULER CPU MOCK %s: %d assertions, %d failures\n",
+              failures ? "FAIL" : "PASS", checks, failures);
+  return failures ? 1 : 0;
+}
+} // namespace
+
+int main() {
+  const int admission = run_admission_tests();
+  const int scheduler = run_scheduler_tests();
+  return admission || scheduler ? 1 : 0;
+}
 #else
 
 static int argmax_v(const std::vector<float>& v){

@@ -21,6 +21,7 @@
 #include <vector>
 #include <string>
 #include <mutex>
+#include <new>
 
 using namespace hermes;
 
@@ -263,7 +264,9 @@ static WEntry* find_w(const std::string& n){
   auto jt=g_w1.find(n); if(jt!=g_w1.end()) return &jt->second;
   return nullptr;
 }
-static void gemv_batch(const uint16_t* d_in, const uint8_t* d_W, float* d_out, int H, int N, int T){
+static thread_local cudaError_t g_async_gemv_error=cudaSuccess;
+static void gemv_batch(const uint16_t* d_in, const uint8_t* d_W, float* d_out, int H, int N, int T,
+                       cudaStream_t stream=0){
   // Experimental CUDA GEMV A/B. No weights are repacked and the validated
   // scalar implementation stays default. The new packed4 path is opt-in.
   // Read only once per process; changing the flag requires a restart.
@@ -282,14 +285,20 @@ static void gemv_batch(const uint16_t* d_in, const uint8_t* d_W, float* d_out, i
       // This API reports launch errors without synchronizing. The existing
       // layer-boundary/output-head checks detect asynchronous CUDA errors.
       cudaError_t rc=nvfp4_gemv_warp_experiment(
-        x,d_W,y,H,N,Nvfp4WarpExperiment::PackedU32x4);
+        x,d_W,y,H,N,Nvfp4WarpExperiment::PackedU32x4,stream);
       if(rc==cudaSuccess) continue;
+      if(stream!=0){
+        // Do not terminate other users on a failed opt-in GEMV launch.
+        // The caller checks this request-local error at the layer boundary.
+        g_async_gemv_error=rc;
+        return;
+      }
       // A failed launch must not silently return partially computed logits.
       std::fprintf(stderr,"HERMES packed4 launch failure: %s\n",cudaGetErrorString(rc));
       std::abort();
     }
     nvfp4_gemv_cuda_variant(x,d_W,y,H,N,
-      (variant==0)?Nvfp4GemvVariant::Scalar:Nvfp4GemvVariant::Warp4);
+      (variant==0)?Nvfp4GemvVariant::Scalar:Nvfp4GemvVariant::Warp4,stream);
   }
 }
 
@@ -972,7 +981,78 @@ static bool decode_skip_layer_sync(){
   return skip;
 }
 
-static bool run_gdn_decode_layer(int li, float* d_x, DecodeState& ds, std::string& err){
+// Strictly opt-in, per-request two-stage decode. No global staging mutex,
+// default-stream launch or device-wide barrier is used by this path.
+struct AsyncDecodeContext {
+  cudaStream_t stream0=nullptr, stream1=nullptr;
+  cudaEvent_t ready0=nullptr, ready1=nullptr;
+  int* host_token=nullptr;            // pinned H2D token (4 B)
+  float* host_hidden=nullptr;         // pinned GPU0 -> GPU1 hidden (20 KiB)
+  float* host_logits=nullptr;         // pinned GPU1 -> CPU logits (993280 B)
+  std::mutex step_mutex;
+  bool poisoned=false;
+};
+
+static bool async_requested(){
+  const char* flag=std::getenv("HERMES_PP2_ASYNC_STREAMS");
+  return flag && std::strcmp(flag,"1")==0;
+}
+
+static bool cuda_async_check(cudaError_t e, const char* op, std::string& err){
+  if(e==cudaSuccess) return true;
+  err=std::string("async decode ")+op+": "+cudaGetErrorString(e);
+  return false;
+}
+
+// Drain all pending work before releasing pinned host buffers or GPU state.
+// This also handles partial initialization and fail-closed CUDA errors.
+static void async_release(DecodeState& ds){
+  auto* ctx=static_cast<AsyncDecodeContext*>(ds.async_ctx);
+  if(!ctx) return;
+  {
+    std::lock_guard<std::mutex> lk(ctx->step_mutex);
+    (void)cudaSetDevice(0);
+    if(ctx->stream0) (void)cudaStreamSynchronize(ctx->stream0);
+    (void)cudaSetDevice(1);
+    if(ctx->stream1) (void)cudaStreamSynchronize(ctx->stream1);
+    (void)cudaSetDevice(0);
+    if(ctx->ready0) (void)cudaEventDestroy(ctx->ready0);
+    if(ctx->stream0) (void)cudaStreamDestroy(ctx->stream0);
+    (void)cudaSetDevice(1);
+    if(ctx->ready1) (void)cudaEventDestroy(ctx->ready1);
+    if(ctx->stream1) (void)cudaStreamDestroy(ctx->stream1);
+    if(ctx->host_token) (void)cudaFreeHost(ctx->host_token);
+    if(ctx->host_hidden) (void)cudaFreeHost(ctx->host_hidden);
+    if(ctx->host_logits) (void)cudaFreeHost(ctx->host_logits);
+    ds.async_ctx=nullptr;
+  }
+  delete ctx;
+}
+
+static bool async_prepare(DecodeState& ds, std::string& err){
+  auto* ctx=new(std::nothrow) AsyncDecodeContext;
+  if(!ctx){ err="async decode context allocation failed"; return false; }
+  ds.async_ctx=ctx; // decode_free handles failure from any intermediate step
+  if(!cuda_async_check(cudaSetDevice(0),"select GPU0 during init",err) ||
+     // cudaMemset of persistent GDN/KV state was enqueued on stream 0.
+     // Explicitly drain it before first use from cudaStreamNonBlocking.
+     !cuda_async_check(cudaStreamSynchronize(0),"zero-state GPU0",err) ||
+     !cuda_async_check(cudaStreamCreateWithFlags(&ctx->stream0,cudaStreamNonBlocking),"create GPU0 stream",err) ||
+     !cuda_async_check(cudaEventCreateWithFlags(&ctx->ready0,cudaEventDisableTiming),"create GPU0 event",err) ||
+     !cuda_async_check(cudaHostAlloc((void**)&ctx->host_token,sizeof(int),cudaHostAllocDefault),"alloc token pinned",err) ||
+     !cuda_async_check(cudaHostAlloc((void**)&ctx->host_hidden,WS_X_BYTES,cudaHostAllocDefault),"alloc hidden pinned",err) ||
+     !cuda_async_check(cudaSetDevice(1),"select GPU1 during init",err) ||
+     !cuda_async_check(cudaStreamSynchronize(0),"zero-state GPU1",err) ||
+     !cuda_async_check(cudaStreamCreateWithFlags(&ctx->stream1,cudaStreamNonBlocking),"create GPU1 stream",err) ||
+     !cuda_async_check(cudaEventCreateWithFlags(&ctx->ready1,cudaEventDisableTiming),"create GPU1 event",err) ||
+     !cuda_async_check(cudaHostAlloc((void**)&ctx->host_logits,WS_LOG_BYTES,cudaHostAllocDefault),"alloc logits pinned",err)){
+    return false;
+  }
+  return true;
+}
+
+static bool run_gdn_decode_layer(int li, float* d_x, DecodeState& ds, std::string& err,
+                                 cudaStream_t stream=0){
   char Pb[16]; snprintf(Pb,16,"blk.%d.",li); std::string P=Pb;
   WEntry *wNorm=find_w(P+"attn_norm.weight"), *wQkv=find_w(P+"attn_qkv.weight"),
          *wGate=find_w(P+"attn_gate.weight"), *wBeta=find_w(P+"ssm_beta.weight"),
@@ -1010,24 +1090,24 @@ static bool run_gdn_decode_layer(int li, float* d_x, DecodeState& ds, std::strin
   uint16_t* d_h2b  = (uint16_t*)(ws+510720);// 10240
   uint16_t* d_gb   = (uint16_t*)(ws+520960);// 12288
   uint16_t* d_hidb = (uint16_t*)(ws+533248);// 34816 (fine 568064)
-  rms_f32_k<<<T,512,(size_t)512*4>>>(d_h,d_x,(float*)wNorm->d,T,HID);
-  f32_to_bf16_k<<<(int)((nH+255)/256),256>>>(d_hb,d_h,(int)nH);
-  gemv_batch(d_hb,(uint8_t*)wQkv->d,d_q1,HID,CC,T);
-  gemv_batch(d_hb,(uint8_t*)wGate->d,d_zl,HID,VDD,T);
-  gemv_batch(d_hb,(uint8_t*)wBeta->d,d_b,HID,HV,T);
-  wa_gemm_k<<<(int)((T*HV+255)/256),256>>>(d_h,(float*)wAlpha->d,d_ar,T,HV,HID);
-  conv_decode_k<<<(int)((CC+255)/256),256>>>(d_q1,(float*)wC->d,ds.CS[li],d_cv,CC);
+  rms_f32_k<<<T,512,(size_t)512*4,stream>>>(d_h,d_x,(float*)wNorm->d,T,HID);
+  f32_to_bf16_k<<<(int)((nH+255)/256),256,0,stream>>>(d_hb,d_h,(int)nH);
+  gemv_batch(d_hb,(uint8_t*)wQkv->d,d_q1,HID,CC,T,stream);
+  gemv_batch(d_hb,(uint8_t*)wGate->d,d_zl,HID,VDD,T,stream);
+  gemv_batch(d_hb,(uint8_t*)wBeta->d,d_b,HID,HV,T,stream);
+  wa_gemm_k<<<(int)((T*HV+255)/256),256,0,stream>>>(d_h,(float*)wAlpha->d,d_ar,T,HV,HID);
+  conv_decode_k<<<(int)((CC+255)/256),256,0,stream>>>(d_q1,(float*)wC->d,ds.CS[li],d_cv,CC);
   {
     size_t nq=(size_t)T*HV*KHD;
-    split_qkv_k<<<(int)((nq+255)/256),256>>>(d_cv,d_q,d_k,d_v,T);
+    split_qkv_k<<<(int)((nq+255)/256),256,0,stream>>>(d_cv,d_q,d_k,d_v,T);
   }
-  beta_gl_k<<<(int)(((size_t)T*HV+255)/256),256>>>(d_b,d_ar,(float*)wA->d,(float*)wDT->d,d_be,d_gl,(int)((size_t)T*HV));
-  qk_norm_scale_k<<<(T*HV),128>>>(d_q,d_k,T);
-  gdn_step_cuda(d_q,d_k,d_v,d_be,d_gl,ds.S[li],d_o,HV,KHD,VHD);
-  gated_rms_k<<<(T*HV),128>>>(d_o,d_zl,(float*)wN->d,d_g,T);
-  f32_to_bf16_k<<<(int)(((size_t)VDD+255)/256),256>>>(d_gb,d_g,(int)((size_t)VDD));
-  gemv_batch(d_gb,(uint8_t*)wOut->d,d_core,VDD,HID,T);
-  add_k<<<(int)((nH+255)/256),256>>>(d_x,d_core,(int)nH);
+  beta_gl_k<<<(int)(((size_t)T*HV+255)/256),256,0,stream>>>(d_b,d_ar,(float*)wA->d,(float*)wDT->d,d_be,d_gl,(int)((size_t)T*HV));
+  qk_norm_scale_k<<<(T*HV),128,0,stream>>>(d_q,d_k,T);
+  gdn_step_cuda(d_q,d_k,d_v,d_be,d_gl,ds.S[li],d_o,HV,KHD,VHD,stream);
+  gated_rms_k<<<(T*HV),128,0,stream>>>(d_o,d_zl,(float*)wN->d,d_g,T);
+  f32_to_bf16_k<<<(int)(((size_t)VDD+255)/256),256,0,stream>>>(d_gb,d_g,(int)((size_t)VDD));
+  gemv_batch(d_gb,(uint8_t*)wOut->d,d_core,VDD,HID,T,stream);
+  add_k<<<(int)((nH+255)/256),256,0,stream>>>(d_x,d_core,(int)nH);
   if(getenv("HERMES_L26") && li==26){
     std::vector<float> hg((size_t)VDD), hc((size_t)HID), ho((size_t)HV*VHD), hx2((size_t)HID);
     cudaMemcpy(hg.data(),d_g,(size_t)VDD*4,cudaMemcpyDeviceToHost);
@@ -1036,20 +1116,27 @@ static bool run_gdn_decode_layer(int li, float* d_x, DecodeState& ds, std::strin
     cudaMemcpy(hx2.data(),d_x,(size_t)HID*4,cudaMemcpyDeviceToHost);
     FILE *ff=fopen("/tmp/l26_dec.bin","ab"); fwrite(hg.data(),4,hg.size(),ff); fwrite(hc.data(),4,hc.size(),ff); fwrite(ho.data(),4,ho.size(),ff); fwrite(hx2.data(),4,hx2.size(),ff); fclose(ff);
   }
-  rms_f32_k<<<T,512,(size_t)512*4>>>(d_h,d_x,(float*)wPost->d,T,HID);
-  f32_to_bf16_k<<<(int)((nH+255)/256),256>>>(d_h2b,d_h,(int)nH);
-  gemv_batch(d_h2b,(uint8_t*)wFg->d,d_gg,HID,FFN,T);
-  gemv_batch(d_h2b,(uint8_t*)wFu->d,d_uu,HID,FFN,T);
-  silu_mul_k<<<(int)(((size_t)FFN+255)/256),256>>>(d_gg,d_uu,d_hid,(int)((size_t)FFN));
-  f32_to_bf16_k<<<(int)(((size_t)FFN+255)/256),256>>>(d_hidb,d_hid,(int)((size_t)FFN));
-  gemv_batch(d_hidb,(uint8_t*)wFd->d,d_down,FFN,HID,T);
-  add_k<<<(int)((nH+255)/256),256>>>(d_x,d_down,(int)nH);
-  if(!decode_skip_layer_sync()) cudaDeviceSynchronize();
+  rms_f32_k<<<T,512,(size_t)512*4,stream>>>(d_h,d_x,(float*)wPost->d,T,HID);
+  f32_to_bf16_k<<<(int)((nH+255)/256),256,0,stream>>>(d_h2b,d_h,(int)nH);
+  gemv_batch(d_h2b,(uint8_t*)wFg->d,d_gg,HID,FFN,T,stream);
+  gemv_batch(d_h2b,(uint8_t*)wFu->d,d_uu,HID,FFN,T,stream);
+  silu_mul_k<<<(int)(((size_t)FFN+255)/256),256,0,stream>>>(d_gg,d_uu,d_hid,(int)((size_t)FFN));
+  f32_to_bf16_k<<<(int)(((size_t)FFN+255)/256),256,0,stream>>>(d_hidb,d_hid,(int)((size_t)FFN));
+  gemv_batch(d_hidb,(uint8_t*)wFd->d,d_down,FFN,HID,T,stream);
+  add_k<<<(int)((nH+255)/256),256,0,stream>>>(d_x,d_down,(int)nH);
+  if(stream==0 && !decode_skip_layer_sync()) cudaDeviceSynchronize();
+  if(stream!=0 && g_async_gemv_error!=cudaSuccess){
+    err="GDN decode GEMV "+P+": "+cudaGetErrorString(g_async_gemv_error);
+    return false;
+  }
+  cudaError_t launch_error=cudaPeekAtLastError();
+  if(launch_error!=cudaSuccess){ err="GDN decode launch "+P+": "+cudaGetErrorString(launch_error); return false; }
   // P6: nessun free (arena persistente ds.ws0/ws1).
   return true;
 }
 
-static bool run_full_decode_layer(int li, float* d_x, DecodeState& ds, long pos, std::string& err){
+static bool run_full_decode_layer(int li, float* d_x, DecodeState& ds, long pos, std::string& err,
+                                  cudaStream_t stream=0){
   char Pb[16]; snprintf(Pb,16,"blk.%d.",li); std::string P=Pb;
   WEntry *wNorm=find_w(P+"attn_norm.weight"),
          *wQ=find_w(P+"attn_q.weight"), *wK=find_w(P+"attn_k.weight"), *wV=find_w(P+"attn_v.weight"),
@@ -1087,30 +1174,43 @@ static bool run_full_decode_layer(int li, float* d_x, DecodeState& ds, long pos,
   uint16_t* d_h2b  = (uint16_t*)(ws+419840);// 10240
   uint16_t* d_hidb = (uint16_t*)(ws+430080);// 34816
   uint16_t* d_gb   = (uint16_t*)(ws+464896);// 12288 (fine 477184 < 568064)
-  rms_f32_k<<<T,512,(size_t)512*4>>>(d_h,d_x,(float*)wNorm->d,T,HID);
-  f32_to_bf16_k<<<(int)((nH+255)/256),256>>>(d_hb,d_h,(int)nH);
-  gemv_batch(d_hb,(uint8_t*)wQ->d,d_qq,HID,NQQ,T);
-  gemv_batch(d_hb,(uint8_t*)wK->d,d_kk,HID,NKK,T);
-  gemv_batch(d_hb,(uint8_t*)wV->d,d_vv,HID,NKK,T);
-  q_norm_rope_pos_k<<<NQ,256>>>(d_qq,(float*)wQn->d,d_Q,(int)pos);
-  k_norm_rope_pos_k<<<NKV,256>>>(d_kk,(float*)wKn->d,d_K1,(int)pos);
-  extract_G_k<<<(int)((NQHD+255)/256),256>>>(d_qq,d_G,NQHD);
-  cudaMemcpy(ds.Kc[li]+(size_t)L*1024,d_K1,(size_t)NKK*4,cudaMemcpyDeviceToDevice);
-  cudaMemcpy(ds.Vc[li]+(size_t)L*1024,d_vv,(size_t)NKK*4,cudaMemcpyDeviceToDevice);
-  sdpa_gqa_decode_k<<<NQ,256,(size_t)(L+1+256)*sizeof(float)>>>(d_Q,ds.Kc[li],ds.Vc[li],d_att,L);
-  gate_k<<<(int)(((size_t)NQHD+255)/256),256>>>(d_att,d_G,d_G,(int)((size_t)NQHD));
-  f32_to_bf16_k<<<(int)(((size_t)NQHD+255)/256),256>>>(d_gb,d_G,(int)((size_t)NQHD));
-  gemv_batch(d_gb,(uint8_t*)wO->d,d_core,NQHD,HID,T);
-  add_k<<<(int)((nH+255)/256),256>>>(d_x,d_core,(int)nH);
-  rms_f32_k<<<T,512,(size_t)512*4>>>(d_h,d_x,(float*)wPost->d,T,HID);
-  f32_to_bf16_k<<<(int)((nH+255)/256),256>>>(d_h2b,d_h,(int)nH);
-  gemv_batch(d_h2b,(uint8_t*)wFg->d,d_gg,HID,FFN,T);
-  gemv_batch(d_h2b,(uint8_t*)wFu->d,d_uu,HID,FFN,T);
-  silu_mul_k<<<(int)(((size_t)FFN+255)/256),256>>>(d_gg,d_uu,d_hid,(int)((size_t)FFN));
-  f32_to_bf16_k<<<(int)(((size_t)FFN+255)/256),256>>>(d_hidb,d_hid,(int)((size_t)FFN));
-  gemv_batch(d_hidb,(uint8_t*)wFd->d,d_down,FFN,HID,T);
-  add_k<<<(int)((nH+255)/256),256>>>(d_x,d_down,(int)nH);
-  if(!decode_skip_layer_sync()) cudaDeviceSynchronize();
+  rms_f32_k<<<T,512,(size_t)512*4,stream>>>(d_h,d_x,(float*)wNorm->d,T,HID);
+  f32_to_bf16_k<<<(int)((nH+255)/256),256,0,stream>>>(d_hb,d_h,(int)nH);
+  gemv_batch(d_hb,(uint8_t*)wQ->d,d_qq,HID,NQQ,T,stream);
+  gemv_batch(d_hb,(uint8_t*)wK->d,d_kk,HID,NKK,T,stream);
+  gemv_batch(d_hb,(uint8_t*)wV->d,d_vv,HID,NKK,T,stream);
+  q_norm_rope_pos_k<<<NQ,256,0,stream>>>(d_qq,(float*)wQn->d,d_Q,(int)pos);
+  k_norm_rope_pos_k<<<NKV,256,0,stream>>>(d_kk,(float*)wKn->d,d_K1,(int)pos);
+  extract_G_k<<<(int)((NQHD+255)/256),256,0,stream>>>(d_qq,d_G,NQHD);
+  // Keep the historical memcpy calls for legacy stream 0, but enqueue both
+  // KV updates into the request stream when running the async pipeline.
+  cudaError_t copy_error=(stream==0)
+    ? cudaMemcpy(ds.Kc[li]+(size_t)L*1024,d_K1,(size_t)NKK*4,cudaMemcpyDeviceToDevice)
+    : cudaMemcpyAsync(ds.Kc[li]+(size_t)L*1024,d_K1,(size_t)NKK*4,cudaMemcpyDeviceToDevice,stream);
+  if(copy_error==cudaSuccess) copy_error=(stream==0)
+    ? cudaMemcpy(ds.Vc[li]+(size_t)L*1024,d_vv,(size_t)NKK*4,cudaMemcpyDeviceToDevice)
+    : cudaMemcpyAsync(ds.Vc[li]+(size_t)L*1024,d_vv,(size_t)NKK*4,cudaMemcpyDeviceToDevice,stream);
+  if(copy_error!=cudaSuccess){ err="full decode KV copy "+P+": "+cudaGetErrorString(copy_error); return false; }
+  sdpa_gqa_decode_k<<<NQ,256,(size_t)(L+1+256)*sizeof(float),stream>>>(d_Q,ds.Kc[li],ds.Vc[li],d_att,L);
+  gate_k<<<(int)(((size_t)NQHD+255)/256),256,0,stream>>>(d_att,d_G,d_G,(int)((size_t)NQHD));
+  f32_to_bf16_k<<<(int)(((size_t)NQHD+255)/256),256,0,stream>>>(d_gb,d_G,(int)((size_t)NQHD));
+  gemv_batch(d_gb,(uint8_t*)wO->d,d_core,NQHD,HID,T,stream);
+  add_k<<<(int)((nH+255)/256),256,0,stream>>>(d_x,d_core,(int)nH);
+  rms_f32_k<<<T,512,(size_t)512*4,stream>>>(d_h,d_x,(float*)wPost->d,T,HID);
+  f32_to_bf16_k<<<(int)((nH+255)/256),256,0,stream>>>(d_h2b,d_h,(int)nH);
+  gemv_batch(d_h2b,(uint8_t*)wFg->d,d_gg,HID,FFN,T,stream);
+  gemv_batch(d_h2b,(uint8_t*)wFu->d,d_uu,HID,FFN,T,stream);
+  silu_mul_k<<<(int)(((size_t)FFN+255)/256),256,0,stream>>>(d_gg,d_uu,d_hid,(int)((size_t)FFN));
+  f32_to_bf16_k<<<(int)(((size_t)FFN+255)/256),256,0,stream>>>(d_hidb,d_hid,(int)((size_t)FFN));
+  gemv_batch(d_hidb,(uint8_t*)wFd->d,d_down,FFN,HID,T,stream);
+  add_k<<<(int)((nH+255)/256),256,0,stream>>>(d_x,d_down,(int)nH);
+  if(stream==0 && !decode_skip_layer_sync()) cudaDeviceSynchronize();
+  if(stream!=0 && g_async_gemv_error!=cudaSuccess){
+    err="full decode GEMV "+P+": "+cudaGetErrorString(g_async_gemv_error);
+    return false;
+  }
+  cudaError_t launch_error=cudaPeekAtLastError();
+  if(launch_error!=cudaSuccess){ err="full decode launch "+P+": "+cudaGetErrorString(launch_error); return false; }
   ds.klen[li]=L+1;
   // P6: nessun free (arena persistente ds.ws0/ws1).
   return true;
@@ -1129,6 +1229,7 @@ bool decode_init(DecodeState& ds, std::string& err, int capacity){
   for(int i=0;i<64;++i){ ds.S[i]=nullptr; ds.CS[i]=nullptr; ds.Kc[i]=nullptr; ds.Vc[i]=nullptr; ds.klen[i]=0; }
   ds.ws0=nullptr; ds.ws1=nullptr; ds.idsbuf=nullptr; ds.x0buf=nullptr;
   ds.x1buf=nullptr; ds.xnbuf=nullptr; ds.logbuf=nullptr; ds.ws_bytes=0;
+  ds.async_ctx=nullptr;
 
   const size_t kv_bytes=(size_t)capacity*1024*sizeof(float);
   size_t required[2]={0,0};
@@ -1196,6 +1297,13 @@ bool decode_init(DecodeState& ds, std::string& err, int capacity){
     if(used>limit){ err="VRAM>15GB after decode_init GPU"+std::to_string(dev)+" used="+std::to_string(used); return fail(); }
     used_after[dev]=used;
   }
+  if(async_requested()){
+    if(std::getenv("HERMES_L26")){
+      err="HERMES_PP2_ASYNC_STREAMS cannot be combined with HERMES_L26 debug";
+      return fail();
+    }
+    if(!async_prepare(ds,err)) return fail();
+  }
   printf("pp2 decode_init capacity=%d used0=%zu MiB used1=%zu MiB (limit 15360 MiB)\n",
     capacity,used_after[0]/1048576,used_after[1]/1048576); fflush(stdout);
   return true;
@@ -1203,6 +1311,9 @@ bool decode_init(DecodeState& ds, std::string& err, int capacity){
 
 void decode_free(DecodeState& ds){
   if(!ds.inited) return;
+  // Cancel/drain both per-request streams before releasing recurrent state,
+  // KV caches and buffers referenced by queued operations.
+  async_release(ds);
   for(int li=0;li<NL;++li){
     int dev=(li<=SPLIT_LAST0)?0:1;
     cudaSetDevice(dev);
@@ -1223,8 +1334,93 @@ void decode_free(DecodeState& ds){
   if(ds.xnbuf){ cudaFree(ds.xnbuf); ds.xnbuf=nullptr; }
   if(ds.logbuf){ cudaFree(ds.logbuf); ds.logbuf=nullptr; }
   ds.ws_bytes=0;
+  ds.async_ctx=nullptr;
   ds.capacity=DecodeState::MAXL;
   ds.inited=false;
+}
+
+static std::vector<float> decode_step_async(int tok, DecodeState& ds, long pos,
+                                             std::string& err){
+  auto* ctx=static_cast<AsyncDecodeContext*>(ds.async_ctx);
+  if(!ctx){ err="missing async context"; return {}; }
+  std::unique_lock<std::mutex> guard(ctx->step_mutex,std::try_to_lock);
+  if(!guard.owns_lock()){
+    err="async decode request already has a token in flight";
+    return {};
+  }
+  if(ctx->poisoned){ err="async decode state poisoned: reinitialize request"; return {}; }
+  g_async_gemv_error=cudaSuccess;
+  auto fail=[&]()->std::vector<float>{ ctx->poisoned=true; return {}; };
+  if(tok<0||tok>=VOC){ err="async decode token OOB"; return fail(); }
+  if(std::getenv("HERMES_L26")){
+    err="HERMES_L26 debug unsupported on async decode state";
+    return fail();
+  }
+
+  auto itemb=g_w0.find("token_embd.weight");
+  auto itnorm=g_w1.find("output_norm.weight");
+  auto ithead=g_w1.find("output.weight");
+  if(itemb==g_w0.end()||itnorm==g_w1.end()||ithead==g_w1.end()){
+    err="missing embedding or output head for async decode";
+    return fail();
+  }
+  // First stage: all GPU0 launches and D2H are ordered in this request's
+  // stream; no default-stream or cross-request device synchronization.
+  *ctx->host_token=tok;
+  if(!cuda_async_check(cudaSetDevice(0),"select GPU0",err) ||
+     !cuda_async_check(cudaMemcpyAsync(ds.idsbuf,ctx->host_token,sizeof(int),
+                          cudaMemcpyHostToDevice,ctx->stream0),"token H2D",err)) return fail();
+  embed_gather_k<<<(int)((HID+255)/256),256,0,ctx->stream0>>>(
+      ds.x0buf,(uint16_t*)itemb->second.d,ds.idsbuf,1);
+  if(!cuda_async_check(cudaPeekAtLastError(),"embedding launch",err)) return fail();
+  for(int li=0;li<=SPLIT_LAST0;++li){
+    bool is_full=(li%4==3);
+    bool ok=is_full
+      ? run_full_decode_layer(li,ds.x0buf,ds,pos,err,ctx->stream0)
+      : run_gdn_decode_layer(li,ds.x0buf,ds,err,ctx->stream0);
+    if(!ok) return fail();
+  }
+  if(!cuda_async_check(cudaMemcpyAsync(ctx->host_hidden,ds.x0buf,WS_X_BYTES,
+                           cudaMemcpyDeviceToHost,ctx->stream0),"GPU0 hidden D2H",err) ||
+     !cuda_async_check(cudaEventRecord(ctx->ready0,ctx->stream0),"record GPU0 event",err) ||
+     !cuda_async_check(cudaEventSynchronize(ctx->ready0),"GPU0 hidden completion",err))
+    return fail();
+
+  // Host event wait is the cross-device handoff: the request-specific pinned
+  // hidden buffer is complete before GPU1 reads it. Concurrent requests may
+  // enqueue GPU0 kernels while GPU1 works on an earlier request.
+  if(!cuda_async_check(cudaSetDevice(1),"select GPU1",err) ||
+     !cuda_async_check(cudaMemcpyAsync(ds.x1buf,ctx->host_hidden,WS_X_BYTES,
+                          cudaMemcpyHostToDevice,ctx->stream1),"GPU1 hidden H2D",err)) return fail();
+  for(int li=SPLIT_LAST0+1;li<NL;++li){
+    bool is_full=(li%4==3);
+    bool ok=is_full
+      ? run_full_decode_layer(li,ds.x1buf,ds,pos,err,ctx->stream1)
+      : run_gdn_decode_layer(li,ds.x1buf,ds,err,ctx->stream1);
+    if(!ok) return fail();
+  }
+  rms_f32_k<<<1,512,(size_t)512*4,ctx->stream1>>>(
+      ds.xnbuf,ds.x1buf,(float*)itnorm->second.d,1,HID);
+  if(use_head_bf16_warp()){
+    cudaError_t launch_err=hermes::head_bf16_warp_cuda(
+      ds.logbuf,ds.xnbuf,(uint16_t*)ithead->second.d,1,HID,VOC,ctx->stream1);
+    if(!cuda_async_check(launch_err,"BF16 head launch",err)) return fail();
+  } else {
+    head_bf16_k<<<(int)(((size_t)VOC+255)/256),256,0,ctx->stream1>>>(
+        ds.logbuf,ds.xnbuf,(uint16_t*)ithead->second.d,1);
+  }
+  if(!cuda_async_check(cudaPeekAtLastError(),"output head launch",err) ||
+     !cuda_async_check(cudaMemcpyAsync(ctx->host_logits,ds.logbuf,WS_LOG_BYTES,
+                        cudaMemcpyDeviceToHost,ctx->stream1),"logits D2H",err) ||
+     !cuda_async_check(cudaEventRecord(ctx->ready1,ctx->stream1),"record GPU1 event",err) ||
+     !cuda_async_check(cudaEventSynchronize(ctx->ready1),"GPU1 logits completion",err))
+    return fail();
+  std::vector<float> logits((size_t)VOC);
+  std::memcpy(logits.data(),ctx->host_logits,WS_LOG_BYTES);
+  for(float v:logits){
+    if(!std::isfinite(v)){ err="async decode produced non-finite logits"; return fail(); }
+  }
+  return logits;
 }
 
 std::vector<float> decode_step(int tok, DecodeState& ds, long pos, std::string& err){
@@ -1237,6 +1433,7 @@ std::vector<float> decode_step(int tok, DecodeState& ds, long pos, std::string& 
   if(!ds.ws0||!ds.ws1||!ds.idsbuf||!ds.x0buf||!ds.x1buf||!ds.xnbuf||!ds.logbuf){
     err="decode ws not inited"; return {};
   }
+  if(ds.async_ctx) return decode_step_async(tok,ds,pos,err);
   cudaSetDevice(0);
   int* d_ids = ds.idsbuf;
   float* d_x0 = ds.x0buf;

@@ -42,8 +42,9 @@ __global__ void gdn_step_k(const float* q, const float* k, const float* v,
 }
 void gdn_step_cuda(const float* q, const float* k, const float* v,
                    const float* beta, const float* gl,
-                   float* S, float* o, int H, int K, int V){
+                   float* S, float* o, int H, int K, int V,
+                   cudaStream_t stream){
   size_t shm=(size_t)(K+K)*sizeof(float);
-  gdn_step_k<<<H,128,shm>>>(q,k,v,beta,gl,S,o,H,K,V);
+  gdn_step_k<<<H,128,shm,stream>>>(q,k,v,beta,gl,S,o,H,K,V);
 }
 }

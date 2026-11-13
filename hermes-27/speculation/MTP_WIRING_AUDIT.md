@@ -1,6 +1,8 @@
 # MTP wiring audit — nostro vs llama.cpp `graph_mtp` (qwen35.cpp)
 
 Scope: solo wiring del draft NextN blk.64. Nessun build/run in questo documento.
+
+> Aggiornamento 2026-11-13: consultare **`speculation/MTP_VERIFIED_PATH.md`** per l'esecuzione GPU reale successiva a questo audit: due prompt, sequenze greedy target-only identiche per 5 nuovi token, 3/4 e 2/4 proposte K=1 accettate, rewind MTP verificato. Le righe V3–V6 qui sotto descrivono il piano storico; non rappresentano piu` lo stato dei test K=1. La generazione K>1 accelerata resta bloccata dall'assenza di una API di commit/rollback stateful PP2.
 Sorgenti: `architecture/src/model_fwd.cpp` (`ModelFwd::mtp_hidden`, `ModelFwd::mtp_draft`, `MtpState`),
 `architecture/include/hermes/model_fwd.hpp`, `speculation/MTP_DESIGN.md`, tensori GGUF reali blk.64.
 Reference: `llama.cpp` `qwen35.cpp::graph_mtp`.

@@ -11,6 +11,7 @@
 - `shared_head_norm` (RMSNorm) + `output.weight` condiviso (lm head) → draft logits.
 
 ## Protocollo proposal/verification (greedy)
+- **Stato implementazione 2026-11-13**: questo protocollo K>1 e` un design futuro, non una funzione gia` disponibile. La CLI verificata con checkpoint reale implementa K=1 iterative con `decode_step` target ad ogni token e nessun throughput gain (vedi `MTP_VERIFIED_PATH.md`). La verifica batch K>1 richiede un'API PP2 capace di costruire e committare/troncare gli stati GDN/conv/KV del prefisso accettato; il solo `prefill(P+draft)` non basta.
 - Draft: K step autoregressivi del blocco MTP (ognuno usa h corrente + tok precedente).
 - Verify: un forward target sui K token draft (single prefill chunk) → logit per posizione.
 - Accept (greedy): finché draft_tok[i] == argmax(target_logits[i]); al primo mismatch

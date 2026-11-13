@@ -68,6 +68,10 @@ struct DecodeState {
   float* xnbuf = nullptr; // [HID=5120] GPU1 (head norm)
   float* logbuf = nullptr;// [VOC=248320] GPU1 (head logits)
   size_t ws_bytes = 0;    // == 568064 quando inited
+  // Strict opt-in HERMES_PP2_ASYNC_STREAMS=1: opaque per-request CUDA streams,
+  // completion events and distinct pinned staging. Owned by decode_init/free.
+  // nullptr means the original synchronous decode_step remains active.
+  void* async_ctx = nullptr;
 };
 
 // Alloca/stati zero su GPU proprietaria (richiede upload già fatto). Ritorna false su errore/OOM.
