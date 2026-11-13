@@ -373,7 +373,7 @@ static int run_stage3(hermes::GgufWeightBackend& be){
   std::vector<float> beta((size_t)T*HV), gl((size_t)T*HV);
   for(int t=0;t<T;++t) for(int hh=0;hh<HV;++hh){
     beta[(size_t)t*HV+hh]=sigmoid_f(b[(size_t)t*HV+hh]);
-    gl[(size_t)t*HV+hh]=-expf(A[hh])*softplus_f(ar[(size_t)t*HV+hh]+DT[hh]);
+    gl[(size_t)t*HV+hh]=A[hh]*softplus_f(ar[(size_t)t*HV+hh]+DT[hh]);
   }
   double mxb=0,mbg=0; double dotb=0,nab=0,nbb=0,dotg=0,nag=0,nbg=0; size_t ib=0,ig=0;
   for(size_t i=0;i<beta.size();++i){ float e=fabsf(beta[i]-beta_ref[i]); if(e>mxb){mxb=e;ib=i;}
@@ -385,7 +385,7 @@ static int run_stage3(hermes::GgufWeightBackend& be){
   // --- q/k/v from golden cv, l2norm CPU ---
   std::vector<float> q((size_t)T*HV*KHD), k((size_t)T*HV*KHD), v((size_t)T*HV*VHD);
   for(int t=0;t<T;++t){ float* c0=&cv_ref[(size_t)t*C];
-    for(int hh=0;hh<HV;++hh){ int g=hh/3;
+    for(int hh=0;hh<HV;++hh){ int g=hh%(KD/KHD);
       for(int d=0;d<KHD;++d){ q[((size_t)t*HV+hh)*KHD+d]=c0[g*KHD+d]; k[((size_t)t*HV+hh)*KHD+d]=c0[KD+g*KHD+d]; }
       for(int d=0;d<VHD;++d) v[((size_t)t*HV+hh)*VHD+d]=c0[2*KD+hh*VHD+d]; } }
   std::vector<float> qn(q.size()), kn(k.size());

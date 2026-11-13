@@ -112,7 +112,8 @@ __global__ void beta_gl_k(const float* b, const float* ar, const float* A, const
   beta[i]=1.f/(1.f+expf(-bv));
   float x=ar[i]+DT[hh];
   float sp=x>20.f?x:logf(1.f+expf(x));
-  gl[i]=-expf(A[hh])*sp;
+  // GGUF ssm_a stores -exp(A_log), already transformed by the converter.
+  gl[i]=A[hh]*sp;
 }
 __global__ void split_qkv_k(const float* cv, float* q, float* k, float* v, int T){
   int idx=(int)(blockIdx.x*blockDim.x+threadIdx.x);
@@ -120,7 +121,8 @@ __global__ void split_qkv_k(const float* cv, float* q, float* k, float* v, int T
   if(idx>=N) return;
   int t=idx/(HV*KHD), rem=idx%(HV*KHD);
   int hh=rem/KHD, d=rem%KHD;
-  int g=hh/3;
+  // GGUF tiles V heads by K group so the Q/K heads repeat modulo the group count.
+  int g=hh%(KD/KHD);
   q[idx]=cv[(size_t)t*CC+g*KHD+d];
   k[idx]=cv[(size_t)t*CC+KD+g*KHD+d];
   // v stesso idx (HV*VHD == HV*KHD)
@@ -415,9 +417,17 @@ static bool run_full_layer(int li, float* d_x, int T, std::string& err){
 
 // ---------- API ----------
 bool upload(Stats& st, std::string& err){
-  if(g_up){ st=g_last_stats; return true; }
+  return upload(st,err,CKPT);
+}
+
+bool upload(Stats& st, std::string& err, const std::string& model_path){
+  if(model_path.empty()){ err="empty model path"; return false; }
+  if(g_up){
+    if(g_be.file().path!=model_path){ err="PP2 already uploaded a different model"; return false; }
+    st=g_last_stats; return true;
+  }
   auto t0=std::chrono::high_resolution_clock::now();
-  try{ g_be.open(CKPT); }catch(std::exception& e){ err=std::string("GGUF OPEN FAIL: ")+e.what(); return false; }
+  try{ g_be.open(model_path); }catch(std::exception& e){ err=std::string("GGUF OPEN FAIL: ")+e.what(); return false; }
   const auto& gf=g_be.file();
   size_t f0=0,tt0=0,f1=0,tt1=0;
   cudaSetDevice(0); cudaMemGetInfo(&f0,&tt0);
@@ -499,7 +509,16 @@ bool upload(Stats& st, std::string& err){
   return true;
 }
 
-std::vector<float> prefill(const std::vector<int>& ids, Stats& st, std::string& err){
+int eos_token_id(){
+  if(!g_up) return -1;
+  const auto& kv=g_be.file().kv_u64;
+  auto it=kv.find("tokenizer.ggml.eos_token_id");
+  if(it==kv.end()||it->second>=(uint64_t)VOC) return -1;
+  return (int)it->second;
+}
+
+std::vector<float> prefill(const std::vector<int>& ids, Stats& st, std::string& err,
+                           std::vector<float>* h_last_out){
   if(!g_up){ err="not uploaded"; return {}; }
   int T=(int)ids.size();
   if(T<=0||T>(int)PIN_TMAX){ err="bad T"; return {}; }
@@ -551,6 +570,11 @@ std::vector<float> prefill(const std::vector<int>& ids, Stats& st, std::string& 
   }
   // output norm + head
   {
+    // MTP accessor minimale: ultimo hidden pre-output_norm (ultimo token).
+    if(h_last_out){
+      h_last_out->resize(HID);
+      cudaMemcpy(h_last_out->data(),d_x1+(size_t)(T-1)*HID,HID*4,cudaMemcpyDeviceToHost);
+    }
     auto itn=g_w1.find("output_norm.weight");
     auto itw=g_w1.find("output.weight");
     if(itn==g_w1.end()||itw==g_w1.end()){ err="no head"; cudaFree(d_x1); return {}; }
@@ -575,6 +599,20 @@ void free_all(){
   g_w0.clear(); g_w1.clear();
   if(g_pinned){ cudaFreeHost(g_pinned); g_pinned=nullptr; }
   g_up=false;
+}
+
+// Accessor minimale MTP (nessuna copy, nessun transfer di ownership).
+bool get_weight_ptr(const std::string& name, void*& dptr, int* ne0,
+                    int* ne1, int* gtype, int* dev){
+  if(!g_up) return false;
+  WEntry* w=find_w(name);
+  if(!w) return false;
+  dptr=w->d;
+  if(ne0) *ne0=w->ne0;
+  if(ne1) *ne1=w->ne1;
+  if(gtype) *gtype=w->gtype;
+  if(dev) *dev=w->dev;
+  return true;
 }
 
 void top5(const float* logits_TxV, int T, int V, int* out_id, float* out_val){
@@ -683,7 +721,7 @@ int check_blk0_gpu0(){
     // q/k/v da cv golden, l2norm CPU, poi gdn_step_cuda con S su GPU0
     std::vector<float> q((size_t)T*HV*KHD), k((size_t)T*HV*KHD), v((size_t)T*HV*VHD);
     for(int t=0;t<T;++t){ float* c0=&cv_ref[(size_t)t*CC];
-      for(int hh=0;hh<HV;++hh){ int g=hh/3;
+      for(int hh=0;hh<HV;++hh){ int g=hh%(KD/KHD);
         for(int d=0;d<KHD;++d){ q[((size_t)t*HV+hh)*KHD+d]=c0[g*KHD+d]; k[((size_t)t*HV+hh)*KHD+d]=c0[KD+g*KHD+d]; }
         for(int d=0;d<VHD;++d) v[((size_t)t*HV+hh)*VHD+d]=c0[2*KD+hh*VHD+d]; } }
     // norm CPU
@@ -849,7 +887,9 @@ __global__ void extract_G_k(const float* qq, float* G, int N){
 }
 __global__ void sdpa_gqa_decode_k(const float* Q, const float* Kc, const float* Vc, float* ATT, int L){
   int b=(int)blockIdx.x; int hq=b; int g=hq/6; int tid=(int)threadIdx.x;
-  __shared__ float scores[128]; __shared__ float tmp[256];
+  extern __shared__ float smem[];
+  float* scores=smem;
+  float* tmp=scores+L+1;
   float qv=Q[(size_t)hq*256+tid];
   for(int t2=0;t2<=L;++t2){
     float kv=Kc[(size_t)t2*1024+g*256+tid];
@@ -956,7 +996,8 @@ static bool run_full_decode_layer(int li, float* d_x, DecodeState& ds, long pos,
   if(!wNorm||!wQ||!wK||!wV||!wQn||!wKn||!wO||!wPost||!wFg||!wFu||!wFd){ err="missing w full dec "+P; return false; }
   if(!ds.Kc[li]||!ds.Vc[li]){ err="decode state null full "+P; return false; }
   int L=ds.klen[li];
-  if(L<0||L>=DecodeState::MAXL){ err="klen OOB "+P; return false; }
+  if(ds.capacity<1||ds.capacity>DecodeState::MAX_CONTEXT){ err="decode capacity OOB "+P; return false; }
+  if(L<0||L>=ds.capacity){ err="klen OOB "+P; return false; }
   if((long)L!=pos){ err="klen/pos mismatch "+P+" klen="+std::to_string(L)+" pos="+std::to_string(pos); return false; }
   const int T=1; size_t nH=(size_t)T*HID;
   const int NQQ=12288, NKK=1024, NQHD=6144;
@@ -992,7 +1033,7 @@ static bool run_full_decode_layer(int li, float* d_x, DecodeState& ds, long pos,
   extract_G_k<<<(int)((NQHD+255)/256),256>>>(d_qq,d_G,NQHD);
   cudaMemcpy(ds.Kc[li]+(size_t)L*1024,d_K1,(size_t)NKK*4,cudaMemcpyDeviceToDevice);
   cudaMemcpy(ds.Vc[li]+(size_t)L*1024,d_vv,(size_t)NKK*4,cudaMemcpyDeviceToDevice);
-  sdpa_gqa_decode_k<<<(NQ),256>>>(d_Q,ds.Kc[li],ds.Vc[li],d_att,L);
+  sdpa_gqa_decode_k<<<NQ,256,(size_t)(L+1+256)*sizeof(float)>>>(d_Q,ds.Kc[li],ds.Vc[li],d_att,L);
   gate_k<<<(int)(((size_t)NQHD+255)/256),256>>>(d_att,d_G,d_G,(int)((size_t)NQHD));
   f32_to_bf16_k<<<(int)(((size_t)NQHD+255)/256),256>>>(d_gb,d_G,(int)((size_t)NQHD));
   gemv_batch(d_gb,(uint8_t*)wO->d,d_core,NQHD,HID,T);
@@ -1012,60 +1053,87 @@ static bool run_full_decode_layer(int li, float* d_x, DecodeState& ds, long pos,
 }
 
 bool decode_init(DecodeState& ds, std::string& err){
+  return decode_init(ds,err,DecodeState::MAXL);
+}
+
+bool decode_init(DecodeState& ds, std::string& err, int capacity){
+  if(ds.inited){ err="decode state already inited"; return false; }
+  if(capacity<1||capacity>DecodeState::MAX_CONTEXT){
+    err="decode capacity must be 1.."+std::to_string(DecodeState::MAX_CONTEXT); return false;
+  }
   if(!g_up){ err="not uploaded"; return false; }
   for(int i=0;i<64;++i){ ds.S[i]=nullptr; ds.CS[i]=nullptr; ds.Kc[i]=nullptr; ds.Vc[i]=nullptr; ds.klen[i]=0; }
   ds.ws0=nullptr; ds.ws1=nullptr; ds.idsbuf=nullptr; ds.x0buf=nullptr;
   ds.x1buf=nullptr; ds.xnbuf=nullptr; ds.logbuf=nullptr; ds.ws_bytes=0;
+
+  const size_t kv_bytes=(size_t)capacity*1024*sizeof(float);
+  size_t required[2]={0,0};
   for(int li=0;li<NL;++li){
-    int dev=(li<=SPLIT_LAST0)?0:1;
-    cudaSetDevice(dev);
-    bool is_full=(li%4==3);
-    if(is_full){
-      size_t bytes=(size_t)DecodeState::MAXL*1024*4;
-      float *k=nullptr,*v=nullptr;
-      if(cudaMalloc(&k,bytes)!=cudaSuccess){ err="OOM Kc li="+std::to_string(li); return false; }
-      if(cudaMalloc(&v,bytes)!=cudaSuccess){ err="OOM Vc li="+std::to_string(li); return false; }
-      cudaMemset(k,0,bytes); cudaMemset(v,0,bytes);
-      ds.Kc[li]=k; ds.Vc[li]=v; ds.klen[li]=0;
+    const int dev=(li<=SPLIT_LAST0)?0:1;
+    if(li%4==3) required[dev]+=2*kv_bytes;
+    else required[dev]+=(size_t)HV*KHD*VHD*sizeof(float)+(size_t)CC*3*sizeof(float);
+  }
+  required[0]+=WS_BYTES+sizeof(int)+WS_X_BYTES;
+  required[1]+=WS_BYTES+2*WS_X_BYTES+WS_LOG_BYTES;
+  const size_t limit=15ULL*1024*1024*1024;
+  for(int dev=0;dev<2;++dev){
+    size_t free_bytes=0,total_bytes=0;
+    cudaError_t e=cudaSetDevice(dev);
+    if(e==cudaSuccess) e=cudaMemGetInfo(&free_bytes,&total_bytes);
+    if(e!=cudaSuccess){ err="decode VRAM preflight GPU"+std::to_string(dev)+": "+cudaGetErrorString(e); return false; }
+    const size_t used=total_bytes-free_bytes;
+    if(used>limit||required[dev]>limit-used||required[dev]>free_bytes){
+      err="decode VRAM preflight GPU"+std::to_string(dev)+" required="+std::to_string(required[dev])+" free="+std::to_string(free_bytes)+" used="+std::to_string(used)+" limit="+std::to_string(limit);
+      return false;
+    }
+  }
+
+  ds.capacity=capacity;
+  ds.inited=true;
+  auto fail=[&](){ decode_free(ds); return false; };
+  for(int li=0;li<NL;++li){
+    const int dev=(li<=SPLIT_LAST0)?0:1;
+    if(cudaSetDevice(dev)!=cudaSuccess){ err="cudaSetDevice li="+std::to_string(li); return fail(); }
+    if(li%4==3){
+      if(cudaMalloc(&ds.Kc[li],kv_bytes)!=cudaSuccess){ err="OOM Kc li="+std::to_string(li); return fail(); }
+      if(cudaMalloc(&ds.Vc[li],kv_bytes)!=cudaSuccess){ err="OOM Vc li="+std::to_string(li); return fail(); }
+      if(cudaMemset(ds.Kc[li],0,kv_bytes)!=cudaSuccess||cudaMemset(ds.Vc[li],0,kv_bytes)!=cudaSuccess){ err="zero KV li="+std::to_string(li); return fail(); }
     } else {
-      size_t sbytes=(size_t)HV*KHD*VHD*4;
-      size_t cbytes=(size_t)CC*3*4;
-      float *s=nullptr,*c=nullptr;
-      if(cudaMalloc(&s,sbytes)!=cudaSuccess){ err="OOM S li="+std::to_string(li); return false; }
-      if(cudaMalloc(&c,cbytes)!=cudaSuccess){ err="OOM CS li="+std::to_string(li); return false; }
-      cudaMemset(s,0,sbytes); cudaMemset(c,0,cbytes);
-      ds.S[li]=s; ds.CS[li]=c;
+      const size_t sbytes=(size_t)HV*KHD*VHD*sizeof(float);
+      const size_t cbytes=(size_t)CC*3*sizeof(float);
+      if(cudaMalloc(&ds.S[li],sbytes)!=cudaSuccess){ err="OOM S li="+std::to_string(li); return fail(); }
+      if(cudaMalloc(&ds.CS[li],cbytes)!=cudaSuccess){ err="OOM CS li="+std::to_string(li); return fail(); }
+      if(cudaMemset(ds.S[li],0,sbytes)!=cudaSuccess||cudaMemset(ds.CS[li],0,cbytes)!=cudaSuccess){ err="zero GDN state li="+std::to_string(li); return fail(); }
     }
   }
   // P6: arene persistenti + buffer step (1x alloc, mai per-layer/per-step).
-  {
-    void *w0=nullptr,*w1=nullptr;
-    int* ids=nullptr; float *x0=nullptr,*x1=nullptr,*xn=nullptr,*lg=nullptr;
-    cudaSetDevice(0);
-    if(cudaMalloc(&w0,WS_BYTES)!=cudaSuccess){ err="OOM ws0"; return false; }
-    if(cudaMalloc(&ids,4)!=cudaSuccess){ err="OOM idsbuf"; cudaFree(w0); return false; }
-    if(cudaMalloc(&x0,WS_X_BYTES)!=cudaSuccess){ err="OOM x0buf"; cudaFree(w0); cudaFree(ids); return false; }
-    cudaMemset(w0,0,WS_BYTES);
-    cudaSetDevice(1);
-    if(cudaMalloc(&w1,WS_BYTES)!=cudaSuccess){ err="OOM ws1"; cudaSetDevice(0); cudaFree(w0); cudaFree(ids); cudaFree(x0); return false; }
-    if(cudaMalloc(&x1,WS_X_BYTES)!=cudaSuccess){ err="OOM x1buf"; return false; }
-    if(cudaMalloc(&xn,WS_X_BYTES)!=cudaSuccess){ err="OOM xnbuf"; return false; }
-    if(cudaMalloc(&lg,WS_LOG_BYTES)!=cudaSuccess){ err="OOM logbuf"; return false; }
-    cudaMemset(w1,0,WS_BYTES);
-    ds.ws0=w0; ds.ws1=w1; ds.idsbuf=ids; ds.x0buf=x0;
-    ds.x1buf=x1; ds.xnbuf=xn; ds.logbuf=lg; ds.ws_bytes=WS_BYTES;
+  cudaError_t e=cudaSetDevice(0);
+  if(e==cudaSuccess) e=cudaMalloc(&ds.ws0,WS_BYTES);
+  if(e==cudaSuccess) e=cudaMalloc(&ds.idsbuf,sizeof(int));
+  if(e==cudaSuccess) e=cudaMalloc(&ds.x0buf,WS_X_BYTES);
+  if(e==cudaSuccess) e=cudaMemset(ds.ws0,0,WS_BYTES);
+  if(e!=cudaSuccess){ err="decode GPU0 workspace: "+std::string(cudaGetErrorString(e)); return fail(); }
+  e=cudaSetDevice(1);
+  if(e==cudaSuccess) e=cudaMalloc(&ds.ws1,WS_BYTES);
+  if(e==cudaSuccess) e=cudaMalloc(&ds.x1buf,WS_X_BYTES);
+  if(e==cudaSuccess) e=cudaMalloc(&ds.xnbuf,WS_X_BYTES);
+  if(e==cudaSuccess) e=cudaMalloc(&ds.logbuf,WS_LOG_BYTES);
+  if(e==cudaSuccess) e=cudaMemset(ds.ws1,0,WS_BYTES);
+  if(e!=cudaSuccess){ err="decode GPU1 workspace: "+std::string(cudaGetErrorString(e)); return fail(); }
+  ds.ws_bytes=WS_BYTES;
+
+  size_t used_after[2]={0,0};
+  for(int dev=0;dev<2;++dev){
+    size_t free_bytes=0,total_bytes=0;
+    e=cudaSetDevice(dev);
+    if(e==cudaSuccess) e=cudaMemGetInfo(&free_bytes,&total_bytes);
+    if(e!=cudaSuccess){ err="decode VRAM check GPU"+std::to_string(dev)+": "+cudaGetErrorString(e); return fail(); }
+    const size_t used=total_bytes-free_bytes;
+    if(used>limit){ err="VRAM>15GB after decode_init GPU"+std::to_string(dev)+" used="+std::to_string(used); return fail(); }
+    used_after[dev]=used;
   }
-  // VRAM hard abort 15GB
-  {
-    size_t f0=0,t0=0,f1=0,t1=0;
-    cudaSetDevice(0); cudaMemGetInfo(&f0,&t0);
-    cudaSetDevice(1); cudaMemGetInfo(&f1,&t1);
-    size_t u0=t0-f0, u1=t1-f1;
-    const size_t LIM=15ULL*1024*1024*1024;
-    if(u0>LIM||u1>LIM){ err="VRAM>15GB after decode_init used0="+std::to_string(u0)+" used1="+std::to_string(u1); return false; }
-    printf("pp2 decode_init used0=%zu MiB used1=%zu MiB (limit 15360 MiB)\n",u0/1048576,u1/1048576); fflush(stdout);
-  }
-  ds.inited=true;
+  printf("pp2 decode_init capacity=%d used0=%zu MiB used1=%zu MiB (limit 15360 MiB)\n",
+    capacity,used_after[0]/1048576,used_after[1]/1048576); fflush(stdout);
   return true;
 }
 
@@ -1091,13 +1159,15 @@ void decode_free(DecodeState& ds){
   if(ds.xnbuf){ cudaFree(ds.xnbuf); ds.xnbuf=nullptr; }
   if(ds.logbuf){ cudaFree(ds.logbuf); ds.logbuf=nullptr; }
   ds.ws_bytes=0;
+  ds.capacity=DecodeState::MAXL;
   ds.inited=false;
 }
 
 std::vector<float> decode_step(int tok, DecodeState& ds, long pos, std::string& err){
   if(!g_up){ err="not uploaded"; return {}; }
   if(!ds.inited){ err="decode not inited"; return {}; }
-  if(pos<0||pos>=DecodeState::MAXL){ err="pos OOB"; return {}; }
+  if(ds.capacity<1||ds.capacity>DecodeState::MAX_CONTEXT){ err="decode capacity OOB"; return {}; }
+  if(pos<0||pos>=ds.capacity){ err="pos OOB"; return {}; }
   const int T=1; size_t nH=(size_t)T*HID;
   // P6: zero malloc/free — buffer persistenti da decode_init.
   if(!ds.ws0||!ds.ws1||!ds.idsbuf||!ds.x0buf||!ds.x1buf||!ds.xnbuf||!ds.logbuf){

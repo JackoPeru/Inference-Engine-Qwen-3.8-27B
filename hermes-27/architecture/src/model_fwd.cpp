@@ -177,7 +177,9 @@ std::vector<float> ModelFwd::prefill(const std::vector<int>& ids, float* h_last_
         cv[(size_t)t*C+c]=silu((float)a); }
       std::vector<float> q((size_t)T*HV*KHD), k((size_t)T*HV*KHD), v((size_t)T*HV*VHD);
       for(int t=0;t<T;++t){ float* c0=&cv[(size_t)t*C];
-        for(int hh=0;hh<HV;++hh){ int g=hh/3;
+        // GGUF groups Q/K by head index modulo the 16 distinct key heads.
+        // The older hh/3 mapping matched the outdated CPU E1 golden, not the GGUF model.
+        for(int hh=0;hh<HV;++hh){ int g=hh%(KD/KHD);
           for(int d=0;d<KHD;++d){ q[((size_t)t*HV+hh)*KHD+d]=c0[g*KHD+d]; k[((size_t)t*HV+hh)*KHD+d]=c0[KD+g*KHD+d]; }
           for(int d=0;d<VHD;++d) v[((size_t)t*HV+hh)*VHD+d]=c0[2*KD+hh*VHD+d]; } }
       std::vector<float> zl((size_t)T*VD), b((size_t)T*HV), ar((size_t)T*HV);
@@ -191,7 +193,8 @@ std::vector<float> ModelFwd::prefill(const std::vector<int>& ids, float* h_last_
       std::vector<float> beta((size_t)T*HV), gl((size_t)T*HV);
       for(int t=0;t<T;++t) for(int hh=0;hh<HV;++hh){
         beta[(size_t)t*HV+hh]=1.f/(1.f+expf(-b[(size_t)t*HV+hh]));
-        gl[(size_t)t*HV+hh]=-expf(A[hh])*softplus(ar[(size_t)t*HV+hh]+DT[hh]); }
+        // GGUF ssm_a has already been converted from A_log to -exp(A_log).
+        gl[(size_t)t*HV+hh]=A[hh]*softplus(ar[(size_t)t*HV+hh]+DT[hh]); }
       for(int t=0;t<T;++t){ qk_norm_scale(&q[(size_t)t*HV*KHD], &k[(size_t)t*HV*KHD], HV, KHD, 1.f/sqrtf(128.f)); }
       std::fill(S.begin(), S.end(), 0.f);
       for(int t=0;t<T;++t) for(int hh=0;hh<HV;++hh){
@@ -333,7 +336,8 @@ std::vector<float> ModelFwd::decode_step(int tok, SeqState& st, long pos) const{
         a+=double(q1[c])*double(Wc[c*4+3]); cv[c]=silu((float)a); }
       for(int c=0;c<C;++c){ CS[c*3]=CS[c*3+1]; CS[c*3+1]=CS[c*3+2]; CS[c*3+2]=q1[c]; }
       float q[48*128],k[48*128],v[48*128];
-      for(int hh=0;hh<48;++hh){ int g=hh/3;
+      // Keep decode head order identical to prefill and the GGUF converter.
+      for(int hh=0;hh<48;++hh){ int g=hh%(KD/KHD);
         for(int d=0;d<128;++d){ q[hh*128+d]=cv[g*128+d]; k[hh*128+d]=cv[KD+g*128+d]; }
         for(int d=0;d<128;++d) v[hh*128+d]=cv[2*KD+hh*128+d]; }
       // in-proj z/b/a + gate/beta
@@ -348,7 +352,7 @@ std::vector<float> ModelFwd::decode_step(int tok, SeqState& st, long pos) const{
       for(int hh=0;hh<48;++hh){
         double nq=0,nk=0; for(int d=0;d<128;++d){ nq+=double(q[hh*128+d])*double(q[hh*128+d]); nk+=double(k[hh*128+d])*double(k[hh*128+d]); }
         nq=1.0/sqrt(nq+1e-6); nk=1.0/sqrt(nk+1e-6);
-        float be=1.f/(1.f+expf(-bl[hh])), dec=expf(-expf(A[hh])*softplus(al[hh]+DT[hh]));
+        float be=1.f/(1.f+expf(-bl[hh])), dec=expf(A[hh]*softplus(al[hh]+DT[hh]));
         float* Sh=&st.gdn[(size_t)li*48*128*128+hh*128*128];
         for(int i=0;i<128*128;++i) Sh[i]*=dec;
         for(int j=0;j<128;++j){ double dd=0; for(int i=0;i<128;++i) dd+=double(Sh[i*128+j])*double(k[hh*128+i]*nk);

@@ -93,12 +93,15 @@ target_include_directories(hermes_pp2 PUBLIC distributed kernels/include model/i
   ${CMAKE_SOURCE_DIR}/thirdparty/cutlass/tools/util/include)
 set_target_properties(hermes_pp2 PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 target_link_libraries(hermes_pp2 PUBLIC hermes_gguf hermes_kernels)
+add_executable(hermes_generate tools/hermes_generate.cpp)
+target_link_libraries(hermes_generate PRIVATE hermes_pp2)
+add_dependencies(hermes_generate gguf_dump)
 add_executable(test_pp2_fwd distributed/test_pp2_fwd.cu)
 target_link_libraries(test_pp2_fwd PRIVATE hermes_pp2 hermes_gguf hermes_kernels)
 add_test(NAME pp2_fwd COMMAND test_pp2_fwd)
 add_executable(test_pp2_p2 distributed/test_pp2_p2.cpp)
-target_link_libraries(test_pp2_p2 PRIVATE hermes_pp2 hermes_gguf hermes_kernels)
-# NOT in ctest: second-prompt check, run explicitly.
+target_link_libraries(test_pp2_p2 PRIVATE hermes_pp2)
+# Run explicitly: second prompt with the full checkpoint.
 # P4 PP2 decode incrementale (stati su GPU, riuso upload P2)
 add_executable(test_pp2_decode distributed/test_pp2_decode.cu)
 target_link_libraries(test_pp2_decode PRIVATE hermes_pp2 hermes_gguf hermes_kernels)
@@ -108,3 +111,25 @@ find_package(Threads REQUIRED)
 add_executable(test_pp2_batch distributed/test_pp2_batch.cu distributed/pp2_batch.cu)
 target_link_libraries(test_pp2_batch PRIVATE hermes_pp2 hermes_gguf hermes_kernels Threads::Threads)
 add_test(NAME pp2_batch COMMAND test_pp2_batch)
+
+add_library(hermes_mtp STATIC distributed/mtp_gpu.cu)
+set_target_properties(hermes_mtp PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+target_link_libraries(hermes_mtp PUBLIC hermes_pp2)
+add_executable(test_mtp_gpu distributed/test_mtp_gpu.cu)
+target_link_libraries(test_mtp_gpu PRIVATE hermes_mtp)
+add_test(NAME mtp_gpu COMMAND test_mtp_gpu)
+
+# Native HTTP serving; uses generic installed headers, never another inference runtime.
+find_path(HERMES_HTTP_INCLUDE_DIR httplib.h
+  HINTS /opt/hermes/src/llama-cpp-turboquant/vendor/cpp-httplib)
+find_path(HERMES_JSON_INCLUDE_DIR nlohmann/json.hpp
+  HINTS /opt/hermes/src/llama-cpp-turboquant/vendor)
+if(HERMES_HTTP_INCLUDE_DIR AND HERMES_JSON_INCLUDE_DIR)
+  add_executable(hermes_server serving/server.cpp distributed/pp2_batch.cu
+    ${HERMES_HTTP_INCLUDE_DIR}/httplib.cpp)
+  target_include_directories(hermes_server PRIVATE
+    ${HERMES_HTTP_INCLUDE_DIR} ${HERMES_JSON_INCLUDE_DIR} distributed)
+  target_link_libraries(hermes_server PRIVATE hermes_pp2 hermes_gguf hermes_kernels Threads::Threads)
+else()
+  message(STATUS "hermes_server disabled: cpp-httplib and nlohmann/json headers not found")
+endif()

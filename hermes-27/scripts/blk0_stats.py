@@ -65,10 +65,10 @@ Wc=get(P+"ssm_conv1d.weight")
 conv=F.conv1d(xp,Wc.reshape(C,1,4),groups=C).squeeze(0).T
 conv=F.silu(conv)
 q,k,v=torch.split(conv,[KD,KD,VD],-1)
-q=q.reshape(11,16,128).repeat_interleave(3,1); k=k.reshape(11,16,128).repeat_interleave(3,1); v=v.reshape(11,48,128)
+q=q.reshape(11,16,128).repeat(1,3,1); k=k.reshape(11,16,128).repeat(1,3,1); v=v.reshape(11,48,128)
 z=(h@get(P+"attn_gate.weight").T).reshape(11,48,128)
 beta=torch.sigmoid(h@get(P+"ssm_beta.weight").T)
-gg=(-get(P+"ssm_a").exp()*F.softplus((h@get(P+"ssm_alpha.weight").T)+get(P+"ssm_dt.bias")))
+gg=get(P+"ssm_a")*F.softplus((h@get(P+"ssm_alpha.weight").T)+get(P+"ssm_dt.bias"))
 def l2n(x): return x*torch.rsqrt((x.float()**2).sum(-1,keepdim=True)+1e-6)
 qn=l2n(q)*(128**-0.5); kn=l2n(k)
 S=torch.zeros(48,128,128); outs=[]

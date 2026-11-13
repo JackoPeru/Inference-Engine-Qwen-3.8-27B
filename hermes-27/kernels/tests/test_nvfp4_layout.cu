@@ -49,7 +49,7 @@ int main(){
   Nvfp4GemmW4A4::build_B_from_gguf(Grow.data(),Bq.data(),SFB.data(),N,K);
   // read back through CuTe tensor (kernel's view)
   auto lb = cute::make_layout(cute::make_shape(N,K,1), cutlass::make_cute_packed_stride(StrideB{},{N,K,1}));
-  auto tB = cute::make_tensor(make_iterator(Bq.data()), lb);
+  auto tB = cute::make_tensor(cute::make_iterator(Bq.data()), lb);
   int bad=0;
   for(int n=0;n<N;++n) for(int k=0;k<K;++k){
     float got = (float)tB(n,k,0);
@@ -64,7 +64,7 @@ int main(){
   std::vector<uint8_t> Aq((size_t)T*K/2,0), SFA(Nvfp4GemmW4A4::sfa_bytes(T,K),0);
   Nvfp4GemmW4A4::quant_activation(X.data(),Aq.data(),SFA.data(),T,K);
   auto la = cute::make_layout(cute::make_shape(T,K,1), cutlass::make_cute_packed_stride(StrideA{},{T,K,1}));
-  auto tA = cute::make_tensor(make_iterator(Aq.data()), la);
+  auto tA = cute::make_tensor(cute::make_iterator(Aq.data()), la);
   int badA=0;
   for(int t=0;t<T;++t) for(int k=0;k<K;++k){
     float got=(float)tA(t,k,0), want=e2m1t((t+k)%16);

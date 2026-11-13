@@ -1,12 +1,13 @@
 // P4 decode incrementale PP2: GATE1 singolo step 11->12 vs prefill-full 12,
 // GATE2 teacher-forcing esteso k=1..3, greedy 4 token da prompt 11.
-// Uso: test_pp2_decode [g1|g2|greedy|all] (default all, ferma al gate fallito)
+// Uso: test_pp2_decode [capacity|g1|g2|greedy|all] (default all, ferma al gate fallito)
 #include "pp2_fwd.hpp"
 #include <cstdio>
 #include <vector>
 #include <string>
 #include <cmath>
 #include <chrono>
+#include <cstring>
 #include <cuda_runtime.h>
 
 static int argmax_v(const std::vector<float>& v){
@@ -17,6 +18,9 @@ static int argmax_v(const std::vector<float>& v){
 static bool finite_all(const std::vector<float>& v){
   for(auto x:v) if(!std::isfinite(x)) return false;
   return true;
+}
+static bool bitwise_equal(const std::vector<float>& a,const std::vector<float>& b){
+  return a.size()==b.size() && std::memcmp(a.data(),b.data(),a.size()*sizeof(float))==0;
 }
 static void top5_1(const std::vector<float>& logits,int* oid,float* ov){
   for(int k=0;k<5;++k){oid[k]=-1;ov[k]=-1e30f;}
@@ -29,8 +33,90 @@ static void top5_1(const std::vector<float>& logits,int* oid,float* ov){
   }
 }
 
+static int run_capacity_test(){
+  using State=pp2::DecodeState;
+  static_assert(State::MAXL==128);
+  static_assert(State::MAX_CONTEXT==8192);
+  std::string err;
+  for(int bad_capacity : {0,State::MAX_CONTEXT+1}){
+    State bad{};
+    if(pp2::decode_init(bad,err,bad_capacity) || bad.inited || err.empty()){
+      printf("CAPACITY invalid=%d not rejected before allocation\n",bad_capacity); return 1;
+    }
+    printf("CAPACITY invalid=%d rejected: %s\n",bad_capacity,err.c_str());
+  }
+
+  pp2::Stats st;
+  if(!pp2::upload(st,err)){ printf("CAPACITY UPLOAD FAIL %s\n",err.c_str()); return 1; }
+  State legacy{}, extended{};
+  if(!pp2::decode_init(legacy,err)){ printf("CAPACITY legacy init FAIL %s\n",err.c_str()); pp2::free_all(); return 1; }
+  if(!pp2::decode_init(extended,err,129)){ printf("CAPACITY 129 init FAIL %s\n",err.c_str()); pp2::decode_free(legacy); pp2::free_all(); return 1; }
+  if(legacy.capacity!=State::MAXL || extended.capacity!=129){
+    printf("CAPACITY wrong values legacy=%d extended=%d\n",legacy.capacity,extended.capacity);
+    pp2::decode_free(legacy); pp2::decode_free(extended); pp2::free_all(); return 1;
+  }
+  const int seed[]={6205,161421,303,220};
+  std::vector<float> extended_last;
+  for(int pos=0;pos<3;++pos){
+    auto a=pp2::decode_step(seed[pos],legacy,pos,err);
+    if(a.empty()){ printf("CAPACITY legacy pos=%d FAIL %s\n",pos,err.c_str()); pp2::decode_free(legacy); pp2::decode_free(extended); pp2::free_all(); return 1; }
+    auto b=pp2::decode_step(seed[pos],extended,pos,err);
+    if(b.empty() || !bitwise_equal(a,b)){
+      printf("CAPACITY short bitwise mismatch pos=%d legacy_empty=%d extended_empty=%d err=%s\n",pos,a.empty(),b.empty(),err.c_str());
+      pp2::decode_free(legacy); pp2::decode_free(extended); pp2::free_all(); return 1;
+    }
+    if(pos==2) extended_last=b;
+    printf("CAPACITY short pos=%d bitwise=PASS\n",pos); fflush(stdout);
+  }
+  std::vector<int> short_ids(seed,seed+3);
+  auto short_prefill=pp2::prefill(short_ids,st,err);
+  if(short_prefill.empty() || std::memcmp(extended_last.data(),short_prefill.data()+2*248320,248320*sizeof(float))!=0){
+    printf("CAPACITY short prefill/decode bitwise mismatch: %s\n",err.c_str());
+    pp2::decode_free(legacy); pp2::decode_free(extended); pp2::free_all(); return 1;
+  }
+  printf("CAPACITY short prefill/decode bitwise=PASS T=3\n"); fflush(stdout);
+  for(int pos=3;pos<129;++pos){
+    auto logits=pp2::decode_step(seed[pos%4],extended,pos,err);
+    if(logits.empty() || !finite_all(logits)){
+      printf("CAPACITY true-context pos=%d FAIL %s\n",pos,err.c_str()); pp2::decode_free(legacy); pp2::decode_free(extended); pp2::free_all(); return 1;
+    }
+    if(pos==128) printf("CAPACITY true-context pos=128 finite=PASS\n");
+  }
+  auto beyond_legacy=pp2::decode_step(seed[0],legacy,128,err);
+  if(!beyond_legacy.empty() || err!="pos OOB"){
+    printf("CAPACITY legacy boundary not rejected err=%s\n",err.c_str()); pp2::decode_free(legacy); pp2::decode_free(extended); pp2::free_all(); return 1;
+  }
+  auto beyond_extended=pp2::decode_step(seed[0],extended,129,err);
+  if(!beyond_extended.empty() || err!="pos OOB"){
+    printf("CAPACITY extended boundary not rejected err=%s\n",err.c_str()); pp2::decode_free(legacy); pp2::decode_free(extended); pp2::free_all(); return 1;
+  }
+  pp2::decode_free(legacy); pp2::decode_free(extended);
+
+  for(int capacity : {1024,State::MAX_CONTEXT}){
+    State probe{};
+    if(!pp2::decode_init(probe,err,capacity)){
+      printf("CAPACITY probe init=%d FAIL %s\n",capacity,err.c_str()); pp2::decode_free(probe); pp2::free_all(); return 1;
+    }
+    const int pos=capacity-1;
+    for(int li=3;li<64;li+=4) probe.klen[li]=pos;
+    auto logits=pp2::decode_step(13,probe,pos,err);
+    if(logits.empty() || !finite_all(logits)){
+      printf("CAPACITY zero-KV probe pos=%d FAIL %s\n",pos,err.c_str()); pp2::decode_free(probe); pp2::free_all(); return 1;
+    }
+    printf("CAPACITY zero-KV score-range pos=%d finite=PASS\n",pos); fflush(stdout);
+    auto beyond=pp2::decode_step(13,probe,capacity,err);
+    if(!beyond.empty() || err!="pos OOB"){
+      printf("CAPACITY probe boundary=%d not rejected err=%s\n",capacity,err.c_str()); pp2::decode_free(probe); pp2::free_all(); return 1;
+    }
+    pp2::decode_free(probe);
+  }
+  pp2::free_all();
+  return 0;
+}
+
 int main(int argc,char** argv){
   std::string only=argc>1?argv[1]:"all";
+  if(only=="capacity") return run_capacity_test();
   printf("P4 PP2 decode T=11 prompt only=%s\n",only.c_str()); fflush(stdout);
   if(only=="bisect"){
     pp2::Stats bst; std::string berr;

@@ -1,5 +1,4 @@
-// P2 second prompt (EN, 13 tok): prefill PP2 vs E1 golden top5.
-// E1 golden: [2250,279,271,8323,198] (torch fp32, direct norms).
+// P2 second prompt (EN, 13 tokens): PP2 argmax vs llama.cpp b9704 CPU, same GGUF.
 #include "pp2_fwd.hpp"
 #include <cstdio>
 #include <algorithm>
@@ -16,9 +15,8 @@ int main(){
     for(int k=0;k<5;++k) if(v>tv[k]){ for(int j=4;j>k;--j){tv[j]=tv[j-1];top[j]=top[j-1];} tv[k]=v;top[k]=i; break; } }
   printf("P2-P2 top5: [%d,%d,%d,%d,%d] vals [%.2f,%.2f,%.2f,%.2f,%.2f]\n",
     top[0],top[1],top[2],top[3],top[4],tv[0],tv[1],tv[2],tv[3],tv[4]);
-  int exp[5]={2250,279,271,8323,198};
-  bool ok=true; for(int k=0;k<5;++k) if(top[k]!=exp[k]) ok=false;
-  printf("P2-P2 %s (E1 golden [2250,279,271,8323,198])\n", ok?"MATCH E1":"DIFFER");
+  const bool ok=top[0]==271;
+  printf("P2-P2 %s (llama.cpp argmax 271)\n", ok?"MATCH":"DIFFER");
   pp2::free_all();
   return ok?0:1;
 }

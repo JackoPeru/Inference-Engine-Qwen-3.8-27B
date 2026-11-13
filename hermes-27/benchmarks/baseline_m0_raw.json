@@ -1,0 +1,89 @@
+{
+ "env": {
+  "health": {
+   "status": "healthy",
+   "issues": []
+  }
+ },
+ "runs": [
+  {
+   "mode": "nonstream",
+   "prompt": "prose_it",
+   "iter": 0,
+   "latency_s": 0.8739543800475076,
+   "prompt_tokens": 71,
+   "completion_tokens": 64,
+   "tok_per_s": 73.23036700899766
+  },
+  {
+   "mode": "nonstream",
+   "prompt": "prose_it",
+   "iter": 1,
+   "latency_s": 0.8750100769102573,
+   "prompt_tokens": 71,
+   "completion_tokens": 64,
+   "tok_per_s": 73.14201480512088
+  },
+  {
+   "mode": "nonstream",
+   "prompt": "code_py",
+   "iter": 0,
+   "latency_s": 0.7594150740187615,
+   "prompt_tokens": 69,
+   "completion_tokens": 64,
+   "tok_per_s": 84.2753879789577
+  },
+  {
+   "mode": "nonstream",
+   "prompt": "code_py",
+   "iter": 1,
+   "latency_s": 0.806831803987734,
+   "prompt_tokens": 69,
+   "completion_tokens": 64,
+   "tok_per_s": 79.32260439373182
+  },
+  {
+   "mode": "nonstream",
+   "prompt": "reasoning",
+   "iter": 0,
+   "latency_s": 0.7929171469295397,
+   "prompt_tokens": 69,
+   "completion_tokens": 64,
+   "tok_per_s": 80.71461217332859
+  },
+  {
+   "mode": "nonstream",
+   "prompt": "reasoning",
+   "iter": 1,
+   "latency_s": 0.7277307469630614,
+   "prompt_tokens": 69,
+   "completion_tokens": 64,
+   "tok_per_s": 87.94461449798898
+  },
+  {
+   "mode": "stream",
+   "prompt": "prose_it",
+   "latency_s": 0.8755679259775206,
+   "ttft_s": 0.2652881289832294,
+   "text_len": 105,
+   "usage": null
+  },
+  {
+   "mode": "concurrency2",
+   "wall_s": 0.6844770349562168,
+   "results": [
+    {
+     "ok": true,
+     "lat": 0.6828510749619454,
+     "ct": 32
+    },
+    {
+     "ok": true,
+     "lat": 0.6827152220066637,
+     "ct": 32
+    }
+   ],
+   "agg_tps": 93.50204131259687
+  }
+ ]
+}

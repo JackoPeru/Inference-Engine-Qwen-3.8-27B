@@ -2,11 +2,19 @@
 #include "hermes/gguf.hpp"
 #include <cstdio>
 int main(int argc, char** argv){
-  if(argc<2){printf("usage: gguf_dump <file.gguf> [--strict]\n");return 2;}
+  if(argc<2){printf("usage: gguf_dump <file.gguf> [--strict|--chat-template]\n");return 2;}
   bool strict = argc>2 && std::string(argv[2])=="--strict";
   hermes::GgufFile g;
   try{ g.open(argv[1], strict); }
   catch(std::exception& e){ printf("OPEN FAIL: %s\n", e.what()); return 1; }
+  if(argc>2 && std::string(argv[2])=="--chat-template"){
+    auto it=g.kv_str.find("tokenizer.chat_template");
+    if(it==g.kv_str.end() || it->second.empty()){
+      fprintf(stderr,"missing tokenizer.chat_template\n");
+      return 1;
+    }
+    return fwrite(it->second.data(),1,it->second.size(),stdout)==it->second.size()?0:1;
+  }
   printf("version=%u n_tensors=%llu n_kv=%llu align=%llu data_off=%llu\n",
     g.header.version,(unsigned long long)g.header.n_tensors,(unsigned long long)g.header.n_kv,
     (unsigned long long)g.alignment,(unsigned long long)g.data_offset);

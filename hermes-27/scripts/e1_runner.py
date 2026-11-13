@@ -114,9 +114,9 @@ for li in range(NL):
         conv=F.conv1d(xp,Wc.reshape(C,1,4),groups=C).squeeze(0).T
         conv=F.silu(conv)
         q,k,v=torch.split(conv,[KD,KD,VD],-1)
-        q=q.reshape(T,16,128).repeat_interleave(3,1); k=k.reshape(T,16,128).repeat_interleave(3,1); v=v.reshape(T,48,128)
+        q=q.reshape(T,16,128).repeat(1,3,1); k=k.reshape(T,16,128).repeat(1,3,1); v=v.reshape(T,48,128)
         z=(h@Wz.T).reshape(T,48,128)
-        beta=torch.sigmoid(h@Wb.T); gg=(-A.exp()*F.softplus((h@Wa.T)+DT))
+        beta=torch.sigmoid(h@Wb.T); gg=A*F.softplus((h@Wa.T)+DT)
         qn=l2n(q)*(KH**-0.5); kn=l2n(k)
         S=torch.zeros(48,128,128); outs=[]
         for t in range(T):
@@ -201,9 +201,9 @@ for step in range(4):
             convs[li]=full[:,-3:].clone()
             conv=F.silu(conv)
             q,k,v=torch.split(conv,[KD,KD,VD],-1)
-            q=q.reshape(1,16,128).repeat_interleave(3,1); k=k.reshape(1,16,128).repeat_interleave(3,1); v=v.reshape(1,48,128)
+            q=q.reshape(1,16,128).repeat(1,3,1); k=k.reshape(1,16,128).repeat(1,3,1); v=v.reshape(1,48,128)
             z=(h@Wz.T).reshape(1,48,128)
-            beta=torch.sigmoid(h@Wb.T); gg=(-A.exp()*F.softplus((h@Wa.T)+DT))
+            beta=torch.sigmoid(h@Wb.T); gg=A*F.softplus((h@Wa.T)+DT)
             qn=l2n(q)*(KH**-0.5); kn=l2n(k)
             S=states[li]
             S=S*torch.exp(gg[0])[:,None,None]

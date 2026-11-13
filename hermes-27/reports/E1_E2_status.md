@@ -1,6 +1,8 @@
-# E1/E2 — Full-model su checkpoint reale (stato 2026-11-13: MATCH diretto, 2 prompt, MTP ACCEPT)
+# E1/E2 — Full-model su checkpoint reale (report storico, riferimenti numerici invalidati)
 
-## Golden vigente (convenzione diretta `rms(x)*w`, cfr `NORM_CONVENTION.md`)
+> **Attenzione, 13 novembre 2026 (post-Codex):** i vecchi golden E1/E2 riportati sotto NON sono riferimenti di correttezza validi per la versione corrente. Il precedente E2 C++ applicava `-exp(ssm_a)` due volte e associava le teste GDN con `hh/3` anziche' `hh%16`. Il codice CPU E2 e' stato corretto in prefill e decode; il nuovo output CPU deve ancora essere riverificato integralmente contro il checkpoint e llama.cpp. Il riferimento indipendente sul prompt IT 11 token e' top1=271 (vedere `reports/PP2_GENERATION.md` e `tests/compare_llama.py`). Non usare i top5 storici `[220,...]` o `[898,...]` per dichiarare PASS, ne' ripubblicare `/tmp/e2_logits.bin` preesistente come golden aggiornato.
+
+## Golden storici (non piu' vigenti; solo archivio, cfr `NORM_CONVENTION.md`)
 - E1 torch CPU fp32, prefill 11 token (`Spiega in 2 frasi la gravita.`):
   top5 `[220,1374,27053,17,1147]` vals `[15.74,12.96,12.41,12.19,11.2]`,
   mean -1.902 std 2.027. Golden precedente (1+w) `[898,...]` INVALIDATO.

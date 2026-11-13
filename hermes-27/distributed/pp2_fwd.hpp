@@ -24,10 +24,21 @@ struct Stats {
 // Upload completo pesi su GPU0/GPU1 secondo PP (split 31/32). Ritorna false se VRAM>15GB o errore CUDA.
 // Misura tempi, conta byte, fa checksum spot (1 tensore/GPU vs CPU).
 bool upload(Stats& st, std::string& err);
+// Explicit checkpoint path for CLI/runtime; legacy overload remains compatible.
+bool upload(Stats& st, std::string& err, const std::string& model_path);
+int eos_token_id(); // tokenizer.ggml.eos_token_id, or -1 if absent/invalid
 
 // Prefill singolo microbatch: ids[T] -> logits[T*VOC] fp32 (solo ultimo? no, tutti T come E2).
 // xfer confine via pinned host, misurato in st.xfer_ms. Ritorna vuoto su errore.
-std::vector<float> prefill(const std::vector<int>& ids, Stats& st, std::string& err);
+// h_last_out (opzionale): se non-null, riempito con ultimo hidden [HID] fp32
+// pre-output_norm (per MTP draft). Nessun costo extra oltre 20KB D2H.
+std::vector<float> prefill(const std::vector<int>& ids, Stats& st, std::string& err,
+                           std::vector<float>* h_last_out = nullptr);
+
+// Accessor minimale MTP: raw device pointer peso residente (no copy, no ownership).
+// Ritorna false se non uploaded o nome assente. ne0/ne1/gtype/dev opzionali.
+bool get_weight_ptr(const std::string& name, void*& dptr, int* ne0 = nullptr,
+                    int* ne1 = nullptr, int* gtype = nullptr, int* dev = nullptr);
 
 // Libera tutto (entrambe GPU + pinned + backend).
 void free_all();
@@ -37,12 +48,15 @@ void free_all();
 // conv tail [C=10240 x 3] per layer lineare, KV full-attn [16 x 4x256 x L] fp32,
 // RoPE usa pos assoluta (come E2 decode_step pos).
 struct DecodeState {
+  // Legacy decode_init() default remains 128. Extended states support up to 8K.
   static const int MAXL = 128;
+  static constexpr int MAX_CONTEXT = 8192;
   float* S[64];   // GDN S persistente [HV*KHD*VHD], nullptr per full layer
   float* CS[64];  // conv tail [C*3], nullptr per full layer
-  float* Kc[64];  // full K cache [MAXL*4*256], nullptr per GDN layer
-  float* Vc[64];  // full V cache [MAXL*4*256], nullptr per GDN layer
+  float* Kc[64];  // full K cache [capacity*4*256], nullptr per GDN layer
+  float* Vc[64];  // full V cache [capacity*4*256], nullptr per GDN layer
   int klen[64];   // len per full layer (host mirror)
+  int capacity = MAXL;
   bool inited = false;
   // P6 workspace persistenti (no malloc/free in decode hot path, T=1 fisso):
   // arena riusata layer-per-layer, own device (ws0 GPU0, ws1 GPU1).
@@ -58,6 +72,8 @@ struct DecodeState {
 
 // Alloca/stati zero su GPU proprietaria (richiede upload già fatto). Ritorna false su errore/OOM.
 bool decode_init(DecodeState& ds, std::string& err);
+// Explicit KV/attention capacity in tokens (1..MAX_CONTEXT).
+bool decode_init(DecodeState& ds, std::string& err, int capacity);
 // Singolo step incrementale: tok + pos assoluta -> logits[VOC] fp32 (ultimo token).
 // Aggiorna S/CS/KV in place. xfer T=1 via pinned (20KB). Ritorna vuoto su errore.
 std::vector<float> decode_step(int tok, DecodeState& ds, long pos, std::string& err);

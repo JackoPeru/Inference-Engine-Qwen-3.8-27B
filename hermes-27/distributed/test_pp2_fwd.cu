@@ -1,4 +1,5 @@
-// P2 test: GATE1 upload+VRAM, GATE2 singolo layer, GATE3 full prefill T=11 top5, GATE4 full-logits.
+// P2 test: GATE1 upload+VRAM, GATE2 singolo layer, GATE3 full prefill vs llama.cpp top1,
+// GATE4 corrected full-logits CPU reference (do not use historical golden fixtures).
 // Uso: test_pp2_fwd [gate]  gate=all|g1|g2|g3|g4  (default all, ferma al gate fallito)
 #include "pp2_fwd.hpp"
 #include <cstdio>
@@ -49,14 +50,14 @@ int main(int argc,char** argv){
     printf("GATE3 logits T=11 V=248320 prefill_ms=%.1f xfer_ms=%.3f\n",st.prefill_ms,st.xfer_ms);
     printf("GATE3 top5: [%d,%d,%d,%d,%d] vals [%.2f,%.2f,%.2f,%.2f,%.2f]\n",
       tid[0],tid[1],tid[2],tid[3],tid[4],tv[0],tv[1],tv[2],tv[3],tv[4]);
-    printf("GATE3 golden top5 [220,1374,27053,17,1147]\n");
+    printf("GATE3 llama.cpp b9704 CPU argmax: 271\n");
     fflush(stdout);
-    bool match=(tid[0]==220&&tid[1]==1374&&tid[2]==27053&&tid[3]==17&&tid[4]==1147);
-    printf("GATE3 %s\n",match?"PASS top5 MATCH":"FAIL top5 MISMATCH (bisect sopra, stop)");
+    bool match=tid[0]==271;
+    printf("GATE3 %s\n",match?"PASS argmax MATCH":"FAIL argmax MISMATCH");
     if(!match) return 3;
     if(only=="g3") return 0;
   }
-  // GATE4 full-logits vs /tmp/e2_logits.bin
+  // GATE4 full-logits vs freshly regenerated corrected E2 reference.
   if(do_g4||only=="all"){
     if(logits.empty()){
       const int ids_arr[11]={6205,161421,303,220,17,1374,9911,1147,27053,6059,13};
@@ -65,7 +66,10 @@ int main(int argc,char** argv){
       if(logits.empty()){ printf("GATE4 FAIL prefill: %s\n",err.c_str()); return 4; }
     }
     std::vector<float> ref;
-    if(!read_bin("/tmp/e2_logits.bin",ref,(size_t)11*248320)){ printf("GATE4 FAIL no golden\n"); return 4; }
+    if(!read_bin("/tmp/e2_logits_corrected.bin",ref,(size_t)11*248320)){
+      printf("GATE4 BLOCKED: no corrected golden; run rebuilt test_logits_dump with fixed CPU E2 first\n");
+      return 4;
+    }
     double mx=0,me=0; size_t im=0; int arg_ok=0, top50_ok=0;
     for(int t=0;t<11;++t){
       const float* g=&logits[(size_t)t*248320];
@@ -98,7 +102,7 @@ int main(int argc,char** argv){
     }
     me/=(11.0*248320);
     printf("GATE4 maxerr=%.5f (at %zu t=%zu v=%zu) meanerr=%.6f argmax %d/11 top50_last %d/50\n",mx,im,im/248320,im%248320,me,arg_ok,top50_ok);
-    printf("GATE4 golden E2==E1 maxerr 7.75e-03 mean 4.17e-04 argmax 11/11 top50 50/50 (riferimento)\n");
+    printf("GATE4 comparison uses corrected E2 CPU golden (not historical E1/E2 fixture)\n");
     fflush(stdout);
     bool pass=(arg_ok==11);
     printf("GATE4 %s (maxerr report, non forzare soglia rumore)\n",pass?"PASS argmax 11/11":"FAIL argmax");
