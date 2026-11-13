@@ -147,7 +147,8 @@ print("logits:",tuple(logits.shape),"mean/std:",logits.mean().item(),logits.std(
 assert torch.isfinite(logits).all()
 top5=logits[-1].topk(5)
 print("top5 ids:",top5.indices.tolist(),"vals:",[round(v,2) for v in top5.values.tolist()],flush=True)
-if os.environ.get("E1_SAVE_LOGITS"):
+import os as _os
+if _os.environ.get("E1_SAVE_LOGITS"):
     torch.save({"ids":ids,"logits":logits.half().cpu(),"top5":top5.indices.tolist()},"/tmp/e1_logits.pt")
     print("saved /tmp/e1_logits.pt",flush=True)
 import os
