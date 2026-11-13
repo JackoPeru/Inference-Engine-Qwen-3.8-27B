@@ -117,3 +117,38 @@ llama traces remain the comparison authority.
 
 **Decision: NO-GO; retain the published Q8_1/DP4A as a standalone
 experiment, without switching the main inference engine.**
+
+## Bounded follow-up: only GDN QKV projections use Q8_1
+
+To distinguish an error propagation caused by changing *all* GEMVs
+from the first proven QKV quantization mismatch, the scratch patcher
+adds a `HERMES_PP2_Q8_DP4A_EXPERIMENTAL_SCOPE=gdn-qkv` selector.
+It applies Q8_1 only to GDN `HID=5120 -> CC=10240` QKV projections
+in the token-by-token decoder; every other projection still executes
+the existing BF16 Warp4 path. It is strictly **scratch-only**, not a
+new production option.
+
+Same GGUF, independent llama trace, prompt IDs, 248320 full FP32
+logits/step and unchanged strict thresholds. Isolated scratch binary:
+`/tmp/h27-q8-e2e-candidate-nwrBNa/build/hermes_generate`;
+candidate output: `/tmp/h27-q8-gdnqkv-a11-20261113`.
+CUDA12.8 compiled and linked with no errors.
+
+| Step | All projections Q8 RMSE | GDN QKV-only Q8 RMSE | GDN QKV-only max abs |
+| ---: | ---: | ---: | ---: |
+| 0 | 0.074186224 | 0.062683179 | 0.38897526 |
+| 1 | 0.040707038 | 0.042388489 | 0.23970795 |
+| 2 | 0.073222515 | 0.057432097 | 0.2879684 |
+
+Greedy tokens remain `[271,248068,198]`. Independent full-logit
+release gate still **FAIL 3/3**. Model upload was unchanged; measured
+11-token seed time 2214.540 ms, and two incremental decode steps
+401.592 ms (single execution, NOT a matched benchmark).
+Both GPUs returned to their previous idle allocations after test.
+
+**Conclusion:** even a selective same-NVFP4 Q8/GDN-QKV correction
+does not make the entire model numerically equivalent to llama.
+Changing every projection to Q8 also does not provide monotonic
+full-logit improvement. The next responsible step is authenticated
+downstream GDN/full-attention intermediate comparison, not
+further global quantizer substitutions or a relaxed release gate.

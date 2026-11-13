@@ -66,7 +66,18 @@ PROBE = r'''
     const char* v=std::getenv("HERMES_PP2_Q8_DP4A_EXPERIMENTAL");
     return v && std::strcmp(v,"1")==0;
   }();
-  if(q8_dp4a){
+  // Scope controls are available ONLY in this scratch build. In particular,
+  // gdn-qkv selects the 5120->10240 GDN QKV GEMV at every GDN layer but
+  // leaves beta/gate/out/FFN/full attention in their legacy BF16 form.
+  static const int q8_scope = [] {
+    const char* v=std::getenv("HERMES_PP2_Q8_DP4A_EXPERIMENTAL_SCOPE");
+    if(!v || std::strcmp(v,"all")==0) return 1;
+    if(std::strcmp(v,"gdn-qkv")==0) return 2;
+    return -1;
+  }();
+  if(q8_dp4a && q8_scope<0)
+    throw std::runtime_error("unknown Q8 DP4A experimental scope");
+  if(q8_dp4a && (q8_scope==1 || (q8_scope==2 && H==HID && N==CC))){
     if(!d_fp32 || T!=1 || H<=0 || H%256 || N<=0 || g_prefill_bf16_scope)
       throw std::runtime_error(
         "Q8 DP4A PP2 requires T1 decode, genuine FP32 input and K divisible by 256");
