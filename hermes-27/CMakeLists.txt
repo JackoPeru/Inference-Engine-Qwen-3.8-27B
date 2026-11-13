@@ -257,6 +257,12 @@ if(Python3_Interpreter_FOUND)
     ${Python3_EXECUTABLE} -B ${CMAKE_SOURCE_DIR}/tools/test_generate_args_cpu.py
     $<TARGET_FILE:hermes_generate>)
   set_tests_properties(generate_batched_args_cpu PROPERTIES TIMEOUT 60)
+  # Offline streaming benchmark/comparator contracts: synthetic HTTP,
+  # no server, no CUDA, no model load and no external requests.
+  add_test(NAME http_sse_latency_contract_cpu COMMAND
+    ${Python3_EXECUTABLE} -B -m unittest discover
+    -s ${CMAKE_SOURCE_DIR}/scripts/tests -p "test_*sse*.py")
+  set_tests_properties(http_sse_latency_contract_cpu PROPERTIES TIMEOUT 60)
 endif()
 add_executable(test_pp2_fwd distributed/test_pp2_fwd.cu)
 target_link_libraries(test_pp2_fwd PRIVATE hermes_pp2 hermes_gguf hermes_kernels)

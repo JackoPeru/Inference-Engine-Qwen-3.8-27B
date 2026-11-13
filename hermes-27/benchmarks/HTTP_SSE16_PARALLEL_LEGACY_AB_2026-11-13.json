@@ -1,0 +1,53 @@
+{
+  "data": [
+    {
+      "clients": 1,
+      "legacy_request_p95_sec": 5.655734,
+      "legacy_tok_per_wall_sec": 2.828674,
+      "legacy_ttfc_p95_sec": 4.27982,
+      "parallel_request_p95_sec": 5.654559,
+      "parallel_tok_per_wall_sec": 2.829256,
+      "parallel_ttfc_p95_sec": 4.280891,
+      "relative_parallel_percent": 0.021
+    },
+    {
+      "clients": 2,
+      "legacy_request_p95_sec": 8.655106,
+      "legacy_tok_per_wall_sec": 3.69501,
+      "legacy_ttfc_p95_sec": 6.601052,
+      "parallel_request_p95_sec": 8.620314,
+      "parallel_tok_per_wall_sec": 3.711921,
+      "parallel_ttfc_p95_sec": 6.52517,
+      "relative_parallel_percent": 0.458
+    },
+    {
+      "clients": 4,
+      "legacy_request_p95_sec": 13.223437,
+      "legacy_tok_per_wall_sec": 4.83938,
+      "legacy_ttfc_p95_sec": 10.015835,
+      "parallel_request_p95_sec": 13.137214,
+      "parallel_tok_per_wall_sec": 4.871126,
+      "parallel_ttfc_p95_sec": 9.918073,
+      "relative_parallel_percent": 0.656
+    },
+    {
+      "clients": 8,
+      "legacy_request_p95_sec": 26.341741,
+      "legacy_tok_per_wall_sec": 4.858091,
+      "legacy_ttfc_p95_sec": 23.172786,
+      "parallel_request_p95_sec": 26.355019,
+      "parallel_tok_per_wall_sec": 4.856234,
+      "parallel_ttfc_p95_sec": 23.107577,
+      "relative_parallel_percent": -0.038
+    }
+  ],
+  "output_hashes_identical": true,
+  "quality_scope": "same-PP2 SSE text hashes/usage only; independent full logits still FAIL",
+  "request_count_per_variant": 30,
+  "schema": "h27.sse-ab-parity.v1",
+  "source_sha256": {
+    "legacy": "4d56d58655bacba13bf8b691f533ed119d8c278a1fc0951fbb673ddf56525f95",
+    "parallel": "6d9dee23823e436d82faa923a0cc424f7759d5ec5c3420543fc51bd75f2248b9"
+  },
+  "status": "PASS_SCOPED_SSE_PARITY"
+}

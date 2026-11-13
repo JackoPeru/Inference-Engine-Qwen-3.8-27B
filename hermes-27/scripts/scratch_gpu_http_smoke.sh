@@ -14,6 +14,7 @@ MODE="${HERMES_TEST_MODE:-async}"
 SCHEDULER="${HERMES_TEST_SCHEDULER:-legacy}"
 PREFILL="${HERMES_TEST_BATCHED_PREFILL:-0}"
 PARALLEL="${HERMES_TEST_PARALLEL_STEPS:-0}"
+SSE_TIMING="${HERMES_TEST_SSE_TIMING:-0}"
 LOG="${ROOT}/http-smoke-${MODE}-${SCHEDULER}-seed${PREFILL}-parallel${PARALLEL}.log"
 SERVER_PID=""
 
@@ -41,6 +42,10 @@ if [[ "$PREFILL" != 0 && "$PREFILL" != 1 ]]; then
 fi
 if [[ "$PARALLEL" != 0 && "$PARALLEL" != 1 ]]; then
   echo "BLOCKED: HERMES_TEST_PARALLEL_STEPS must be 0 or 1" >&2
+  exit 77
+fi
+if [[ "$SSE_TIMING" != 0 && "$SSE_TIMING" != 1 ]]; then
+  echo "BLOCKED: HERMES_TEST_SSE_TIMING must be 0 or 1" >&2
   exit 77
 fi
 if [[ "$PARALLEL" == 1 ]] &&
@@ -172,4 +177,22 @@ if [[ "${HERMES_TEST_LOAD:-0}" == 1 ]]; then
       --max-tokens 8 --prompt-style arithmetic
   fi
   echo "SCRATCH HTTP CONCURRENCY: PASS mode=$MODE scheduler=$SCHEDULER batched_prefill=$PREFILL"
+fi
+if [[ "$SSE_TIMING" == 1 ]]; then
+  if [[ "$PARALLEL" == 1 ]]; then
+    sse_variant=parallel
+  elif [[ "$SCHEDULER" == "legacy" ]]; then
+    sse_variant=legacy
+  else
+    sse_variant=serial
+  fi
+  if [[ ! -f "${SOURCE}/scripts/scratch_http_sse_latency.py" ]]; then
+    echo "BLOCKED: SSE latency harness absent from isolated source" >&2
+    exit 77
+  fi
+  timeout --signal=TERM --kill-after=10 175 "$PYTHON" -B \
+    "${SOURCE}/scripts/scratch_http_sse_latency.py" \
+    --base-url "http://127.0.0.1:${PORT}" --variant "$sse_variant" \
+    --clients 1 2 4 8 --rounds 2 --max-tokens 16
+  echo "SCRATCH SSE TIMING: PASS variant=$sse_variant"
 fi
