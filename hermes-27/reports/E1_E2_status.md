@@ -9,6 +9,7 @@
 - Secondo prompt (EN storia, 13 tok `Summarize the causes...`): E1==E2
   top5 `[2250,279,271,8323,198]`, full-logits maxerr 7.12e-03 (floor fp16),
   meanerr 4.42e-04, argmax 13/13 SAME, top50 50/50 ovunque.
+- GPU PP2 sullo stesso prompt: top5 identici → MATCH E1 (test_pp2_p2).
 
 ## E2 (C++ `ModelFwd`)
 - `test_model_fwd` top5 identici al golden → **MATCH E1 PASS** (log `/tmp/e2_full_direct.log`).

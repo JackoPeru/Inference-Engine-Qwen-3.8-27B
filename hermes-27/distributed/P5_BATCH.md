@@ -147,3 +147,42 @@ Cosa blocca il resto:
   (`/health /metrics`), (b) mancanza CUDA Graphs/workspace persistente (per-step overhead
   uccide il guadagno con N variabile), (c) prefix caching GDN non banale. Il batch N fisso
   qui prova correttezza stati separati + misura onesta (x1.00), ma non e` serving dinamico.
+
+## P6 APPENDICE — Workspace persistenti decode (no malloc/free storm, misurato 2026-11-13)
+
+Obiettivo: eliminare ~1349 cudaMalloc/Free per token (48 GDN x22 + 16 full x18 + 5 step)
+senza cambiare kernel, ordine, tipi, layout, stream (default-stream sincrono, no Graphs).
+Solo `distributed/pp2_fwd.{hpp,cu}`, no commit, VRAM <15GB, servizi intatti.
+
+Byte arene (T=1 fisso, HID=5120 FFN=17408 VDD=6144 C=10240 HV/KHD/VHD=48/128/128 NKV*HD=1024):
+- GDN decode 568064 B: h 20480 + hb 10240 + q1 40960 + cv 40960 + zl 24576
+  + b/ar/be/gl 4x192=768 + q/k/v/o 4x24576=98304 + g 24576 + core 20480
+  + gg/uu/hid 3x69632=208896 + down 20480 + h2b 10240 + gb 12288 + hidb 34816.
+- FULL decode 477184 B: h 20480 + hb 10240 + qq 49152 + kk 4096 + vv 4096 + Q 24576
+  + K1 4096 + V1 4096 (allocato mai usato, preservato) + G 24576 + att 24576 + core 20480
+  + gg/uu/hid 208896 + down 20480 + h2b 10240 + hidb 34816 + gb 12288.
+- WS_BYTES = max = 568064 per GPU (ws0 GPU0, ws1 GPU1, in `DecodeState`, per-req thread-safe).
+- Extra step persistenti/req: ids 4 (GPU0) + x0/x1/xn 3x20480 + logits 993280 (GPU1)
+  = 1072744 B + 2x568064 = 2169852 B (~2.07 MiB/req). `decode_init` alloca 1x, `decode_free` rilascia.
+
+Misurato (stesso prompt 11 `[6205,161421,303,220,17,1374,9911,1147,27053,6059,13]`):
+- PRIMA (malloc/free): bisect11 11x maxerr 0.000000 SAME; greedy gen [220,17,1374,220]
+  WARMUP 7209.9ms avg 655.4, step 654.3/654.7/656.1/654.4 avg 654.9ms/tok, VRAM 9856/11469 MiB stabili.
+- DOPO (arene): bisect11 11x maxerr 0.000000 SAME (bit-exact preservata);
+  greedy gen [220,17,1374,220] identici, top5 identici, GATE1 maxerr 0.00000 SAME;
+  WARMUP 7093.6-7095.2ms avg 644.9-645.0, step 645.0/645.2/645.1/645.1 avg ~645.1ms/tok;
+  VRAM 9858/11471 MiB (+2/+2 vs prima, workspace), 9858->9858/11471->11471 per step (no leak, no crescita).
+- dmon util (120 campioni durante greedy): pattern invariato alternato 0/99, mem 7-10%,
+  una GPU alla volta — nessuna overlap nuova (atteso, single-stream + sync per layer invariati).
+
+Nota onesta: speedup ~9.8ms/tok (~1.5%, 654.9 -> 645.1). Lo storm malloc (~1300 alloc/token)
+costava solo ~10ms; il collo resta GEMV host-bound + cudaDeviceSynchronize per layer
+(64 sync/token) + launch overhead, non la sola allocazione. Senza CUDA Graphs / stream dedicati
+/ fusione GEMV il guadagno resta marginale — misurato, non stimato.
+- File/linee: `pp2_fwd.hpp` DecodeState +7 campi (ws0/ws1/idsbuf/x0buf/x1buf/xnbuf/logbuf/ws_bytes);
+  `pp2_fwd.cu` +costanti WS_* (r.42-56), `run_gdn_decode_layer` carve (r.~900), `run_full_decode_layer`
+  carve (r.~980), `decode_init` +arene/step (r.~1044), `decode_free` +free (r.~1085),
+  `decode_step` zero malloc/free (r.~1100). Prefill `run_gdn/full_layer` e debug invariati.
+  Full build -j4 PASS (tutti i target incl. test_pp2_batch), `test_pp2_fwd g2` PASS.
+- Resta: CUDA Graphs capture loop 64L, hot path W4A4 (GEMV -> GEMM batched), stream/events
+  per-layer (via default sync), pinned pool per-req, batching continuo, prefix-cache GDN.

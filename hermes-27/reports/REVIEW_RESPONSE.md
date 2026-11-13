@@ -41,3 +41,11 @@ Stato server verificato prima di agire: golden E1 diretto rigenerato, E2 rebuild
   ~654ms/step, VRAM stabile (no leak); GATE3 top5 MATCH E2; GATE4 invariato
   (maxerr 6.55, argmax 9/11: rumore bf16-activation+W4A4, non regressione).
 - Dettagli: `distributed/P4_DECODE.md` sez. 6.
+
+## P5 batching + secondo prompt GPU (2026-11-13)
+- Decode concorrente N=2/4 bit-exact vs single-stream; agg 1.53→1.56 tok/s
+  (x1.00-1.02): collo host-bound (malloc/sync per layer), non GPU.
+  Workspace persistenti introdotti (2.07 MiB/req, no leak); passo successivo
+  CUDA Graphs + W4A4 hot path, non altro batching.
+- Secondo prompt EN su GPU PP2: top5 `[2250,279,271,8323,198]` = E1 MATCH.
+- Servizi produzione intatti per tutta la sessione (nessun restart).
