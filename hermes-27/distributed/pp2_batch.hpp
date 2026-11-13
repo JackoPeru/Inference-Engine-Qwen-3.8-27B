@@ -120,6 +120,10 @@ struct SchedulerConfig {
   int max_context = pp2::DecodeState::MAX_CONTEXT;
   int vocab_size = 248320;
   int eos_token_id = -1;              // -1 disables EOS stopping
+  // Experimental opt-in: use the existing freshly allocated DecodeState
+  // for a single T-token PP2 stateful prefill when 1 <= prompt.size() <= 64.
+  // Default false preserves the incremental prompt loop exactly.
+  bool enable_batched_prefill = false;
   // Synchronous, optional event sink: no callbacks under metadata lock.
   // Must be thread-safe: queued cancellation calls it from the canceller,
   // admission, tokens and other terminal events from the pump. May call
@@ -140,8 +144,15 @@ struct SchedulerMetrics {
   std::size_t expired_total = 0;
   std::size_t failed_total = 0;
   std::size_t decode_steps_total = 0;
+  std::size_t prefill_attempts_total = 0;
+  std::size_t prefill_seeded_total = 0;
+  std::size_t prefill_unsupported_total = 0;
+  std::size_t prefill_failed_total = 0;
+  std::size_t prefill_prompt_tokens_total = 0;
   std::size_t callback_errors_total = 0;
 };
+
+enum class PrefillResult { unsupported, success, failed, seeded = success };
 
 class StepBackend {
  public:
@@ -151,6 +162,23 @@ class StepBackend {
   virtual bool open(int capacity, void*& state, std::string& error) = 0;
   virtual bool step(void* state, int token, long position,
                     std::vector<float>& logits, std::string& error) = 0;
+  // Optional single-pass seeded prefill on THE SAME fresh open() state.
+  // Output contains only the final token's VOC logits; state must be ready
+  // for continuation at absolute position prompt.size() on 'seeded'.
+  // 'unsupported' MUST leave state completely untouched, so the scheduler
+  // can execute the legacy token-by-token prompt loop on that same state.
+  // 'failed' may leave state poisoned/freed: scheduler NEVER retries or
+  // replays, only calls close() and sends terminal failure. close() must be
+  // safe when the underlying prefill implementation already freed GPU data.
+  virtual PrefillResult prefill(void* state, const std::vector<int>& prompt,
+                               std::vector<float>& last_logits,
+                               std::string& error) {
+    (void)state;
+    (void)prompt;
+    last_logits.clear();
+    error.clear();
+    return PrefillResult::unsupported;
+  }
   virtual void close(void* state) noexcept = 0;
 };
 
@@ -176,7 +204,9 @@ class ContinuousScheduler {
   void finish(const std::shared_ptr<Job>& job, JobStatus status,
               const std::string& error = {});
   void expire_waiting(SchedulerClock::time_point now);
-  void promote(std::size_t& remaining_admissions);
+  void promote(std::size_t& remaining_admissions,
+               SchedulerClock::time_point logical_now,
+               SchedulerClock::time_point entered_at);
   void emit_event(const std::shared_ptr<Job>& job, EventKind kind, int token_id = -1);
   bool closed(JobStatus status) const;
   void trim_finished_locked();
@@ -201,6 +231,9 @@ class PP2StepBackend final : public StepBackend {
   bool open(int capacity, void*& state, std::string& error) override;
   bool step(void* state, int token, long position,
             std::vector<float>& logits, std::string& error) override;
+  PrefillResult prefill(void* state, const std::vector<int>& prompt,
+                       std::vector<float>& last_logits,
+                       std::string& error) override;
   void close(void* state) noexcept override;
 };
 #endif

@@ -66,6 +66,7 @@ struct Config {
   int gpu0_start_limit_mib = 2000;
   int gpu1_start_limit_mib = 2500;
   bool continuous_scheduler = false; // Experimental opt-in; legacy is default.
+  bool batched_prefill = false;       // Opt-in seeded PP2 prefill for prompts of <=64.
 };
 
 void usage(FILE* out) {
@@ -74,6 +75,7 @@ void usage(FILE* out) {
     "[--active 1..16] [--queue 1..32] [--context 1..8192] [--api-key KEY | --api-key-file FILE]\n"
     "Optional: --tokenizer FILE --gguf-dump FILE --python FILE --model-id ID\n"
     "Experimental: --continuous-scheduler (single-owner PP2 scheduler, opt-in)\n"
+    "Experimental: --batched-prefill (seed fresh PP2 state for prompts of 1..64 tokens)\n"
     "Greedy text-only PP2; context defaults to 128. Unsupported sampling/tools are rejected.\n");
 }
 
@@ -92,6 +94,7 @@ bool parse_args(int argc, char** argv, Config& cfg, bool& show_help) {
     std::string arg = argv[i];
     if (arg == "--help" || arg == "-h") { usage(stdout); show_help = true; return false; }
     if (arg == "--continuous-scheduler") { cfg.continuous_scheduler = true; continue; }
+    if (arg == "--batched-prefill") { cfg.batched_prefill = true; continue; }
     if (i + 1 >= argc) { std::fprintf(stderr, "missing value for %s\n", arg.c_str()); return false; }
     const char* value = argv[++i];
     if (arg == "--model") cfg.model = value;
@@ -294,6 +297,8 @@ struct Metrics {
   std::atomic<std::uint64_t> requests{0}, accepted{0}, completed{0}, rejected{0};
   std::atomic<std::uint64_t> cancelled{0}, errors{0}, prompt_tokens{0}, completion_tokens{0};
   std::atomic<std::uint64_t> stream_backpressure{0};
+  std::atomic<std::uint64_t> prefill_attempts{0}, prefill_seeded{0};
+  std::atomic<std::uint64_t> prefill_failed{0}, prefill_prompt_tokens{0};
 };
 
 struct Job {
@@ -361,6 +366,22 @@ class ServerContinuousBackend final : public pp2batch::StepBackend {
                               position, error);
     return !logits.empty();
   }
+  pp2batch::PrefillResult prefill(
+      void* state, const std::vector<int>& prompt,
+      std::vector<float>& last_logits, std::string& error) override {
+    if (!state || prompt.empty() || prompt.size() > 64)
+      return pp2batch::PrefillResult::unsupported;
+    pp2::Stats stats;
+    auto full_logits = pp2::prefill_into_decode_state(
+        prompt, *static_cast<pp2::DecodeState*>(state), stats, error);
+    if (full_logits.empty()) return pp2batch::PrefillResult::failed;
+    if (full_logits.size() != prompt.size() * static_cast<std::size_t>(kVocab)) {
+      error = "seeded prefill returned unexpected T*VOC logits count";
+      return pp2batch::PrefillResult::failed;
+    }
+    last_logits.assign(full_logits.end() - kVocab, full_logits.end());
+    return pp2batch::PrefillResult::seeded;
+  }
   void close(void* state) noexcept override {
     if (!state) return;
     auto* decoder = static_cast<pp2::DecodeState*>(state);
@@ -374,7 +395,7 @@ class Scheduler {
  public:
   Scheduler(TokenizerBridge& tokenizer, int eos, const Config& cfg)
       : tokenizer_(tokenizer), eos_(eos), active_limit_(cfg.active), queue_limit_(cfg.queued),
-        queue_timeout_(cfg.queue_timeout_sec) {
+        queue_timeout_(cfg.queue_timeout_sec), batched_prefill_(cfg.batched_prefill) {
     if (cfg.continuous_scheduler) {
       backend_ = std::make_unique<ServerContinuousBackend>();
       pp2batch::SchedulerConfig options;
@@ -386,6 +407,7 @@ class Scheduler {
       options.steps_per_tick = static_cast<std::size_t>(cfg.active);
       options.queue_timeout = std::chrono::seconds(cfg.queue_timeout_sec);
       options.max_retained = 64;
+      options.enable_batched_prefill = cfg.batched_prefill;
       options.on_event = [this](const pp2batch::SchedulerEvent& event) {
         continuous_event(event);
       };
@@ -452,6 +474,10 @@ class Scheduler {
 
   std::string metrics_text(const std::string& model) {
     std::size_t queued = 0, active = 0;
+    std::uint64_t prefill_attempts = metrics_.prefill_attempts.load();
+    std::uint64_t prefill_seeded = metrics_.prefill_seeded.load();
+    std::uint64_t prefill_failed = metrics_.prefill_failed.load();
+    std::uint64_t prefill_tokens = metrics_.prefill_prompt_tokens.load();
     {
       std::lock_guard<std::mutex> lock(mutex_);
       if (!continuous_) { queued = queue_.size(); active = active_.size(); }
@@ -460,6 +486,10 @@ class Scheduler {
       const auto current = continuous_->metrics();
       queued = current.queued;
       active = current.active;
+      prefill_attempts = current.prefill_attempts_total;
+      prefill_seeded = current.prefill_seeded_total;
+      prefill_failed = current.prefill_failed_total;
+      prefill_tokens = current.prefill_prompt_tokens_total;
     }
     size_t used0 = 0, used1 = 0;
     pp2batch::vram_used(used0, used1);
@@ -472,6 +502,10 @@ class Scheduler {
     out += "# TYPE hermes_requests_rejected_total counter\nhermes_requests_rejected_total " + std::to_string(m.rejected.load()) + "\n";
     out += "# TYPE hermes_requests_cancelled_total counter\nhermes_requests_cancelled_total " + std::to_string(m.cancelled.load()) + "\n";
     out += "# TYPE hermes_stream_backpressure_total counter\nhermes_stream_backpressure_total " + std::to_string(m.stream_backpressure.load()) + "\n";
+    out += "# TYPE hermes_prefill_attempts_total counter\nhermes_prefill_attempts_total " + std::to_string(prefill_attempts) + "\n";
+    out += "# TYPE hermes_prefill_seeded_total counter\nhermes_prefill_seeded_total " + std::to_string(prefill_seeded) + "\n";
+    out += "# TYPE hermes_prefill_failed_total counter\nhermes_prefill_failed_total " + std::to_string(prefill_failed) + "\n";
+    out += "# TYPE hermes_prefill_prompt_tokens_total counter\nhermes_prefill_prompt_tokens_total " + std::to_string(prefill_tokens) + "\n";
     out += "# TYPE hermes_inference_errors_total counter\nhermes_inference_errors_total " + std::to_string(m.errors.load()) + "\n";
     out += "# TYPE hermes_requests_active gauge\nhermes_requests_active " + std::to_string(active) + "\n";
     out += "# TYPE hermes_requests_queued gauge\nhermes_requests_queued " + std::to_string(queued) + "\n";
@@ -799,6 +833,108 @@ class Scheduler {
     return true;
   }
 
+  // Handles a token from either legacy step-by-step prompt consumption or
+  // a seeded batched prefill. All SSE, stop, usage and terminal semantics
+  // share exactly this code; a caller must never feed the same token twice.
+  bool legacy_token(const std::shared_ptr<Job>& job, int token) {
+    job->output.push_back(token);
+    if (job->stream_started) {
+      try {
+        const std::string delta = tokenizer_.stream_push(job->id, token);
+        if (job->stops.empty()) job->text += delta;
+        else {
+          job->decoded_text += delta;
+          update_visible_text(*job, false);
+        }
+      } catch (const std::exception& e) {
+        complete(job, 500, std::string("incremental detokenization failed: ") + e.what(), "length");
+        return true;
+      }
+      stream_text(job);
+    } else if (!job->stops.empty()) {
+      // Unsupported non-ByteLevel tokenizers use reference decoding for
+      // stop checks, but emit only completed SSE text.
+      try {
+        job->decoded_text = tokenizer_.decode(job->output);
+        update_visible_text(*job, false);
+      } catch (const std::exception& e) {
+        complete(job, 500, std::string("stop decoding failed: ") + e.what(), "length");
+        return true;
+      }
+    }
+    if (job->stop_matched || token == eos_) {
+      complete(job, 200, {}, "stop");
+      return true;
+    }
+    if (static_cast<int>(job->output.size()) >= job->max_new_tokens) {
+      complete(job, 200, {}, "length");
+      return true;
+    }
+    return false;
+  }
+
+  // The state must be freshly allocated and untouched. pp2::prefill_into_
+  // decode_state is the ONLY writer of prompt positions 0..T-1. It returns
+  // T*VOC logits and invalidates/frees the state on failure; never retry the
+  // old token-by-token loop on a partially seeded state.
+  bool seed_legacy_prompt(const std::shared_ptr<Job>& job) {
+    if (!batched_prefill_ || job->prompt.size() > 64) return false;
+    metrics_.prefill_attempts.fetch_add(1);
+    pp2::Stats prefill_stats;
+    std::string error;
+    std::vector<float> logits;
+    try {
+      logits = pp2::prefill_into_decode_state(
+          job->prompt, job->state, prefill_stats, error);
+    } catch (const std::exception& e) {
+      error = e.what();
+    } catch (...) {
+      error = "unknown seeded prefill exception";
+    }
+    if (logits.size() != job->prompt.size() * static_cast<std::size_t>(kVocab)) {
+      metrics_.prefill_failed.fetch_add(1);
+      // The PP2 helper normally frees/invalidates state on a failure;
+      // rare early guard errors can leave it initialized. Never leak or
+      // double-free: complete() consults the actual inited marker.
+      job->state_ready = job->state.inited;
+      complete(job, 500,
+               "PP2 seeded prefill failed: " +
+                   (error.empty() ? "invalid logits shape" : error),
+               "length");
+      return true;
+    }
+    if (job->cancel.load()) {
+      complete(job, 200, {}, "cancelled");
+      return true;
+    }
+    const float* last = logits.data() +
+        (job->prompt.size() - 1) * static_cast<std::size_t>(kVocab);
+    int token = -1;
+    float best = -std::numeric_limits<float>::infinity();
+    for (int t = 0; t < kVocab; ++t) {
+      if (!std::isfinite(last[t])) {
+        metrics_.prefill_failed.fetch_add(1);
+        complete(job, 500, "PP2 seeded prefill non-finite final logit", "length");
+        return true;
+      }
+      if (last[t] > best) {
+        best = last[t];
+        token = t;
+      }
+    }
+    if (token < 0) {
+      metrics_.prefill_failed.fetch_add(1);
+      complete(job, 500, "PP2 seeded prefill greedy selection failed", "length");
+      return true;
+    }
+    // The prompt is now entirely represented in GDN/conv/KV. The NEXT
+    // pp2::decode_step consumes this generated token at absolute pos T.
+    job->prompt_pos = job->prompt.size();
+    metrics_.prefill_seeded.fetch_add(1);
+    metrics_.prefill_prompt_tokens.fetch_add(job->prompt.size());
+    return legacy_token(job, token);
+  }
+
   void run() {
     if (continuous_) { run_continuous(); return; }
     for (;;) {
@@ -864,6 +1000,8 @@ class Scheduler {
             continue;
           }
         }
+        if (seed_legacy_prompt(job)) continue; // terminal/error; no double enqueue
+        if (job->cancel.load()) { complete(job, 200, {}, "cancelled"); continue; }
         {
           std::lock_guard<std::mutex> lock(mutex_);
           active_.push_back(job);
@@ -921,34 +1059,7 @@ class Scheduler {
           if (value > best) { best = value; token = static_cast<int>(t); }
         }
         if (token < 0) { complete(job, 500, "greedy selection failed: " + errors[i], "length"); finished.push_back(job); continue; }
-        job->output.push_back(token);
-        if (job->stream_started) {
-          try {
-            const std::string delta = tokenizer_.stream_push(job->id, token);
-            if (job->stops.empty()) job->text += delta;
-            else {
-              job->decoded_text += delta;
-              update_visible_text(*job, false);
-            }
-          }
-          catch (const std::exception& e) { complete(job, 500, std::string("incremental detokenization failed: ") + e.what(), "length"); finished.push_back(job); continue; }
-          stream_text(job);
-        } else if (!job->stops.empty()) {
-          // Safe fallback for non-ByteLevel tokenizers: detect stop strings
-          // against the reference decoder, but stream only the final text.
-          try {
-            job->decoded_text = tokenizer_.decode(job->output);
-            update_visible_text(*job, false);
-          } catch (const std::exception& e) {
-            complete(job, 500, std::string("stop decoding failed: ") + e.what(), "length");
-            finished.push_back(job);
-            continue;
-          }
-        }
-        if (job->stop_matched || token == eos_) { complete(job, 200, {}, "stop"); finished.push_back(job); }
-        else if (static_cast<int>(job->output.size()) >= job->max_new_tokens) {
-          complete(job, 200, {}, "length"); finished.push_back(job);
-        }
+        if (legacy_token(job, token)) finished.push_back(job);
       }
       if (!finished.empty()) {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -962,6 +1073,7 @@ class Scheduler {
   TokenizerBridge& tokenizer_;
   int eos_;
   int active_limit_, queue_limit_, queue_timeout_;
+  bool batched_prefill_ = false;
   mutable std::mutex mutex_;
   std::condition_variable cv_;
   std::deque<std::shared_ptr<Job>> queue_;
@@ -1198,6 +1310,14 @@ int main(int argc, char** argv) {
   Config cfg;
   bool show_help = false;
   if (!parse_args(argc, argv, cfg, show_help)) return show_help ? 0 : 2;
+  if (cfg.batched_prefill) {
+    const char* bf16 = std::getenv("HERMES_PP2_PREFILL_BF16");
+    if (bf16 && std::strcmp(bf16, "1") == 0) {
+      std::fprintf(stderr,
+          "HERMES_PP2_PREFILL_BF16=1 is not supported by serving: strict fail-closed (raw-only prefill)\n");
+      return 2;
+    }
+  }
   if (!cfg.api_key_file.empty()) {
     if (!cfg.api_key.empty()) {
       std::fprintf(stderr, "choose --api-key or --api-key-file, not both\n");

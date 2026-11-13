@@ -12,7 +12,8 @@ PYTHON="${HERMES_TEST_PYTHON:-/opt/hermes/runtimes/exllamav3-venv/bin/python}"
 PORT="${HERMES_TEST_PORT:-18127}"
 MODE="${HERMES_TEST_MODE:-async}"
 SCHEDULER="${HERMES_TEST_SCHEDULER:-legacy}"
-LOG="${ROOT}/http-smoke-${MODE}-${SCHEDULER}.log"
+PREFILL="${HERMES_TEST_BATCHED_PREFILL:-0}"
+LOG="${ROOT}/http-smoke-${MODE}-${SCHEDULER}-seed${PREFILL}.log"
 SERVER_PID=""
 
 for file in "${BUILD}/hermes_server" "${BUILD}/gguf_dump" "${SOURCE}/serving/tokenizer_bridge.py" "${SOURCE}/serving/smoke.py" "${MODEL}" "${TOKENIZER}" "${PYTHON}"; do
@@ -31,6 +32,10 @@ if [[ "$MODE" != "async" && "$MODE" != "legacy" ]]; then
 fi
 if [[ "$SCHEDULER" != "continuous" && "$SCHEDULER" != "legacy" ]]; then
   echo "BLOCKED: HERMES_TEST_SCHEDULER must be continuous or legacy" >&2
+  exit 77
+fi
+if [[ "$PREFILL" != 0 && "$PREFILL" != 1 ]]; then
+  echo "BLOCKED: HERMES_TEST_BATCHED_PREFILL must be 0 or 1" >&2
   exit 77
 fi
 if ss -ltnH "( sport = :${PORT} )" | grep -q .; then
@@ -57,6 +62,8 @@ fi
 export HERMES_NVFP4_GEMV=packed4
 export HERMES_HEAD_BF16=warp4
 export HERMES_DECODE_SKIP_LAYER_SYNC=1
+# BF16 full-model T64 quality is not approved. Keep this A/B strictly RAW.
+unset HERMES_PP2_PREFILL_BF16 HERMES_PP2_CHUNKED_PREFILL || true
 if [[ "$MODE" == "async" ]]; then
   export HERMES_PP2_ASYNC_STREAMS=1
 else
@@ -65,6 +72,9 @@ fi
 scheduler_args=()
 if [[ "$SCHEDULER" == "continuous" ]]; then
   scheduler_args+=(--continuous-scheduler)
+fi
+if [[ "$PREFILL" == 1 ]]; then
+  scheduler_args+=(--batched-prefill)
 fi
 
 cleanup() {
@@ -103,10 +113,29 @@ if [[ "$ready" != 1 ]]; then
   tail -n 40 "$LOG" >&2
   exit 1
 fi
-echo "SCRATCH SERVER READY mode=$MODE scheduler=$SCHEDULER port=$PORT"
+echo "SCRATCH SERVER READY mode=$MODE scheduler=$SCHEDULER batched_prefill=$PREFILL port=$PORT"
 timeout --signal=TERM --kill-after=10 175 "$PYTHON" -B "${SOURCE}/serving/smoke.py" \
   --base-url "http://127.0.0.1:${PORT}" --model hermes-27
-echo "SCRATCH HTTP GPU SMOKE: PASS mode=$MODE scheduler=$SCHEDULER"
+metrics="$(curl --fail --silent --max-time 10 "http://127.0.0.1:${PORT}/metrics")"
+metric_value() {
+  printf '%s\n' "$metrics" | awk -v name="$1" '$1 == name { print $2 }'
+}
+seeded="$(metric_value hermes_prefill_seeded_total)"
+failed="$(metric_value hermes_prefill_failed_total)"
+prompt_tokens="$(metric_value hermes_prefill_prompt_tokens_total)"
+if [[ ! "$seeded" =~ ^[0-9]+$ || ! "$failed" =~ ^[0-9]+$ ||
+      ! "$prompt_tokens" =~ ^[0-9]+$ ]]; then
+  echo "FAIL: missing numeric prefill counters from real HTTP server" >&2
+  exit 1
+fi
+if (( failed != 0 )) ||
+   { [[ "$PREFILL" == 1 ]] && (( seeded < 1 || prompt_tokens < 1 )); } ||
+   { [[ "$PREFILL" == 0 ]] && (( seeded != 0 || prompt_tokens != 0 )); }; then
+  echo "FAIL: prefill counters do not match opt-in policy (seeded=$seeded failed=$failed tokens=$prompt_tokens flag=$PREFILL)" >&2
+  exit 1
+fi
+echo "REAL HTTP PREFILL COUNTERS: PASS seeded=$seeded failed=$failed tokens=$prompt_tokens flag=$PREFILL"
+echo "SCRATCH HTTP GPU SMOKE: PASS mode=$MODE scheduler=$SCHEDULER batched_prefill=$PREFILL"
 if [[ "${HERMES_TEST_LOAD:-0}" == 1 ]]; then
   if [[ "${HERMES_TEST_LOAD_STYLE:-arithmetic}" == "explain" ]]; then
     timeout --signal=TERM --kill-after=10 175 "$PYTHON" -B "${SOURCE}/scripts/scratch_http_load.py" \
@@ -117,5 +146,5 @@ if [[ "${HERMES_TEST_LOAD:-0}" == 1 ]]; then
       --base-url "http://127.0.0.1:${PORT}" --clients 1 2 4 8 --rounds 2 \
       --max-tokens 8 --prompt-style arithmetic
   fi
-  echo "SCRATCH HTTP CONCURRENCY: PASS mode=$MODE scheduler=$SCHEDULER"
+  echo "SCRATCH HTTP CONCURRENCY: PASS mode=$MODE scheduler=$SCHEDULER batched_prefill=$PREFILL"
 fi

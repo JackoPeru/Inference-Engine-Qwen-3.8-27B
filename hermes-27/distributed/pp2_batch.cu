@@ -407,8 +407,14 @@ void ContinuousScheduler::expire_waiting(SchedulerClock::time_point now) {
   for (const auto& job : expired) finish(job, JobStatus::expired, "queue timeout");
 }
 
-void ContinuousScheduler::promote(std::size_t& remaining_admissions) {
+void ContinuousScheduler::promote(std::size_t& remaining_admissions,
+                                  SchedulerClock::time_point logical_now,
+                                  SchedulerClock::time_point entered_at) {
   for (;;) {
+    // A seeded prefill can spend substantial time in a single CUDA call.
+    // Re-evaluate the waiting queue deadline before EACH next admission,
+    // otherwise a later request may start despite an expired wait deadline.
+    expire_waiting(logical_now + (SchedulerClock::now() - entered_at));
     std::shared_ptr<Job> job;
     {
       std::lock_guard<std::mutex> guard(mutex_);
@@ -459,8 +465,103 @@ void ContinuousScheduler::promote(std::size_t& remaining_admissions) {
         running_.push_back(job);
       }
     }
-    if (cancelled) finish(job, JobStatus::cancelled);
-    else emit_event(job, EventKind::admitted);
+    if (cancelled) {
+      finish(job, JobStatus::cancelled);
+      continue;
+    }
+
+    // Explicit opt-in: seed the SAME freshly opened state in a single
+    // T-token PP2 pass, before HTTP sees 'admitted'. An attempted prefill
+    // may poison/deallocate the GPU state on failure. NEVER replay the prompt
+    // or allocate a second state after PrefillResult::failed.
+    if (config_.enable_batched_prefill && job->request.prompt.size() <= 64) {
+      std::vector<float> last_logits;
+      std::string prefill_error;
+      PrefillResult result = PrefillResult::failed;
+      try {
+        result = backend_.prefill(state, job->request.prompt,
+                                  last_logits, prefill_error);
+      } catch (const std::exception& e) {
+        prefill_error = e.what();
+      } catch (...) {
+        prefill_error = "backend seeded prefill threw an unknown exception";
+      }
+      {
+        std::lock_guard<std::mutex> guard(mutex_);
+        ++counters_.prefill_attempts_total;
+        if (result == PrefillResult::seeded) {
+          ++counters_.prefill_seeded_total;
+          counters_.prefill_prompt_tokens_total += job->request.prompt.size();
+        } else if (result == PrefillResult::unsupported) {
+          ++counters_.prefill_unsupported_total;
+        } else {
+          ++counters_.prefill_failed_total;
+        }
+        cancelled = job->cancel_requested || stopping_;
+      }
+      if (cancelled) {
+        finish(job, JobStatus::cancelled);
+        continue;
+      }
+      if (result == PrefillResult::failed) {
+        finish(job, JobStatus::failed,
+               "PP2 seeded prefill failed: " +
+               (prefill_error.empty() ? "invalid or poisoned state" : prefill_error));
+        continue;
+      }
+      if (result == PrefillResult::seeded) {
+        // Only the final prompt position yields the first completion token;
+        // the T-1 earlier logits must never count toward usage or SSE.
+        if (last_logits.size() != static_cast<size_t>(config_.vocab_size)) {
+          finish(job, JobStatus::failed, "PP2 seeded prefill invalid final logits size");
+          continue;
+        }
+        int best_id = -1;
+        float best = -std::numeric_limits<float>::infinity();
+        for (size_t i = 0; i < last_logits.size(); ++i) {
+          if (!std::isfinite(last_logits[i])) { best_id = -1; break; }
+          if (last_logits[i] > best) {
+            best = last_logits[i];
+            best_id = static_cast<int>(i);
+          }
+        }
+        if (best_id < 0) {
+          finish(job, JobStatus::failed, "PP2 seeded prefill invalid/nonfinite logits");
+          continue;
+        }
+        {
+          std::lock_guard<std::mutex> guard(mutex_);
+          job->prompt_consumed = job->request.prompt.size();
+        }
+        // Guarantee event order: admitted -> token -> optional terminal.
+        // An admitted callback may cancel for disconnected/backpressured SSE.
+        emit_event(job, EventKind::admitted);
+        {
+          std::lock_guard<std::mutex> guard(mutex_);
+          cancelled = job->cancel_requested || stopping_;
+          if (!cancelled) job->generated.push_back(best_id);
+        }
+        if (cancelled) {
+          finish(job, JobStatus::cancelled);
+          continue;
+        }
+        emit_event(job, EventKind::token, best_id);
+        bool done, cancelled_now;
+        {
+          std::lock_guard<std::mutex> guard(mutex_);
+          cancelled_now = job->cancel_requested || stopping_;
+          done = job->generated.size() >=
+                     static_cast<size_t>(job->request.max_new_tokens) ||
+                 best_id == config_.eos_token_id;
+        }
+        if (done || cancelled_now)
+          finish(job, cancelled_now ? JobStatus::cancelled : JobStatus::completed);
+        continue;
+      }
+      // 'unsupported' guarantees no state mutation: normal prompt steps
+      // start from position 0 on this same allocated DecodeState.
+    }
+    emit_event(job, EventKind::admitted);
   }
 }
 
@@ -489,7 +590,7 @@ std::size_t ContinuousScheduler::tick(SchedulerClock::time_point now) {
       if (stopping_) break; // shutdown can flag stop while a GPU step runs
     }
     expire_waiting(effective_now());
-    promote(remaining_admissions);
+    promote(remaining_admissions, now, entered_at);
     std::shared_ptr<Job> job;
     {
       std::lock_guard<std::mutex> guard(mutex_);
@@ -650,6 +751,34 @@ bool PP2StepBackend::step(void* state, int token, long position,
   }
   logits = pp2::decode_step(token, ds, position, error);
   return !logits.empty();
+}
+
+PrefillResult PP2StepBackend::prefill(void* state,
+                                     const std::vector<int>& prompt,
+                                     std::vector<float>& last_logits,
+                                     std::string& error) {
+  last_logits.clear();
+  if (prompt.empty() || prompt.size() > 64)
+    return PrefillResult::unsupported; // untouched; caller may step normally
+  if (!state) {
+    error = "null PP2 prefill state";
+    return PrefillResult::failed;
+  }
+  auto& ds = *static_cast<pp2::DecodeState*>(state);
+  if (!ds.inited || ds.ever_advanced || prompt.size() > static_cast<size_t>(ds.capacity)) {
+    error = "PP2 seeded prefill requires an untouched allocated state";
+    return PrefillResult::failed;
+  }
+  pp2::Stats stats;
+  const std::vector<float> full =
+      pp2::prefill_into_decode_state(prompt, ds, stats, error);
+  constexpr size_t VOC = 248320u;
+  if (full.size() != prompt.size() * VOC) {
+    if (error.empty()) error = "seeded prefill returned incomplete logits";
+    return PrefillResult::failed;
+  }
+  last_logits.assign(full.end() - VOC, full.end());
+  return PrefillResult::seeded;
 }
 
 void PP2StepBackend::close(void* state) noexcept {

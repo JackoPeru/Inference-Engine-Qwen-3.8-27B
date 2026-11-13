@@ -57,9 +57,14 @@ struct FakeBackend final : pp2batch::StepBackend {
   int attempts = 0, opens = 0, closes = 0, live = 0, peak_live = 0;
   bool fail_next_open = false, fail_next_step = false, wrong_logits = false;
   bool nan_logits = false, throw_step = false;
+  bool support_prefill = false, fail_next_prefill = false;
+  bool wrong_prefill_logits = false, nan_prefill_logits = false, throw_prefill = false;
+  int prefill_calls = 0;
+  std::vector<std::vector<int>> prefill_prompts;
   std::vector<Call> calls;
   std::function<void()> during_open;
   std::function<void()> during_step;
+  std::function<void()> during_prefill;
 
   bool open(int capacity, void*& state, std::string& error) override {
     state = nullptr;
@@ -97,6 +102,33 @@ struct FakeBackend final : pp2batch::StepBackend {
     logits[2] = 1.f; // deterministic greedy token; EOS=7 never selected
     return true;
   }
+  pp2batch::PrefillResult prefill(void* p, const std::vector<int>& prompt,
+                                 std::vector<float>& last_logits,
+                                 std::string& error) override {
+    ++prefill_calls;
+    prefill_prompts.push_back(prompt);
+    if (!support_prefill) return pp2batch::PrefillResult::unsupported;
+    auto* s = static_cast<State*>(p);
+    if (prompt.empty() || prompt.size() > 64 ||
+        prompt.size() > static_cast<size_t>(s->capacity) || s->next_pos != 0) {
+      error = "prefill requires fresh state and bounded prompt";
+      return pp2batch::PrefillResult::failed;
+    }
+    // The mock represents the exact one-pass persistent GDN/KV mutation.
+    s->next_pos = static_cast<int>(prompt.size());
+    if (during_prefill) during_prefill();
+    if (throw_prefill) throw std::runtime_error("injected seeded prefill exception");
+    if (fail_next_prefill) {
+      fail_next_prefill = false;
+      error = "injected partially seeded state failure";
+      return pp2batch::PrefillResult::failed;
+    }
+    last_logits.assign(wrong_prefill_logits ? 3u : 8u, -1.f);
+    if (nan_prefill_logits) last_logits[0] =
+        std::numeric_limits<float>::quiet_NaN();
+    last_logits[2] = 1.f;
+    return pp2batch::PrefillResult::seeded;
+  }
   void close(void* p) noexcept override {
     delete static_cast<State*>(p);
     ++closes;
@@ -131,6 +163,329 @@ bool has_status(pp2batch::ContinuousScheduler& s, const std::string& id,
 int run_scheduler_tests() {
   using namespace pp2batch;
   using namespace std::chrono;
+  // Stateful seeded prefill consumes the full prompt on the SAME newly
+  // allocated backend state, emits only the LAST prompt logit's greedy token,
+  // and resumes the normal decoder at absolute position T (never replays).
+  for (int t : {1, 11, 64}) {
+    FakeBackend backend;
+    backend.support_prefill = true;
+    auto cfg = config();
+    cfg.enable_batched_prefill = true;
+    cfg.max_context = 128;
+    cfg.steps_per_tick = 8;
+    std::vector<SchedulerEvent> events;
+    cfg.on_event = [&](const SchedulerEvent& e) { events.push_back(e); };
+    ContinuousScheduler s(cfg, backend);
+    std::vector<int> prompt(static_cast<size_t>(t), 3);
+    const std::string id = "seeded-" + std::to_string(t);
+    expect(s.enqueue({id, prompt, 3}).code == SubmitCode::accepted,
+           "seeded short prompt accepted");
+    expect(s.tick() == 2, "seeded pass followed by exactly two decode steps");
+    JobSnapshot snapshot;
+    expect(s.inspect(id, snapshot) && snapshot.status == JobStatus::completed &&
+           snapshot.prompt_consumed == static_cast<size_t>(t) &&
+           snapshot.generated == std::vector<int>({2, 2, 2}),
+           "seeded completion usage matches incremental token accounting");
+    expect(backend.prefill_calls == 1 &&
+           backend.prefill_prompts == std::vector<std::vector<int>>({prompt}) &&
+           backend.calls.size() == 2 && backend.calls[0].pos == t &&
+           backend.calls[1].pos == t + 1,
+           "seeded cache continuation starts at T without double-seed");
+    expect(backend.opens == 1 && backend.closes == 1 && backend.live == 0,
+           "seeded request uses exactly one allocated/deallocated state");
+    auto m = s.metrics();
+    expect(m.prefill_attempts_total == 1 && m.prefill_seeded_total == 1 &&
+           m.prefill_prompt_tokens_total == static_cast<size_t>(t) &&
+           m.decode_steps_total == 2 && m.prefill_failed_total == 0,
+           "seeded metrics distinguish prompt prefill from decode steps");
+    expect(events.size() == 5 &&
+           events[0].kind == EventKind::admitted &&
+           events[0].prompt_consumed == static_cast<size_t>(t) &&
+           events[1].kind == EventKind::token && events[1].token_id == 2 &&
+           events[2].kind == EventKind::token &&
+           events[3].kind == EventKind::token &&
+           events[4].kind == EventKind::terminal &&
+           events[4].status == JobStatus::completed &&
+           events[4].generated == std::vector<int>({2, 2, 2}),
+           "seeded events admitted/token/token/token/terminal exact order");
+  }
+  {
+    FakeBackend backend;
+    backend.support_prefill = true;
+    auto cfg = config();
+    cfg.enable_batched_prefill = true;
+    cfg.max_context = 128;
+    cfg.eos_token_id = 2;
+    std::vector<EventKind> kinds;
+    cfg.on_event = [&](const SchedulerEvent& e) { kinds.push_back(e.kind); };
+    ContinuousScheduler s(cfg, backend);
+    s.enqueue({"seed-eos", std::vector<int>(11, 1), 8});
+    expect(s.tick() == 0 && has_status(s, "seed-eos", JobStatus::completed, 1),
+           "seeded EOS completes without an extra decode call");
+    expect(kinds == std::vector<EventKind>({
+             EventKind::admitted, EventKind::token, EventKind::terminal}) &&
+           backend.prefill_calls == 1 && backend.calls.empty() && backend.live == 0,
+           "seeded first-token EOS callback and release exactly once");
+  }
+  // Flag-off is byte-for-byte legacy behavior even if backend supports
+  // prefill. Unsupported MUST leave state untouched for legal fallback.
+  {
+    FakeBackend backend;
+    backend.support_prefill = true;
+    auto cfg = config();
+    cfg.steps_per_tick = 4;
+    ContinuousScheduler s(cfg, backend);
+    s.enqueue({"default-off", {1, 2, 3}, 2});
+    expect(s.tick() == 4 && has_status(s, "default-off", JobStatus::completed, 2),
+           "default-off consumes all prompt tokens incrementally");
+    expect(backend.prefill_calls == 0 && backend.calls.size() == 4 &&
+           backend.calls[0].pos == 0 && backend.calls[3].pos == 3,
+           "flag-off never touches experimental backend prefill");
+  }
+  {
+    FakeBackend backend; // prefill intentionally unsupported by default
+    auto cfg = config();
+    cfg.enable_batched_prefill = true;
+    cfg.steps_per_tick = 4;
+    ContinuousScheduler s(cfg, backend);
+    s.enqueue({"unsupported", {1, 2, 3}, 2});
+    expect(s.tick() == 4 && has_status(s, "unsupported", JobStatus::completed, 2),
+           "unsupported prefill falls back only on untouched same state");
+    expect(backend.prefill_calls == 1 && backend.calls.size() == 4 &&
+           backend.opens == 1 && backend.closes == 1,
+           "unsupported fallback never duplicates state or token");
+    expect(s.metrics().prefill_unsupported_total == 1 &&
+           s.metrics().prefill_seeded_total == 0,
+           "unsupported fallback metrics exact");
+  }
+  // Prompt T>64 MUST bypass experimental prefill and use normal absolute
+  // positions. No backend.prefill() call is allowed for long prompts.
+  {
+    FakeBackend backend;
+    backend.support_prefill = true;
+    auto cfg = config();
+    cfg.enable_batched_prefill = true;
+    cfg.max_context = 128;
+    cfg.steps_per_tick = 16;
+    ContinuousScheduler s(cfg, backend);
+    s.enqueue({"long65", std::vector<int>(65, 1), 1});
+    size_t calls = 0;
+    for (int i = 0; i < 6; ++i) calls += s.tick();
+    expect(calls == 65 && has_status(s, "long65", JobStatus::completed, 1),
+           "T65 legacy fallback consumes exactly 65 tokens");
+    expect(backend.prefill_calls == 0 && backend.calls.size() == 65 &&
+           backend.calls.back().pos == 64 && backend.live == 0,
+           "long fallback never invokes prefill or doubles state");
+  }
+  // Multi-user mixed 1/11/64/65 prompt lengths share weights but never
+  // share per-request S/CS/KV; the fourth request must use fallback while
+  // the first three resume generated tokens at their own absolute positions.
+  {
+    FakeBackend backend;
+    backend.support_prefill = true;
+    auto cfg = config();
+    cfg.enable_batched_prefill = true;
+    cfg.max_active = 4;
+    cfg.max_queued = 4;
+    cfg.max_context = 128;
+    cfg.steps_per_tick = 4;
+    cfg.queue_timeout = hours(1);
+    std::vector<SchedulerEvent> events;
+    cfg.on_event = [&](const SchedulerEvent& e) { events.push_back(e); };
+    ContinuousScheduler s(cfg, backend);
+    for (int t : {1, 11, 64, 65})
+      expect(s.enqueue({"mix-" + std::to_string(t),
+                        std::vector<int>(static_cast<size_t>(t), 1), 2}).code ==
+             SubmitCode::accepted, "mixed seeded+fallback request accepted");
+    std::size_t decoded = 0;
+    for (int i = 0; i < 40; ++i) decoded += s.tick();
+    for (int t : {1, 11, 64, 65})
+      expect(has_status(s, "mix-" + std::to_string(t),
+                        JobStatus::completed, 2),
+             "mixed request completed with exactly two sampled output IDs");
+    expect(decoded == 69 && backend.calls.size() == 69 &&
+           backend.prefill_calls == 3,
+           "mixed scheduler saves 1+11+64 prompt decode steps without replay");
+    expect(backend.prefill_prompts.size() == 3 &&
+           backend.prefill_prompts[0].size() == 1 &&
+           backend.prefill_prompts[1].size() == 11 &&
+           backend.prefill_prompts[2].size() == 64,
+           "only short prompts receive one stateful prefill each");
+    expect(backend.opens == 4 && backend.closes == 4 &&
+           backend.peak_live == 4 && backend.live == 0,
+           "mixed prefill/legacy states each allocated and released once");
+    const auto m = s.metrics();
+    expect(m.prefill_attempts_total == 3 && m.prefill_seeded_total == 3 &&
+           m.prefill_prompt_tokens_total == 76 &&
+           m.decode_steps_total == 69 && m.completed_total == 4,
+           "mixed prefill metrics report exact input and decode operations");
+    std::size_t admitted = 0, tokens = 0, terminal = 0;
+    for (const auto& e : events) {
+      if (e.kind == EventKind::admitted) ++admitted;
+      if (e.kind == EventKind::token) ++tokens;
+      if (e.kind == EventKind::terminal) ++terminal;
+    }
+    expect(admitted == 4 && tokens == 8 && terminal == 4,
+           "mixed multiuser delivery exactly once per admission/output/terminal");
+  }
+  // A partially mutated/failed prefill can never be replayed token-by-token.
+  // Failure occurs before admitted, permitting the HTTP layer to send 503.
+  for (int mode = 0; mode < 4; ++mode) {
+    FakeBackend backend;
+    backend.support_prefill = true;
+    backend.fail_next_prefill = mode == 0;
+    backend.wrong_prefill_logits = mode == 1;
+    backend.nan_prefill_logits = mode == 2;
+    backend.throw_prefill = mode == 3;
+    auto cfg = config();
+    cfg.enable_batched_prefill = true;
+    std::vector<SchedulerEvent> events;
+    cfg.on_event = [&](const SchedulerEvent& e) { events.push_back(e); };
+    ContinuousScheduler s(cfg, backend);
+    s.enqueue({"bad-seed", {1, 2}, 2});
+    expect(s.tick() == 0 && has_status(s, "bad-seed", JobStatus::failed),
+           "failed or invalid seeded prefill terminates without replay");
+    expect(events.size() == 1 && events[0].kind == EventKind::terminal &&
+           events[0].status == JobStatus::failed && !events[0].error.empty(),
+           "failed seeded prefill emits single pre-admission terminal");
+    expect(backend.prefill_calls == 1 && backend.calls.empty() &&
+           backend.opens == 1 && backend.closes == 1 && backend.live == 0,
+           "failed seeded prefill closes poisoned state exactly once");
+    expect(s.metrics().prefill_failed_total == (mode == 0 || mode == 3 ? 1u : 0u),
+           "seeded backend failures counted separately from logits validation");
+  }
+  // A concurrent disconnect while prefill operates must be visible without
+  // holding a metadata mutex across PP2. Discard sampled logits on cancel.
+  {
+    FakeBackend backend;
+    backend.support_prefill = true;
+    auto cfg = config();
+    cfg.enable_batched_prefill = true;
+    std::vector<EventKind> kinds;
+    cfg.on_event = [&](const SchedulerEvent& e) { kinds.push_back(e.kind); };
+    ContinuousScheduler s(cfg, backend);
+    s.enqueue({"cancel-seed", {1, 2, 3}, 3});
+    backend.during_prefill = [&] {
+      expect(s.cancel("cancel-seed"), "cancel during seeded CUDA pass responsive");
+    };
+    expect(s.tick() == 0 && has_status(s, "cancel-seed", JobStatus::cancelled),
+           "cancelled seed discards output and never starts decode loop");
+    expect(kinds == std::vector<EventKind>({EventKind::terminal}) &&
+           backend.calls.empty() && backend.live == 0,
+           "seed cancellation returns exactly one terminal without SSE headers");
+  }
+  // SSE admission and token callbacks may cancel a seeded request. Respect
+  // transport backpressure before emitting any additional tokens.
+  for (int cancel_at = 0; cancel_at < 2; ++cancel_at) {
+    FakeBackend backend;
+    backend.support_prefill = true;
+    auto cfg = config();
+    cfg.enable_batched_prefill = true;
+    std::vector<EventKind> kinds;
+    ContinuousScheduler* scheduler = nullptr;
+    cfg.on_event = [&](const SchedulerEvent& e) {
+      kinds.push_back(e.kind);
+      if ((cancel_at == 0 && e.kind == EventKind::admitted) ||
+          (cancel_at == 1 && e.kind == EventKind::token))
+        expect(scheduler->cancel(e.id), "SSE seeded callback cancellation");
+    };
+    ContinuousScheduler s(cfg, backend);
+    scheduler = &s;
+    s.enqueue({"sse-seed", {1, 2}, 3});
+    expect(s.tick() == 0 && has_status(s, "sse-seed", JobStatus::cancelled,
+                                        cancel_at == 0 ? 0 : 1),
+           "SSE seeded cancel retains only already delivered tokens");
+    expect(kinds == (cancel_at == 0 ?
+             std::vector<EventKind>({EventKind::admitted, EventKind::terminal}) :
+             std::vector<EventKind>({EventKind::admitted, EventKind::token, EventKind::terminal})) &&
+           backend.live == 0 && backend.calls.empty(),
+           "SSE seeded cancel suppresses all further decode");
+  }
+  // Queue deadline may expire DURING a seeded prefill of a prior request,
+  // in the very same tick and before the next admission/open call.
+  {
+    FakeBackend backend;
+    backend.support_prefill = true;
+    backend.during_prefill = [] { std::this_thread::sleep_for(milliseconds(10)); };
+    auto cfg = config();
+    cfg.enable_batched_prefill = true;
+    cfg.max_active = 1;
+    cfg.queue_timeout = milliseconds(2);
+    ContinuousScheduler s(cfg, backend);
+    const auto t0 = SchedulerClock::time_point{};
+    s.enqueue({"seed-slow", {1}, 1}, t0);
+    s.enqueue({"seed-expired", {1}, 1}, t0);
+    expect(s.tick(t0) == 0 && has_status(s, "seed-slow", JobStatus::completed, 1) &&
+           has_status(s, "seed-expired", JobStatus::expired),
+           "deadline rechecked after slow seeded prefill in same tick");
+    expect(backend.prefill_calls == 1 && backend.opens == 1 && backend.live == 0,
+           "expired waiting job never gets GPU state after long prefill");
+  }
+  // Shutdown must flag all active states before waiting for a noninterruptible
+  // seeded CUDA pass. No SSE admission/first token may escape after stop.
+  {
+    FakeBackend backend;
+    backend.support_prefill = true;
+    auto cfg = config();
+    cfg.enable_batched_prefill = true;
+    cfg.queue_timeout = seconds(60);
+    std::mutex gate_mutex, events_mutex;
+    std::condition_variable gate_cv;
+    bool entered_prefill = false, release_prefill = false;
+    std::vector<SchedulerEvent> events;
+    backend.during_prefill = [&] {
+      std::unique_lock<std::mutex> lk(gate_mutex);
+      entered_prefill = true;
+      gate_cv.notify_all();
+      gate_cv.wait(lk, [&] { return release_prefill; });
+    };
+    cfg.on_event = [&](const SchedulerEvent& e) {
+      std::lock_guard<std::mutex> lk(events_mutex);
+      events.push_back(e);
+    };
+    ContinuousScheduler s(cfg, backend);
+    s.enqueue({"shutdown-seed", {1, 2}, 4});
+    s.enqueue({"shutdown-queued", {1, 2}, 2});
+    std::atomic<std::size_t> executed{99};
+    std::thread pump([&] { executed.store(s.tick()); });
+    {
+      std::unique_lock<std::mutex> lk(gate_mutex);
+      gate_cv.wait(lk, [&] { return entered_prefill; });
+    }
+    std::thread stopping([&] { s.shutdown(); });
+    bool signalled = false;
+    const auto deadline = SchedulerClock::now() + seconds(2);
+    while (SchedulerClock::now() < deadline) {
+      if (s.metrics().stopping) { signalled = true; break; }
+      std::this_thread::sleep_for(milliseconds(1));
+    }
+    expect(signalled, "shutdown visible while seeded prefill is in flight");
+    if (signalled)
+      expect(s.enqueue({"late-seed", {1}, 2}).code == SubmitCode::stopped,
+             "no new admission while seeded prefill is in flight at shutdown");
+    {
+      std::lock_guard<std::mutex> lk(gate_mutex);
+      release_prefill = true;
+    }
+    gate_cv.notify_all();
+    pump.join();
+    stopping.join();
+    expect(executed.load() == 0 && backend.prefill_calls == 1 &&
+           backend.calls.empty() && backend.live == 0 &&
+           backend.opens == backend.closes,
+           "shutdown drains seeded and queued states without extra decode");
+    expect(has_status(s, "shutdown-seed", JobStatus::cancelled) &&
+           has_status(s, "shutdown-queued", JobStatus::cancelled) &&
+           s.metrics().cancelled_total == 2,
+           "shutdown seeded jobs terminal once and states freed");
+    expect(events.size() == 2 &&
+           events[0].kind == EventKind::terminal &&
+           events[1].kind == EventKind::terminal &&
+           events[0].status == JobStatus::cancelled &&
+           events[1].status == JobStatus::cancelled,
+           "shutdown during seeded prefill sends no admitted or token event");
+  }
+
   // Static mixed-context projection is exact for the FP32 per-state layout.
   std::string why;
   expect(admit_mixed({1, 8192, 1}, why) && !why.empty(), "mixed contexts allowed");

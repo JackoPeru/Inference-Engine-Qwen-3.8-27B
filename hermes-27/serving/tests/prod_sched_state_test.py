@@ -26,7 +26,7 @@ ARGS, OTHER = PARSER.parse_known_args()
 
 
 @contextmanager
-def running_server(ids=(), flags=(), env_extra=None):
+def running_server(ids=(), flags=(), env_extra=None, continuous=True):
     with tempfile.TemporaryDirectory(prefix="hermes-prod-sched-") as temp:
         trace = Path(temp) / "states.log"
         env = os.environ.copy()
@@ -34,7 +34,7 @@ def running_server(ids=(), flags=(), env_extra=None):
         env["FAKE_TRACE_FILE"] = str(trace)
         env.update(env_extra or {})
         cmd = [
-            ARGS.server, "--continuous-scheduler",
+            ARGS.server, *(["--continuous-scheduler"] if continuous else []),
             "--model", ARGS.model, "--gguf-dump", ARGS.gguf_dump,
             "--tokenizer", ARGS.tokenizer, "--python", ARGS.python,
             "--context", "256", "--port", "0", *flags,

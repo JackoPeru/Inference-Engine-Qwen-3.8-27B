@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <fstream>
+#include <limits>
 #include <mutex>
 #include <sstream>
 #include <string>
@@ -75,6 +76,7 @@ bool decode_init(DecodeState& state, std::string& error, int capacity) {
   }
   state.capacity = capacity;
   state.inited = true;
+  state.ever_advanced = false;
   trace("open", capacity);
   return true;
 }
@@ -85,6 +87,7 @@ std::vector<float> decode_step(int, DecodeState& state, long position,
     error = "mock state not initialized or position out of capacity";
     return {};
   }
+  state.ever_advanced = true;
   trace("step", position);
   if (std::getenv("FAKE_DECODE_FAIL_ONCE") && !decode_failed_once.exchange(true)) {
     error = "forced mock decode failure";
@@ -100,6 +103,42 @@ std::vector<float> decode_step(int, DecodeState& state, long position,
   logits[static_cast<std::size_t>(token)] = 100.0f;
   const int delay = env_integer("FAKE_STEP_MS", 8);
   if (delay > 0) std::this_thread::sleep_for(std::chrono::milliseconds(delay));
+  return logits;
+}
+
+std::vector<float> prefill_into_decode_state(
+    const std::vector<int>& ids, DecodeState& state, Stats& stats,
+    std::string& error, std::vector<float>* h_last_out) {
+  if (!state.inited || state.ever_advanced || ids.empty() || ids.size() > 64 ||
+      ids.size() > static_cast<std::size_t>(state.capacity)) {
+    error = "mock seeded prefill requires fresh state and 1..64 tokens";
+    if (state.inited) decode_free(state);
+    return {};
+  }
+  trace("prefill", static_cast<long>(ids.size()));
+  if (std::getenv("FAKE_PREFILL_FAIL")) {
+    error = "forced mock seeded prefill failure";
+    decode_free(state);
+    return {};
+  }
+  if (h_last_out) h_last_out->clear();
+  const auto scripted = fake_ids();
+  constexpr std::size_t vocab = 248320;
+  std::vector<float> logits(ids.size() * vocab, -100.0f);
+  for (std::size_t position = 0; position < ids.size(); ++position) {
+    const int result = scripted[std::min(position, scripted.size() - 1)];
+    if (result < 0 || result >= static_cast<int>(vocab)) {
+      error = "invalid mock output token";
+      decode_free(state);
+      return {};
+    }
+    logits[position * vocab + static_cast<std::size_t>(result)] = 100.0f;
+  }
+  if (std::getenv("FAKE_PREFILL_NONFINITE")) {
+    logits[(ids.size() - 1) * vocab] = std::numeric_limits<float>::quiet_NaN();
+  }
+  stats.prefill_ms = 0.1;
+  state.ever_advanced = true;
   return logits;
 }
 

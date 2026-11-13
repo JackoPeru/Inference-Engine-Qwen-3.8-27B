@@ -75,7 +75,7 @@ Tests ran against separate localhost ephemeral ports. No production Hermes servi
 ## Remaining limitations
 
 - CPU-only tests cannot establish real GPU correctness, throughput, VRAM occupancy or multiuser CUDA safety. Do not claim production GPU readiness until prime builds and tests the integrated snapshot with a permitted isolated GPU slot.
-- Host-threaded per-request decode is not fused GPU batching. Chunked prefill, broad sampling, tool calls, multimodal input and native 262K context are not implemented by the serving API.
+- Host-threaded per-request decode is not fused GPU batching. The experimental --batched-prefill seeds a fresh state for T<=64 only; general chunked prefill, broad sampling, tool calls, multimodal input and native 262K context are not implemented by the serving API.
 - Python tokenizer pipe remains serialized. Unsupported decoder types use final-only SSE fallback, or full-prefix decodes for stop detection. The streaming backpressure cancellation and finish_reason cancelled are Hermes extensions.
 - Once SSE headers have been sent, later generation errors appear as SSE error events. Nonstream clients disconnecting without explicit cancellation can continue occupying scheduler resources.
 - The API has neither native TLS nor per-user rate limits. A correctly configured TLS/authenticated proxy is required for public network deployment.
@@ -137,3 +137,78 @@ authorizing GPU tests.
 Qwen weights, throughput, response latency, real CUDA cancellation
 or concurrent backend safety. Until GPU gate and production soak are
 completed, leave --continuous-scheduler disabled by default.
+
+## Experimental raw-GGUF stateful prefill (2026-11-13; CPU-only gate)
+
+Enable `--batched-prefill` explicitly on a new isolated server instance.
+The option is independent of `--continuous-scheduler`: both the default
+legacy Scheduler and the ContinuousScheduler support it. Neither is
+enabled automatically and BOTH flags can be omitted for the fully
+unchanged legacy default. When the input prompt has **1..64 tokenizer
+tokens**, the server asks PP2 to seed a freshly allocated DecodeState
+using `pp2::prefill_into_decode_state(ids, state, stats, error)`.
+For **T>=65**, each scheduler uses the original token-by-token prompt
+loop; it never truncates, chunks or seeds half a prompt.
+
+### Exactly one state owner and first-token semantics
+
+- Legacy: after `decode_init(capacity = prompt_len + max_new_tokens - 1)`,
+  `seed_legacy_prompt` consumes the whole prompt in a SINGLE stateful
+  prefill. From its `T*VOC` FP32 logits, only the **last row** determines
+  the first generated token by greedy argmax. The HTTP Job advances its
+  `prompt_pos` to `T`, processes that generated token through the same
+  existing incremental decoder/stop/SSE/usage routine as the legacy path,
+  then resumes `decode_step` at absolute position **T**, with the
+  generated token as input. There are zero prompt replay decode steps.
+- Continuous: worker-6 extended StepBackend with opt-in
+  `prefill(state, prompt, last_logits, error) -> PrefillResult` and
+  `SchedulerConfig.enable_batched_prefill=false` by default.
+  `PP2StepBackend` owns the real state and calls the exact same raw
+  PP2 seeded API, returning only the last VOC row; the scheduler's
+  `promote` performs the prefill on the SAME opened state before the
+  `admitted` event, emits the first completion token once, and never
+  steps prompt positions again. Token/terminal callbacks are unchanged
+  and retain Unicode, usage, SSE and stop semantics.
+- Cancellation is checked after the potentially non-interruptible
+  seeded operation; a cancelled job is closed and does not generate
+  another step. Failed/invalid logits must fail closed and must never
+  retry token-by-token on an already seeded/poisoned state. The PP2
+  implementation itself may have called `decode_free` on failure; the
+  serving legacy path consults `DecodeState.inited`, while the worker-6
+  adapter calls `decode_free` idempotently before deleting its host
+  state. No second GPU state or duplicate job queue is created.
+- `HERMES_PP2_PREFILL_BF16=1` is a **NO-GO**: with
+  `--batched-prefill`, server startup rejects it with exit code 2,
+  before model upload. Raw GGUF computation is the only permitted
+  seeded path. The BF16 full-logit quality gate in the PP2 source is
+  NOT relaxed or bypassed.
+
+### Counters and reproducible CPU validation
+
+Prometheus `/metrics` includes
+`hermes_prefill_attempts_total`, `hermes_prefill_seeded_total`,
+`hermes_prefill_failed_total`, and
+`hermes_prefill_prompt_tokens_total`, with the same names for legacy
+and ContinuousScheduler. These count actual seeded requests/tokens,
+not theoretical or estimated speedups. T>=65 fallback and default
+flag-off requests leave these counts at zero.
+
+Run `bash serving/tests/prod_sched_cpu_gate.sh` from the project root.
+It now compiles real `serving/server.cpp` + current worker-6
+`distributed/pp2_batch.cu` with `-DHERMES_ADMISSION_CPU_ONLY`
+and runs `serving/tests/prod_sched_prefill_test.py` alongside the
+earlier HTTP/tokenizer/SSE suites. The seeded tests exercise T=1,
+T=11, T=64, fallback T=65, default-off parity, concurrent mixed-context
+N6 with four active states, EOS/text stop, Unicode SSE, usage,
+cancellation, invalid logits, injected prefill failure, context
+rejection, and BF16 fail-closed startup. Instrumented fake PP2 traces
+require one `open` and one `close` per job, exactly one `prefill T`
+when eligible, and only continuation `step` calls at positions >=T.
+
+**Do not infer production throughput, TTFT or numerical quality from
+these CPU mocks.** The raw PP2 stateful prefill's isolated numerical
+parity tests are separate from the HTTP integration gate. Prime must
+run authorized exclusive-GPU N1/N2/N4 throughput and correctness
+tests with the same integrated source snapshot, including VRAM return
+to baseline and cancellation under real kernel load. Until that
+happens keep both experimental flags off in production.

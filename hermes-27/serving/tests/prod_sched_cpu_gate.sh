@@ -17,6 +17,7 @@ cp "$ROOT/distributed/pp2_fwd.hpp" "$ROOT/distributed/pp2_batch.hpp" "$SCRATCH/"
 cp "$ROOT/distributed/pp2_batch.cu" "$SCRATCH/pp2_batch.cu"
 cp "$HERE/prod_sched_mock_pp2.cpp" "$SCRATCH/serving/tests/"
 cp "$HERE/prod_sched_launcher.py" "$HERE/prod_sched_state_test.py" \
+   "$HERE/prod_sched_prefill_test.py" \
    "$HERE/test_production_http.py" "$HERE/test_stream_mock_http.py" \
    "$HERE/test_bytelevel_stream.py" "$SCRATCH/serving/tests/"
 cp "$HERE/mock_gguf_dump.py" "$SCRATCH/gguf_dump_fake.py"
@@ -44,6 +45,10 @@ HERMES_TEST_SERVER_BIN="$SCRATCH/build/hermes_server" \
 
 echo "Continuous PP2 state ownership and cancellation (expected 7/7)"
 "$PYTHON" "$SCRATCH/serving/tests/prod_sched_state_test.py" \
+    --server "$SCRATCH/build/hermes_server" "${COMMON[@]}"
+
+echo "Raw seeded opt-in prefill: legacy + continuous, T1/11/64/65 (expected 11/11)"
+"$PYTHON" "$SCRATCH/serving/tests/prod_sched_prefill_test.py" \
     --server "$SCRATCH/build/hermes_server" "${COMMON[@]}"
 
 echo "Continuous SSE Unicode parity (expected 9/9 scenarios)"
