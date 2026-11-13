@@ -24,12 +24,18 @@ health/models/metrics, strict error codes, concurrent SSE plus
 nonstream, Unicode SSE/nonstream exact-text parity, stream cancellation
 and graceful shutdown. Both commands returned **exit 0**.
 
-The final integrated PP2 source independently passed the manual real
-GGUF seeded RAW prefill T11 test (all FP32 logits, GDN state,
-convolution tail, K/V and next-token async continuation max_abs **0**,
-exit 0). Earlier isolated PP2 source had also passed T2/T11/T64 before
-a final shared pinned-buffer mutex adjustment; those are not claimed
-as retested for the exact final source at all T values.
+The final integrated PP2 source (SHA256 `b22a8f867db5b9c7f35df54384a79b792afcd3e21349d7ac68bdfd733b8b3818`)
+independently passed real-GGUF seeded RAW prefill at **T=11 and T=64**
+after the final shared pinned-buffer mutex adjustment. Both returned
+**max_abs=0** for all FP32 logits, 64 layers of GDN/conv/KV state and
+next-token async continuation, exit code 0. The last T64 output is
+`/tmp/hermes27-prime-resume-20261113/prefill_final_T64.log`.
+The unchanged final source also passed a fresh N4 async real-GGUF
+regression: 4 requests x 15 positions, all 248320 FP32 logits
+**bit-identical** against the sequential reference (max_abs=0),
+exit 0, 4016.382 ms for the correctness workload. This is *not* a
+steady-state throughput sample. Source and build copied under
+`/tmp/hermes27-prime-resume-20261113/`, never installed in production.
 
 ## End-to-end arithmetic load (includes prompt prefill)
 
@@ -70,6 +76,14 @@ until reproducibly explained or mitigated.
 The scratch server was terminated after each run. GPU memory returned
 to the same baseline, with no observed residual allocation after the
 successful tests. Production TabbyAPI and GPU Manager remained active.
+
+Two separate, later test invocations also failed to upload the model
+while a *different scratch HTTP server was still using both GPUs*
+(`OOM blk.21.ffn_up.weight` and `OOM blk.14.ffn_gate.weight`).
+Those were overlapping GPU tests, not isolated regressions. Serial
+reruns of seeded T11 and T64 after the other scratch server exited
+both passed. This **does not explain** the initial legacy startup
+OOM above, whose cause remains open.
 
 ## Commands and next performance gate
 
