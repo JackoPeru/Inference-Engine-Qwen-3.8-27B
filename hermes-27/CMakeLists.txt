@@ -9,6 +9,7 @@ option(HERMES_BUILD_MTP_GENERATOR "Build verified greedy MTP diagnostic CLI (not
 option(HERMES_BUILD_W4A4_PROTOTYPE "Build unapproved CUTLASS NVFP4 activation-requantizing W4A4 prototype" OFF)
 option(HERMES_BUILD_REAL_GEMV_ORACLE "Build real GGUF same-X/W Scalar/Warp4/Packed4 oracle (GPU execution manual only)" OFF)
 option(HERMES_BUILD_LAYER0_LLAMA_GEMV_ORACLE "Build same-GGUF layer0 llama-capture GEMV differential (GPU execution manual only)" OFF)
+option(HERMES_BUILD_Q8_1_EXPERIMENT "Build isolated GGUF NVFP4 x Q8_1 activation accuracy/latency experiments (not production)" OFF)
 option(HERMES_BUILD_REAL_PREFILL_TEST "Build real GGUF batched prefill state/cache/continuation gate (GPU execution manual only)" OFF)
 option(HERMES_BUILD_CHUNK_PREFILL_TEST "Build experimental T65..8192 PP2 chunked prefill test (manual GPU execution only)" OFF)
 option(HERMES_REGISTER_GPU_TESTS "Register CUDA tests in CTest (run ONLY during exclusive GPU maintenance)" OFF)
@@ -98,6 +99,23 @@ if(HERMES_BUILD_LAYER0_LLAMA_GEMV_ORACLE)
   target_link_libraries(gemv_layer0_compare PRIVATE hermes_gguf hermes_kernels)
   # Requires an independently authenticated llama.cpp capture and explicit
   # GPU exclusivity. Never register this full-checkpoint test in CTest.
+endif()
+if(HERMES_BUILD_Q8_1_EXPERIMENT)
+  add_executable(q8_1_gpu_bench
+    kernels/src/nvfp4_gemv_q8_1_experimental.cu
+    kernels/tests/q8_1_gpu_bench.cu)
+  target_include_directories(q8_1_gpu_bench PRIVATE kernels/include model/include)
+  target_link_libraries(q8_1_gpu_bench PRIVATE hermes_gguf CUDA::cudart)
+  add_executable(q8_1_real_capture_cpu kernels/tests/q8_1_real_capture_cpu.cpp)
+  target_link_libraries(q8_1_real_capture_cpu PRIVATE hermes_gguf)
+  if(Python3_Interpreter_FOUND)
+    add_test(NAME q8_1_quant_cpu
+      COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_SOURCE_DIR}/kernels/tests/q8_1_cpu_test.py)
+    set_tests_properties(q8_1_quant_cpu PROPERTIES TIMEOUT 60)
+  endif()
+  # The GPU Q8 benchmark is never an automatic CTest: manual same-GGUF
+  # capture plus explicit exclusive-GPU approval are mandatory.
+  # This option does not alter production hermes_kernels or PP2 routing.
 endif()
 add_executable(test_rmsnorm kernels/tests/test_rmsnorm.cu)
 target_link_libraries(test_rmsnorm PRIVATE hermes_kernels)
