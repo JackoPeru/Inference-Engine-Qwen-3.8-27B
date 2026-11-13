@@ -18,6 +18,7 @@
 #include <unordered_map>
 #include <vector>
 #include <string>
+#include <mutex>
 
 using namespace hermes;
 
@@ -36,6 +37,7 @@ static std::unordered_map<std::string,WEntry> g_w0, g_w1;
 static float* g_pinned=nullptr; // pinned host xfer [Tmax*HID]
 static const size_t PIN_TMAX=64;
 static Stats g_last_stats;
+static std::mutex g_xfer_mu; // P5: rende decode_step thread-safe per batch parallelo (xfer atomico)
 
 #define CUDA_OK(x) do{ cudaError_t e=(x); if(e!=cudaSuccess){ err="cuda fail " #x ": "+std::string(cudaGetErrorString(e)); return false; } } while(0)
 #define CUDA_OK_V(x,er) do{ cudaError_t e=(x); if(e!=cudaSuccess){ er="cuda fail " #x ": "+std::string(cudaGetErrorString(e)); return {}; } } while(0)
@@ -1047,11 +1049,17 @@ std::vector<float> decode_step(int tok, DecodeState& ds, long pos, std::string& 
     bool ok=is_full? run_full_decode_layer(li,d_x0,ds,pos,err) : run_gdn_decode_layer(li,d_x0,ds,err);
     if(!ok){ cudaFree(d_x0); return {}; }
   }
-  cudaMemcpy(g_pinned,d_x0,nH*4,cudaMemcpyDeviceToHost);
-  cudaFree(d_x0);
-  cudaSetDevice(1);
-  float* d_x1=nullptr; cudaMalloc(&d_x1,nH*4);
-  cudaMemcpy(d_x1,g_pinned,nH*4,cudaMemcpyHostToDevice);
+  // P5: xfer atomico sotto lock per batch parallelo (stesso pinned condiviso).
+  // Compute GPU0 sopra resta fuori dal lock -> overlap reale con GPU1 di altro thread.
+  float* d_x1=nullptr;
+  {
+    std::lock_guard<std::mutex> lk(g_xfer_mu);
+    cudaMemcpy(g_pinned,d_x0,nH*4,cudaMemcpyDeviceToHost);
+    cudaFree(d_x0); d_x0=nullptr;
+    cudaSetDevice(1);
+    cudaMalloc(&d_x1,nH*4);
+    cudaMemcpy(d_x1,g_pinned,nH*4,cudaMemcpyHostToDevice);
+  }
   for(int li=SPLIT_LAST0+1;li<NL;++li){
     bool is_full=(li%4==3);
     bool ok=is_full? run_full_decode_layer(li,d_x1,ds,pos,err) : run_gdn_decode_layer(li,d_x1,ds,err);
