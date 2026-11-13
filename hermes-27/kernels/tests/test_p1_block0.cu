@@ -1,7 +1,9 @@
-// P1 blk.0 GPU1: stage1 conv+silu (PASS) + stage2 qkv GEMM NVFP4.
-// Stage1: qkv golden H2D + Wc reale -> conv kernel -> vs /tmp/e1_cv.bin, thr 1e-4.
+// P1 blk.0 GPU1: stage1 conv+silu + stage2 qkv GEMM NVFP4.
+// Golden: independent corrected CPU block0 GGUF reference (scripts/block0_corrected_ref.py).
+// Missing/stale oracle = BLOCKED exit 77, never a false PASS against old /tmp/e1_*.bin.
+// Stage1: corrected qkv H2D + Wc reale -> conv kernel -> vs corrected cv, thr 1e-4.
 // Stage2: h=RMS(x,attn_norm) diretto da embed reali -> qkv via NVFP4 W4A4 GPU
-//         vs /tmp/e1_cv_qkv.bin. Riporta numeri reali (no soglie inventate).
+//         vs corrected qkv. Riporta numeri reali (no soglie inventate).
 // Leggero: <150MB VRAM.
 #include "hermes/weights.hpp"
 #include "hermes/gguf.hpp"
@@ -15,16 +17,13 @@
 #include <vector>
 #include <string>
 #include <cstring>
+#include <cstdint>
+#include <fstream>
+#include <algorithm>
 #include <cuda_runtime.h>
 
 static const char* CKPT = "/home/matteo/hermes-27/models/Qwen3.8-27B-Uncensored-NVFP4-MTP.gguf";
-static const char* F_QKV = "/tmp/e1_cv_qkv.bin";
-static const char* F_CV  = "/tmp/e1_cv.bin";
-static const char* F_BETA= "/tmp/e1_beta.bin";
-static const char* F_GL  = "/tmp/e1_gl.bin";
-static const char* F_O   = "/tmp/e1_o.bin";
-static const char* F_CORE= "/tmp/e1_core.bin";
-static const char* F_Y   = "/tmp/e1_y.bin";
+static const char* F_CORRECTED = "/tmp/h27_block0_corrected_v2.bin";
 static const int T = 11;
 static const int C = 10240;
 static const int HID = 5120;
@@ -48,17 +47,77 @@ __global__ void conv_silu_k(const float* qkv, const float* Wc, float* cv, int TT
   cv[idx] = acc * s;
 }
 
-static bool read_bin(const char* path, std::vector<float>& out, size_t expect_n) {
-  FILE* f = fopen(path, "rb");
-  if (!f) { printf("OPEN FAIL %s\n", path); return false; }
-  fseek(f, 0, SEEK_END);
-  long sz = ftell(f);
-  fseek(f, 0, SEEK_SET);
-  if ((size_t)sz != expect_n * 4) { printf("SIZE MISMATCH %s: got %ld expect %zu\n", path, sz, expect_n * 4); fclose(f); return false; }
-  out.resize(expect_n);
-  size_t r = fread(out.data(), 4, expect_n, f);
+struct CorrectedOracle {
+  std::vector<float> qkv, cv, beta, gl, o, core, y;
+};
+static CorrectedOracle g_oracle;
+
+static bool get_model_identity(uint64_t& size, uint64_t& hash, std::string& err) {
+  std::ifstream model(CKPT, std::ios::binary | std::ios::ate);
+  if (!model) { err="cannot open checkpoint"; return false; }
+  std::streamoff extent=model.tellg();
+  if (extent<=0) { err="invalid checkpoint size"; return false; }
+  size=(uint64_t)extent;
+  hash=14695981039346656037ULL;
+  auto block=[&](uint64_t pos)->bool {
+    char data[4096];
+    size_t n=(size_t)std::min<uint64_t>(size,4096);
+    model.clear();
+    model.seekg((std::streamoff)pos);
+    model.read(data,(std::streamsize)n);
+    if (model.gcount()!=(std::streamsize)n) return false;
+    for(size_t j=0;j<n;++j) hash=(hash^(uint8_t)data[j])*1099511628211ULL;
+    return true;
+  };
+  if (!block(0) || !block(size-std::min<uint64_t>(size,4096))) {
+    err="cannot fingerprint checkpoint"; return false;
+  }
+  return true;
+}
+
+static bool load_corrected_oracle(std::string& err) {
+  const char* path=std::getenv("HERMES_BLOCK0_ORACLE");
+  if (!path || !*path) path=F_CORRECTED;
+  FILE* f=fopen(path,"rb");
+  if(!f){ err=std::string("corrected oracle missing: ")+path; return false; }
+  auto fail=[&](const std::string& msg)->bool{ err=msg; fclose(f); return false; };
+  const char expected[8]={'H','2','7','B','0','V','2','!'};
+  char magic[8]={};
+  uint64_t model_size=0, model_hash=0;
+  int32_t ids[T]={};
+  if(fread(magic,1,8,f)!=8 || fread(&model_size,8,1,f)!=1 ||
+     fread(&model_hash,8,1,f)!=1 || fread(ids,sizeof(int32_t),T,f)!=(size_t)T)
+    return fail("corrected oracle header truncated");
+  if(memcmp(magic,expected,8)!=0)
+    return fail("corrected oracle wrong version (need H27B0V2!)");
+  const int32_t expected_ids[T]={6205,161421,303,220,17,1374,9911,1147,27053,6059,13};
+  if(memcmp(ids,expected_ids,sizeof(ids))!=0)
+    return fail("corrected oracle token IDs mismatch");
+  uint64_t live_size=0, live_hash=0;
+  if(!get_model_identity(live_size,live_hash,err)){ fclose(f); return false; }
+  if(model_size!=live_size || model_hash!=live_hash)
+    return fail("corrected oracle checkpoint fingerprint mismatch");
+  auto take=[&](std::vector<float>& v,size_t n)->bool {
+    v.resize(n);
+    return fread(v.data(),sizeof(float),n,f)==n;
+  };
+  if(!take(g_oracle.qkv,(size_t)T*C) || !take(g_oracle.cv,(size_t)T*C) ||
+     !take(g_oracle.beta,(size_t)T*HV) || !take(g_oracle.gl,(size_t)T*HV) ||
+     !take(g_oracle.o,(size_t)T*HV*VHD) || !take(g_oracle.core,(size_t)T*HID) ||
+     !take(g_oracle.y,(size_t)T*HID))
+    return fail("corrected oracle payload truncated");
+  if(fgetc(f)!=EOF) return fail("corrected oracle unexpected trailing bytes");
   fclose(f);
-  if (r != expect_n) { printf("READ FAIL %s\n", path); return false; }
+  auto all_finite=[](const std::vector<float>& v){
+    for(float x:v) if(!std::isfinite(x)) return false;
+    return true;
+  };
+  if(!all_finite(g_oracle.qkv) || !all_finite(g_oracle.cv) ||
+     !all_finite(g_oracle.beta) || !all_finite(g_oracle.gl) ||
+     !all_finite(g_oracle.o) || !all_finite(g_oracle.core) ||
+     !all_finite(g_oracle.y)){ err="corrected oracle contains nonfinite values"; return false; }
+  printf("CORRECTED ORACLE V2 verified: %s, GGUF size=%llu hash=%016llx\n",
+         path,(unsigned long long)live_size,(unsigned long long)live_hash);
   return true;
 }
 
@@ -67,9 +126,8 @@ static int run_stage1(hermes::GgufWeightBackend& be, float* ms_out, double* mx_o
   cudaMemGetInfo(&free0, &tot0);
   printf("\n=== STAGE1 conv+silu T=%d C=%d ===\n", T, C);
   printf("vram_before free=%zu MiB\n", free0 / (1024*1024));
-  std::vector<float> qkv, cv_ref;
-  if (!read_bin(F_QKV, qkv, (size_t)T * C)) return 1;
-  if (!read_bin(F_CV, cv_ref, (size_t)T * C)) return 1;
+  const auto& qkv=g_oracle.qkv;
+  const auto& cv_ref=g_oracle.cv;
   printf("golden qkv[0..4]: %.6f %.6f %.6f %.6f %.6f\n", qkv[0], qkv[1], qkv[2], qkv[3], qkv[4]);
   auto wv = be.view("blk.0.ssm_conv1d.weight");
   printf("Wc %s ne=[%llu,%llu] bytes=%llu\n", wv.info->name.c_str(),
@@ -153,8 +211,7 @@ static int run_stage2(hermes::GgufWeightBackend& be) {
   }
   printf("h[0,0..4]: %.6f %.6f %.6f %.6f %.6f\n",h[0],h[1],h[2],h[3],h[4]);
   // golden qkv
-  std::vector<float> qkv_ref;
-  if(!read_bin(F_QKV,qkv_ref,(size_t)T*N_QKV)) return 1;
+  const auto& qkv_ref=g_oracle.qkv;
   // CPU dequant reference: dequant Wqkv -> float GEMM
   const uint8_t* qkvRows=vQkv.data;
   int nb=HID/64; // 80
@@ -315,12 +372,11 @@ static int run_stage3(hermes::GgufWeightBackend& be){
     for(int i=0;i<HID;++i) ss+=(double)xr[i]*xr[i];
     float inv=1.f/sqrtf((float)(ss/HID)+1e-6f);
     for(int i=0;i<HID;++i) h[(size_t)t*HID+i]=xr[i]*inv*wNorm[i]; }
-  std::vector<float> cv_ref, beta_ref, gl_ref, o_ref, core_ref;
-  if(!read_bin(F_CV,cv_ref,(size_t)T*C)) return 1;
-  if(!read_bin(F_BETA,beta_ref,(size_t)T*HV)) return 1;
-  if(!read_bin(F_GL,gl_ref,(size_t)T*HV)) return 1;
-  if(!read_bin(F_O,o_ref,(size_t)T*HV*VHD)) return 1;
-  if(!read_bin(F_CORE,core_ref,(size_t)T*HID)) return 1;
+  const auto& cv_ref=g_oracle.cv;
+  const auto& beta_ref=g_oracle.beta;
+  const auto& gl_ref=g_oracle.gl;
+  const auto& o_ref=g_oracle.o;
+  const auto& core_ref=g_oracle.core;
   // h_bf16 for GEMV
   std::vector<uint16_t> h_bf16((size_t)T*HID);
   for(size_t i=0;i<h.size();++i) h_bf16[i]=hermes::f32_to_bf16(h[i]);
@@ -384,7 +440,7 @@ static int run_stage3(hermes::GgufWeightBackend& be){
   printf("gl   vs golden maxerr=%.3e at %zu gpu=%.6f ref=%.6f cos=%.8f\n",mbg,ig,gl[ig],gl_ref[ig],dotg/(sqrt(nag*nbg)+1e-12));
   // --- q/k/v from golden cv, l2norm CPU ---
   std::vector<float> q((size_t)T*HV*KHD), k((size_t)T*HV*KHD), v((size_t)T*HV*VHD);
-  for(int t=0;t<T;++t){ float* c0=&cv_ref[(size_t)t*C];
+  for(int t=0;t<T;++t){ const float* c0=&cv_ref[(size_t)t*C];
     for(int hh=0;hh<HV;++hh){ int g=hh%(KD/KHD);
       for(int d=0;d<KHD;++d){ q[((size_t)t*HV+hh)*KHD+d]=c0[g*KHD+d]; k[((size_t)t*HV+hh)*KHD+d]=c0[KD+g*KHD+d]; }
       for(int d=0;d<VHD;++d) v[((size_t)t*HV+hh)*VHD+d]=c0[2*KD+hh*VHD+d]; } }
@@ -492,10 +548,8 @@ static int run_stage4(hermes::GgufWeightBackend& be){
   for(int t=0;t<T;++t){ double ss=0; for(int i=0;i<HID;++i) ss+=(double)x[(size_t)t*HID+i]*x[(size_t)t*HID+i];
     float inv=1.f/sqrtf((float)(ss/HID)+1e-6f);
     for(int i=0;i<HID;++i) h[(size_t)t*HID+i]=x[(size_t)t*HID+i]*inv*wNorm[i]; }
-  std::vector<float> cv_ref, y_ref, core_ref;
-  if(!read_bin(F_CV,cv_ref,(size_t)T*C)) return 1;
-  if(!read_bin(F_Y,y_ref,(size_t)T*HID)) return 1;
-  if(!read_bin(F_CORE,core_ref,(size_t)T*HID)) return 1;
+  const auto& y_ref=g_oracle.y;
+  const auto& core_ref=g_oracle.core;
   // Recompute full blk.0 chain on GPU where heavy, CPU for tiny elementwise.
   // To isolate stage4, use golden core for residual (exact), then post_norm+MLP on GPU.
   // h1 = x + core_golden
@@ -569,6 +623,21 @@ static int run_stage4(hermes::GgufWeightBackend& be){
 
 int main(int argc,char** argv){
   std::string only = (argc>1)? argv[1] : "all";
+  if(only!="all" && only!="s1" && only!="s2" && only!="s3" && only!="s4" && only!="oracle"){
+    printf("USAGE: test_p1_block0 [oracle|s1|s2|s3|s4|all]\n"); return 2;
+  }
+  std::string oracle_err;
+  if(!load_corrected_oracle(oracle_err)){
+    printf("P1 BLOCK0 BLOCKED: %s\n"
+           "Generate corrected CPU oracle: python3 scripts/block0_corrected_ref.py\n"
+           "Older /tmp/e1_*.bin files are not authoritative for current GGUF semantics.\n",
+           oracle_err.c_str());
+    return 77; // fail-closed: CTest sees nonzero until an independently generated oracle exists
+  }
+  if(only=="oracle"){
+    printf("P1 BLOCK0 ORACLE CHECK PASS (CPU-only; no CUDA context)\n");
+    return 0;
+  }
   hermes::GgufWeightBackend be;
   try{ be.open(CKPT); }catch(std::exception& e){ printf("GGUF OPEN FAIL: %s\n",e.what()); return 1; }
   int rc=0;

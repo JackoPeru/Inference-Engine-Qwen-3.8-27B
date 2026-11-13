@@ -23,6 +23,7 @@ add_library(hermes_kernels STATIC
   kernels/src/mlp.cu
   kernels/src/attn.cu
   kernels/src/nvfp4_gemv.cu
+  kernels/src/nvfp4_gemv_warp_variants.cu
   kernels/src/head_bf16_optimized.cu
   kernels/src/gdn_step.cu
   kernels/src/nvfp4_gemm_w4a4.cu

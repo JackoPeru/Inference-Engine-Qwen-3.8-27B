@@ -64,6 +64,9 @@ prompt processing is still token-by-token and long contexts are slow.
   performance with commands and limitations.
 - `benchmarks/HEAD_AB_2026-11-13.md`: optional BF16 output head, numerical
   and complete-engine A/B timings.
+- `benchmarks/PACKED4_AB_2026-11-13.md`: further opt-in vectorized GEMV,
+  real-model 11.06 decode step/s and N4 parallel 12.03 aggregate step/s on
+  short controlled workloads; no quality parity claim on arbitrary prompts.
 - `benchmarks/PROFILING_GUIDE.md`: GPU profiling procedure.
 - `kernels/tests/README_nvfp4_prefill_prototype.md`: **research only**,
   CUTLASS SM120 W4A4 batched prefill microbench on the real GGUF. Device
@@ -78,6 +81,8 @@ prompt processing is still token-by-token and long contexts are slow.
 Three strictly optional CUDA switches can be combined:
 
 - `HERMES_NVFP4_GEMV=warp4` selects the optimized raw-GGUF GEMV.
+- `HERMES_NVFP4_GEMV=packed4` selects a faster 32-bit vectorized raw-GGUF
+  GEMV, with the prior Warp4 selectable as a rollback path.
 - `HERMES_HEAD_BF16=warp4` selects an FP32 warp-per-vocabulary-row output
   projection, replacing the original FP64 scalar dot product.
 - `HERMES_DECODE_SKIP_LAYER_SYNC=1` omits redundant per-layer device-wide

@@ -92,6 +92,27 @@ def main():
         result_a, result_b = a.result(), b.result()
     print("concurrent non-stream + SSE: PASS", result_a["id"], result_b[0]["id"])
 
+    # Greedy generation is deterministic. SSE content must reconstruct exactly
+    # the text from a separate non-stream request with the same chat template.
+    parity_prompt = [{"role": "user", "content": "Reply briefly: café 🚀 中文."}]
+    parity_payload = {
+        "model": args.model, "messages": parity_prompt,
+        "max_tokens": 8, "temperature": 0,
+    }
+    status, body = request(base + "/v1/chat/completions", parity_payload)
+    assert status == 200, (status, body)
+    reference_text = json.loads(body)["choices"][0]["message"]["content"]
+    parity_events = event_stream(
+        base + "/v1/chat/completions", {**parity_payload, "stream": True}
+    )
+    assert parity_events[-1] == "[DONE]", parity_events
+    streamed_text = "".join(
+        event["choices"][0]["delta"].get("content", "")
+        for event in parity_events if isinstance(event, dict) and "choices" in event
+    )
+    assert streamed_text == reference_text, (repr(streamed_text), repr(reference_text))
+    print("SSE vs non-stream exact text parity: PASS")
+
     cancelled_id = []
     def cancel_after_role(event):
         cancelled_id.append(event["id"])

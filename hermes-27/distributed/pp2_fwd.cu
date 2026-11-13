@@ -6,6 +6,7 @@
 #include "hermes/gguf.hpp"
 #include "hermes/rmsnorm.hpp"
 #include "hermes/nvfp4_gemv.hpp"
+#include "hermes/nvfp4_gemv_warp_variants.hpp"
 #include "hermes/head_bf16_optimized.hpp"
 #include "hermes/nvfp4_gemm.hpp"
 #include "hermes/gdn_step.hpp"
@@ -263,16 +264,33 @@ static WEntry* find_w(const std::string& n){
   return nullptr;
 }
 static void gemv_batch(const uint16_t* d_in, const uint8_t* d_W, float* d_out, int H, int N, int T){
-  // Experimental CUDA GEMV A/B. Preserve the already-validated scalar path
-  // unless explicitly opted into the new raw-GGUF Warp4 implementation.
-  // The flag is read only once per process; changing it requires a restart.
-  static const Nvfp4GemvVariant variant = [] {
+  // Experimental CUDA GEMV A/B. No weights are repacked and the validated
+  // scalar implementation stays default. The new packed4 path is opt-in.
+  // Read only once per process; changing the flag requires a restart.
+  static const int variant = [] {
     const char* value=std::getenv("HERMES_NVFP4_GEMV");
-    return (value && std::strcmp(value,"warp4")==0)
-      ? Nvfp4GemvVariant::Warp4 : Nvfp4GemvVariant::Scalar;
+    if(value && std::strcmp(value,"packed4")==0) return 2;
+    if(value && std::strcmp(value,"warp4")==0) return 1;
+    return 0;
   }();
-  for(int t=0;t<T;++t)
-    nvfp4_gemv_cuda_variant(d_in+(size_t)t*H,d_W,d_out+(size_t)t*N,H,N,variant);
+  const bool packed_compatible=H>0 && (H%64)==0 && N>0 &&
+    (reinterpret_cast<uintptr_t>(d_W)&3u)==0u;
+  for(int t=0;t<T;++t){
+    const uint16_t* x=d_in+(size_t)t*H;
+    float* y=d_out+(size_t)t*N;
+    if(variant==2 && packed_compatible){
+      // This API reports launch errors without synchronizing. The existing
+      // layer-boundary/output-head checks detect asynchronous CUDA errors.
+      cudaError_t rc=nvfp4_gemv_warp_experiment(
+        x,d_W,y,H,N,Nvfp4WarpExperiment::PackedU32x4);
+      if(rc==cudaSuccess) continue;
+      // A failed launch must not silently return partially computed logits.
+      std::fprintf(stderr,"HERMES packed4 launch failure: %s\n",cudaGetErrorString(rc));
+      std::abort();
+    }
+    nvfp4_gemv_cuda_variant(x,d_W,y,H,N,
+      (variant==0)?Nvfp4GemvVariant::Scalar:Nvfp4GemvVariant::Warp4);
+  }
 }
 
 static bool use_head_bf16_warp(){
@@ -610,9 +628,17 @@ std::vector<float> prefill(const std::vector<int>& ids, Stats& st, std::string& 
     } else {
       head_bf16_k<<<(int)(((size_t)T*VOC+255)/256),256>>>(d_log,d_xn,(uint16_t*)itw->second.d,T);
     }
-    cudaDeviceSynchronize();
+    cudaError_t head_sync_err=cudaDeviceSynchronize();
+    if(head_sync_err!=cudaSuccess){
+      err="output head prefill sync: "+std::string(cudaGetErrorString(head_sync_err));
+      cudaFree(d_xn); cudaFree(d_log); cudaFree(d_x1); return {};
+    }
     std::vector<float> logits((size_t)T*VOC);
-    cudaMemcpy(logits.data(),d_log,(size_t)T*VOC*4,cudaMemcpyDeviceToHost);
+    cudaError_t head_copy_err=cudaMemcpy(logits.data(),d_log,(size_t)T*VOC*4,cudaMemcpyDeviceToHost);
+    if(head_copy_err!=cudaSuccess){
+      err="output head prefill logits copy: "+std::string(cudaGetErrorString(head_copy_err));
+      cudaFree(d_xn); cudaFree(d_log); cudaFree(d_x1); return {};
+    }
     cudaFree(d_xn); cudaFree(d_log); cudaFree(d_x1);
     auto tp1=std::chrono::high_resolution_clock::now();
     st.prefill_ms=std::chrono::duration<double,std::milli>(tp1-tp0).count();
@@ -1257,9 +1283,17 @@ std::vector<float> decode_step(int tok, DecodeState& ds, long pos, std::string& 
     } else {
       head_bf16_k<<<(int)(((size_t)VOC+255)/256),256>>>(d_log,d_xn,(uint16_t*)itw->second.d,T);
     }
-    cudaDeviceSynchronize();
+    cudaError_t head_sync_err=cudaDeviceSynchronize();
+    if(head_sync_err!=cudaSuccess){
+      err="output head decode sync: "+std::string(cudaGetErrorString(head_sync_err));
+      return {};
+    }
     std::vector<float> logits((size_t)VOC);
-    cudaMemcpy(logits.data(),d_log,(size_t)VOC*4,cudaMemcpyDeviceToHost);
+    cudaError_t head_copy_err=cudaMemcpy(logits.data(),d_log,(size_t)VOC*4,cudaMemcpyDeviceToHost);
+    if(head_copy_err!=cudaSuccess){
+      err="output head decode logits copy: "+std::string(cudaGetErrorString(head_copy_err));
+      return {};
+    }
     // P6: nessun free (persistenti).
     return logits;
   }

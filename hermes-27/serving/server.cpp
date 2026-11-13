@@ -41,6 +41,7 @@
 namespace {
 using json = nlohmann::json;
 using Clock = std::chrono::steady_clock;
+constexpr int kVocab = 248320; // Fixed vocabulary of the Qwen3.8-27B target model.
 constexpr std::size_t kMaxBody = 1024 * 1024;
 
 struct Config {
@@ -127,6 +128,7 @@ class TokenizerBridge {
     input_ = to_child[1]; output_ = from_child[0];
     json ready = json::parse(read_line());
     if (!ready.value("ready", false)) throw std::runtime_error("tokenizer startup: " + ready.value("error", "no ready response"));
+    incremental_ = ready.value("incremental", false);
   }
 
   ~TokenizerBridge() {
@@ -145,6 +147,26 @@ class TokenizerBridge {
   std::string decode(const std::vector<int>& ids) {
     json response = call({{"op", "decode"}, {"ids", ids}});
     return response.at("text").get<std::string>();
+  }
+
+  bool incremental_supported() const { return incremental_; }
+
+  void stream_start(const std::string& id) {
+    call({{"op", "stream_start"}, {"id", id}});
+  }
+
+  std::string stream_push(const std::string& id, int token) {
+    return call({{"op", "stream_push"}, {"id", id}, {"token", token}})
+      .at("delta").get<std::string>();
+  }
+
+  std::string stream_finish(const std::string& id) {
+    return call({{"op", "stream_finish"}, {"id", id}})
+      .at("tail").get<std::string>();
+  }
+
+  void stream_abort(const std::string& id) {
+    call({{"op", "stream_abort"}, {"id", id}});
   }
 
  private:
@@ -187,6 +209,7 @@ class TokenizerBridge {
   pid_t pid_ = -1;
   int input_ = -1, output_ = -1;
   std::string pending_;
+  bool incremental_ = false;
   std::mutex mutex_;
 };
 
@@ -200,7 +223,8 @@ struct Job {
   std::string model;
   std::vector<int> prompt;
   std::vector<int> output;
-  std::string text, sent_text;
+  std::string text;
+  std::size_t sent_bytes = 0;
   std::string error;
   json response;
   bool stream = false;
@@ -213,6 +237,7 @@ struct Job {
   pp2::DecodeState state{};
   bool state_ready = false;
   bool admitted = false; // Guarded by mutex: streaming HTTP headers wait for GPU admission.
+  bool stream_started = false;
   std::mutex mutex;
   std::condition_variable cv;
   std::deque<std::string> stream_chunks;
@@ -311,20 +336,16 @@ class Scheduler {
     job.cv.notify_all();
   }
 
-  static std::size_t stable_utf8_prefix(const std::string& text) {
-    if (text.empty()) return 0;
-    std::size_t lead = text.size() - 1;
-    while (lead > 0 && (static_cast<unsigned char>(text[lead]) & 0xc0) == 0x80) --lead;
-    return lead;
-  }
-
-  void stream_text(const std::shared_ptr<Job>& job, bool final) {
+  void stream_text(const std::shared_ptr<Job>& job) {
     if (!job->stream || job->cancel.load()) return;
-    const std::size_t end = final ? job->text.size() : stable_utf8_prefix(job->text);
+    // The ByteLevel stream bridge releases only complete, stable UTF-8
+    // codepoints; unsupported decoders emit the entire text at completion.
     std::lock_guard<std::mutex> lock(job->mutex);
-    if (end <= job->sent_text.size() || job->text.compare(0, job->sent_text.size(), job->sent_text) != 0) return;
-    const std::string delta = job->text.substr(job->sent_text.size(), end - job->sent_text.size());
-    job->sent_text = job->text.substr(0, end);
+    if (job->text.size() <= job->sent_bytes) return;
+    // All updates append stable decoded characters, so a byte offset is
+    // sufficient. Copying/comparing the entire sent prefix was O(n^2).
+    const std::string delta = job->text.substr(job->sent_bytes);
+    job->sent_bytes = job->text.size();
     if (!delta.empty()) push_stream_locked(*job, chunk(*job, {{"content", delta}}, nullptr));
   }
 
@@ -333,11 +354,29 @@ class Scheduler {
     if (job->state_ready) { pp2::decode_free(job->state); job->state_ready = false; }
     const bool was_cancelled = job->cancel.load();
     if (was_cancelled && status == 200) error.clear();
+    const bool was_incremental = job->stream_started;
+    if (was_incremental) {
+      try {
+        if (status == 200) job->text += tokenizer_.stream_finish(job->id);
+        else tokenizer_.stream_abort(job->id);
+      } catch (const std::exception& e) {
+        status = 500;
+        error = std::string("incremental decoder finalization failed: ") + e.what();
+      }
+      job->stream_started = false;
+    }
     if (status == 200) {
-      try { job->text = tokenizer_.decode(job->output); }
+      try {
+        // One reference decode verifies exact final parity (also for invalid
+        // Unicode / byte fallback) and serves non-stream clients directly.
+        std::string reference = tokenizer_.decode(job->output);
+        if (was_incremental && job->text != reference)
+          throw std::runtime_error("incremental decoder output mismatch");
+        job->text = std::move(reference);
+      }
       catch (const std::exception& e) { status = 500; error = std::string("detokenization failed: ") + e.what(); }
     }
-    if (status == 200) stream_text(job, true);
+    if (status == 200) stream_text(job);
 
     if (status == 200) {
       const std::string reason = was_cancelled ? "cancelled" : finish_reason;
@@ -454,6 +493,15 @@ class Scheduler {
         }
         job->state_ready = true;
         if (job->cancel.load()) { complete(job, 200, {}, "cancelled"); continue; }
+        if (job->stream && tokenizer_.incremental_supported()) {
+          try {
+            tokenizer_.stream_start(job->id);
+            job->stream_started = true;
+          } catch (const std::exception& e) {
+            complete(job, 500, std::string("incremental decoder startup failed: ") + e.what(), "length");
+            continue;
+          }
+        }
         {
           std::lock_guard<std::mutex> lock(mutex_);
           active_.push_back(job);
@@ -512,9 +560,11 @@ class Scheduler {
         }
         if (token < 0) { complete(job, 500, "greedy selection failed: " + errors[i], "length"); finished.push_back(job); continue; }
         job->output.push_back(token);
-        try { job->text = tokenizer_.decode(job->output); }
-        catch (const std::exception& e) { complete(job, 500, std::string("detokenization failed: ") + e.what(), "length"); finished.push_back(job); continue; }
-        stream_text(job, false);
+        if (job->stream_started) {
+          try { job->text += tokenizer_.stream_push(job->id, token); }
+          catch (const std::exception& e) { complete(job, 500, std::string("incremental detokenization failed: ") + e.what(), "length"); finished.push_back(job); continue; }
+          stream_text(job);
+        }
         if (token == eos_) { complete(job, 200, {}, "stop"); finished.push_back(job); }
         else if (static_cast<int>(job->output.size()) >= job->max_new_tokens) {
           complete(job, 200, {}, "length"); finished.push_back(job);
@@ -757,6 +807,9 @@ int main(int argc, char** argv) {
       try { prompt = tokenizer.encode(messages, thinking); }
       catch (const std::exception& e) { scheduler.rejected(); set_error(res, 400, std::string("tokenization/template failed: ") + e.what(), "invalid_request_error", "messages", "invalid_value"); return; }
       if (prompt.empty()) { scheduler.rejected(); set_error(res, 400, "chat template produced empty prompt", "invalid_request_error", "messages", "invalid_value"); return; }
+      if (std::any_of(prompt.begin(), prompt.end(), [](int id) { return id < 0 || id >= kVocab; })) {
+        scheduler.rejected(); set_error(res, 400, "tokenizer returned an ID outside the model vocabulary", "invalid_request_error", "messages", "invalid_value"); return;
+      }
       if (prompt.size() > static_cast<std::size_t>(cfg.context) ||
           prompt.size() + static_cast<std::size_t>(max_tokens) - 1 > static_cast<std::size_t>(cfg.context)) {
         scheduler.rejected(); set_error(res, 400, "prompt plus max_tokens exceeds PP2 context limit " + std::to_string(cfg.context), "invalid_request_error", "max_tokens", "context_length_exceeded"); return;
