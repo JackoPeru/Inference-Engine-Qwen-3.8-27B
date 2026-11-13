@@ -153,7 +153,9 @@ static bool checked_weight(const char* n, void*& d, int ne0_want,
 bool init(MtpState& st, std::string& err){ return init(st, err, MAXL); }
 
 bool init(MtpState& st, std::string& err, int capacity){
+  std::lock_guard<std::mutex> lock(st.mutex);
   if(capacity<1 || capacity>MAX_CONTEXT){ err="mtp capacity must be 1..8192"; return false; }
+  if(st.poisoned){ err="mtp CUDA state poisoned: free_state then init required"; return false; }
   if(st.inited){
     if(st.capacity!=capacity){ err="mtp already initialized with different capacity"; return false; }
     return true;
@@ -168,39 +170,47 @@ bool init(MtpState& st, std::string& err, int capacity){
   ce=cudaMemset(k,0,bytes);
   if(ce==cudaSuccess) ce=cudaMemset(v,0,bytes);
   if(ce!=cudaSuccess){ err="mtp KV init failed: "+std::string(cudaGetErrorString(ce)); cudaFree(k); cudaFree(v); return false; }
-  st.Kc=k; st.Vc=v; st.len=0; st.first_pos=-1; st.inited=true;
+  st.Kc=k; st.Vc=v; st.len=0; st.first_pos=-1; st.poisoned=false; st.inited=true;
   return true;
 }
-void reset(MtpState& st){ if(st.inited){ st.len=0; st.first_pos=-1; } }
+void reset(MtpState& st){
+  std::lock_guard<std::mutex> lock(st.mutex);
+  detail::reset_metadata(st);
+}
 
 bool rewind(MtpState& st, int keep_len, std::string& err){
-  if(!st.inited){ err="mtp rewind uninitialized"; return false; }
-  if(keep_len<0 || keep_len>st.len){ err="mtp rewind outside committed range"; return false; }
-  st.len=keep_len;
-  if(keep_len==0) st.first_pos=-1;
+  std::lock_guard<std::mutex> lock(st.mutex);
+  if(!detail::rewind_metadata(st,keep_len)){
+    err=st.poisoned?"mtp rewind forbidden: state poisoned":
+      "mtp rewind outside committed range or uninitialized";
+    return false;
+  }
   return true;
 }
 void free_state(MtpState& st){
+  std::lock_guard<std::mutex> lock(st.mutex);
   if(!st.inited) return;
   cudaSetDevice(1);
   if(st.Kc){ cudaFree(st.Kc); st.Kc=nullptr; }
   if(st.Vc){ cudaFree(st.Vc); st.Vc=nullptr; }
-  st.len=0; st.first_pos=-1; st.capacity=MAXL; st.inited=false;
+  st.len=0; st.first_pos=-1; st.capacity=MAXL;
+  st.inited=false; st.poisoned=false;
 }
 
 static inline float bf2f_cpu(uint16_t b){ uint32_t u=(uint32_t)b<<16; float f; memcpy(&f,&u,4); return f; }
 
 std::vector<float> draft_step(const float* h_last, int tok, MtpState& st, long pos,
                               std::string& err){
+  std::lock_guard<std::mutex> lock(st.mutex);
   err.clear();
   if(!st.inited){ err="mtp not inited"; return {}; }
+  if(st.poisoned){ err="mtp draft state poisoned; free_state then init required"; return {}; }
   if(!h_last){ err="null h_last"; return {}; }
   if(tok<0||tok>=VOC){ err="tok OOB"; return {}; }
-  if(st.len<0||st.capacity<1||st.capacity>MAX_CONTEXT||st.len>=st.capacity){ err="mtp len OOB"; return {}; }
-  if(pos<0||pos>INT_MAX || (st.len>0 && pos!=st.first_pos+st.len)){
-    err="mtp pos not consecutive with draft KV (reset or rewind required)"; return {};
+  if(!detail::can_append(st,pos)){
+    err="mtp KV position/capacity invalid or nonconsecutive (reset for new prompt)";
+    return {};
   }
-  if(st.len>0 && st.first_pos<0){ err="mtp invalid first_pos"; return {}; }
   // Strictly this accepts the GGUF 65-layer checkpoint, not any arbitrary
   // converted weights with a similar name. Tensor dtype/dims/dev checked below.
   // ---- pesi residenti (tutti su GPU1 tranne emb su GPU0) ----
@@ -345,10 +355,16 @@ std::vector<float> draft_step(const float* h_last, int tok, MtpState& st, long p
   out.resize(248320);
   MTP_CK(cudaMemcpy(out.data(),d_log,(size_t)248320*4,cudaMemcpyDeviceToHost),err,fail);
   cudaFree(d_log); d_log=nullptr;
-  if(st.len==0) st.first_pos=pos;
-  st.len++;
+  if(!detail::commit_append(st,pos)){
+    err="mtp bookkeeping failed after GPU write; state poisoned";
+    goto fail;
+  }
   return out;
 fail:
+  // If any CUDA failure occurred (including after writing only one of Kc/Vc),
+  // the logical length is not sufficient evidence that retained cache entries
+  // are valid. Never allow reset/rewind to silently revive such a state.
+  st.poisoned=true;
   if(d_hl)cudaFree(d_hl); if(d_e)cudaFree(d_e);
   if(d_hn)cudaFree(d_hn); if(d_en)cudaFree(d_en);
   if(d_eh)cudaFree(d_eh); if(d_ehb)cudaFree(d_ehb);

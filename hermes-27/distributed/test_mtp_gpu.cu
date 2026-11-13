@@ -1,7 +1,10 @@
-// HERMES-27 strict, multi-step verified greedy MTP regression test.
+// HERMES-27 strict, multi-step verified GREEDY K=1 MTP regression test.
 // Former k3/sweep tests reused one frozen h_last, verified with full rescans,
 // had no target state commit/rollback and used an invented bonus TPS numerator.
 // They have been removed. Exit 0 requires real GPU evidence, not just finiteness.
+// IMPORTANT: the rewind exercised here is ONLY the draft MTP KV, not the
+// pp2::DecodeState target GDN/CS/KV. This test does NOT validate K>1 batch
+// target verification or target rollback, and must not imply speed gains.
 //
 // Run only with exclusive GPU access and real GGUF checkpoint uploaded:
 //   test_mtp_gpu [verified|verified-b|all]
@@ -146,8 +149,8 @@ bool run_one(const std::vector<int>& P,int steps,const char* name,pp2::Stats& st
     }
     if(st.draft.len!=checkpoint+1){std::printf("FAIL draft len advance\n");return false;}
     if(step==0){
-      // Real GPU rollback/replay: remove a pending draft KV entry and rerun it
-      // from the exact same verified target prefix; target state stays untouched.
+      // Real GPU DRAFT-KV rewind/replay only: remove the last draft KV entry
+      // and rerun it from the verified target prefix; PP2 is NOT rewound.
       if(!mtp_gpu::rewind(st.draft,checkpoint,err))return false;
       if(st.draft.len!=checkpoint){std::printf("FAIL rewind logical length\n");return false;}
       std::vector<float> again=mtp_gpu::draft_step(
@@ -165,14 +168,14 @@ bool run_one(const std::vector<int>& P,int steps,const char* name,pp2::Stats& st
     ++proposed;accepted+=(draft_tok==teacher_tok);
     std::printf("VERIFY step=%d pos=%ld draft=%d target=%d %s\n",
                 step,pos,draft_tok,teacher_tok,draft_tok==teacher_tok?"ACCEPT":"REJECT");
-    // Every next state is driven by the target-selected token. Rejections
-    // cannot contaminate the target GDN/conv/KV state or the MTP KV history.
+    // This serial K=1 probe never places rejected speculative candidates in
+    // the target. It does NOT prove PP2 can roll back tentative target steps.
     if(!capture_hidden(st.target,prev_hidden,err))return false;
   }
   if(outputsA!=outputsB){std::printf("FAIL target stream differs\n");return false;}
   std::printf("VERIFIED PASS %s: generated %zu target-only-identical tokens, "
               "MTP_seed=%d/%d, MTP_generated=%d/%d, rejects=%d,"
-              " rollback_gpu=PASS; TPS claim=NONE\n",
+              " draft_KV_rewind_gpu=PASS; target_batch_rollback=UNSUPPORTED; TPS claim=NONE\n",
       name,outputsA.size(),seed_accepted,seed_proposals,accepted,proposed,proposed-accepted);
   std::fflush(stdout);
   return true;

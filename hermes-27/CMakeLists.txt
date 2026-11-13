@@ -306,6 +306,13 @@ endif()
 add_library(hermes_mtp STATIC distributed/mtp_gpu.cu)
 set_target_properties(hermes_mtp PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 target_link_libraries(hermes_mtp PUBLIC hermes_pp2)
+# CPU-only real-header draft bookkeeping + full 64-layer target rollback
+# POLICY mock. The real PP2 target K>1 transaction remains UNSUPPORTED.
+add_executable(test_mtp_rollback_cpu
+  distributed/tests/test_mtp_rollback_contract.cpp)
+target_link_libraries(test_mtp_rollback_cpu PRIVATE Threads::Threads)
+add_test(NAME mtp_rollback_cpu COMMAND test_mtp_rollback_cpu)
+set_tests_properties(mtp_rollback_cpu PROPERTIES TIMEOUT 60)
 add_executable(test_mtp_gpu distributed/test_mtp_gpu.cu)
 target_link_libraries(test_mtp_gpu PRIVATE hermes_mtp)
 if(HERMES_REGISTER_GPU_TESTS)

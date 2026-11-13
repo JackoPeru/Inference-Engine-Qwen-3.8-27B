@@ -1,0 +1,65 @@
+{
+  "schema": "h27.mtp.rollback.offline.v1",
+  "date": "2026-11-14",
+  "status": "CPU_MOCK_GUARDS_PASS_BUT_TARGET_BATCH_ROLLBACK_BLOCKED",
+  "gpu_executed": false,
+  "production_route_changed": false,
+  "pp2_target_batch_rollback_supported": false,
+  "changes": [
+    {
+      "path": "distributed/mtp_gpu.hpp",
+      "change": "modified",
+      "sha256": "03741b69c810769a330dac7b9fb9523da04d3d04467f163268b947afb86cf2e3"
+    },
+    {
+      "path": "distributed/mtp_gpu.cu",
+      "change": "modified",
+      "sha256": "5abaf14ccc3f6aee832b444319b9a82594a3cde99be52fc88f5d2caf8f206c17"
+    },
+    {
+      "path": "distributed/test_mtp_gpu.cu",
+      "change": "modified",
+      "sha256": "e25d27bac1845dd83bf95d074edf8da527eee417826cd22cb7343ff35e457b56"
+    },
+    {
+      "path": "distributed/tests/test_mtp_rollback_contract.cpp",
+      "change": "new",
+      "sha256": "663a11b6226ddf1ed2fbb0124275941ddb0c20c1223cdae70a8bda2d9114427b"
+    },
+    {
+      "path": "reports/MTP_ROLLBACK_BATCHED_REVIEW.md",
+      "change": "new",
+      "sha256": "1c62024bd76844d3dc393988ac6232d7a0869f12bfddb8cda23dd051d93e9940"
+    },
+    {
+      "path": "distributed/tests/test_mtp_rollback_manifest.json",
+      "change": "new",
+      "sha256": null,
+      "note": "self-hash intentionally omitted"
+    }
+  ],
+  "checks": {
+    "test_first_red": "pre-fix contract test compile failed as required",
+    "standalone_cpu_compile": "PASS",
+    "standalone_cpu_run": "PASS",
+    "cpu_assertions": 2377,
+    "asan_ubsan": "PASS",
+    "mtp_gpu_cu_offline_nvcc_compile": "PASS",
+    "test_mtp_gpu_cu_offline_nvcc_compile": "PASS",
+    "existing_cli_host_object_compile": "PASS",
+    "real_gpu_decode": "NOT_EXECUTED",
+    "live_target_rollback": "NOT_EXECUTED_AND_UNSUPPORTED"
+  },
+  "scratch_paths": {
+    "cpu_binary": "/tmp/hermes_w5_mtp_rollback_offline/test_mtp_rollback_contract",
+    "sanitizer_binary": "/tmp/hermes_w5_mtp_rollback_offline/test_mtp_rollback_san",
+    "mtp_cuda_object": "/tmp/hermes_w5_mtp_rollback_offline/mtp_gpu.o",
+    "gpu_test_cuda_object": "/tmp/hermes_w5_mtp_rollback_offline/test_mtp_gpu.o"
+  },
+  "critical_gates": [
+    "PP2 must provide per-request all-layer GDN/conv/KV/position target checkpoint and accepted-prefix commit",
+    "No MTP batched verification or throughput claim until real GPU A/B parity",
+    "MtpState ABI changed; all affected opt-in binaries must be rebuilt together",
+    "CPU mock state/transactions do not stand in for actual PP2 state handling"
+  ]
+}
