@@ -19,6 +19,7 @@
 #include <cstring>
 #include <deque>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -32,7 +33,9 @@
 
 #ifdef __linux__
 #include <sys/types.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
+#include <poll.h>
 #include <unistd.h>
 #else
 #error "Hermes serving tokenizer bridge currently requires Linux"
@@ -43,6 +46,8 @@ using json = nlohmann::json;
 using Clock = std::chrono::steady_clock;
 constexpr int kVocab = 248320; // Fixed vocabulary of the Qwen3.8-27B target model.
 constexpr std::size_t kMaxBody = 1024 * 1024;
+constexpr std::size_t kMaxBufferedStreamBytes = 1024 * 1024;
+constexpr std::size_t kMaxBufferedStreamChunks = 256;
 
 struct Config {
   std::string model = "/home/matteo/hermes-27/models/Qwen3.8-27B-Uncensored-NVFP4-MTP.gguf";
@@ -52,6 +57,7 @@ struct Config {
   std::string model_id = "hermes-27";
   std::string host = "127.0.0.1";
   std::string api_key;
+  std::string api_key_file;
   int port = 0;
   int active = 4;
   int queued = 32;
@@ -64,7 +70,7 @@ struct Config {
 void usage(FILE* out) {
   std::fprintf(out,
     "Usage: hermes_server --model FILE.gguf [--host 127.0.0.1] [--port 0] "
-    "[--active 1..16] [--queue 1..32] [--context 1..8192] [--api-key KEY]\n"
+    "[--active 1..16] [--queue 1..32] [--context 1..8192] [--api-key KEY | --api-key-file FILE]\n"
     "Optional: --tokenizer FILE --gguf-dump FILE --python FILE --model-id ID\n"
     "Greedy text-only PP2; context defaults to 128. Unsupported sampling/tools are rejected.\n");
 }
@@ -92,6 +98,7 @@ bool parse_args(int argc, char** argv, Config& cfg, bool& show_help) {
     else if (arg == "--model-id") cfg.model_id = value;
     else if (arg == "--host") cfg.host = value;
     else if (arg == "--api-key") cfg.api_key = value;
+    else if (arg == "--api-key-file") cfg.api_key_file = value;
     else if (arg == "--port") { if (!parse_int(value, cfg.port) || cfg.port < 0 || cfg.port > 65535) return false; }
     else if (arg == "--active") { if (!parse_int(value, cfg.active) || cfg.active < 1 || cfg.active > 16) return false; }
     else if (arg == "--queue") { if (!parse_int(value, cfg.queued) || cfg.queued < 1 || cfg.queued > 32) return false; }
@@ -106,36 +113,10 @@ bool parse_args(int argc, char** argv, Config& cfg, bool& show_help) {
 
 class TokenizerBridge {
  public:
-  TokenizerBridge(const Config& cfg, const std::string& helper) {
-    int to_child[2], from_child[2];
-    if (pipe(to_child) || pipe(from_child)) throw std::runtime_error("tokenizer bridge pipe failed");
-    pid_ = fork();
-    if (pid_ < 0) throw std::runtime_error("tokenizer bridge fork failed");
-    if (pid_ == 0) {
-      close(to_child[1]); close(from_child[0]);
-      if (dup2(to_child[0], STDIN_FILENO) < 0 || dup2(from_child[1], STDOUT_FILENO) < 0) _exit(126);
-      close(to_child[0]); close(from_child[1]);
-      char* args[] = {
-        const_cast<char*>(cfg.python.c_str()), const_cast<char*>(helper.c_str()),
-        const_cast<char*>("--tokenizer"), const_cast<char*>(cfg.tokenizer.c_str()),
-        const_cast<char*>("--model"), const_cast<char*>(cfg.model.c_str()),
-        const_cast<char*>("--gguf-dump"), const_cast<char*>(cfg.gguf_dump.c_str()), nullptr
-      };
-      execv(cfg.python.c_str(), args);
-      _exit(127);
-    }
-    close(to_child[0]); close(from_child[1]);
-    input_ = to_child[1]; output_ = from_child[0];
-    json ready = json::parse(read_line());
-    if (!ready.value("ready", false)) throw std::runtime_error("tokenizer startup: " + ready.value("error", "no ready response"));
-    incremental_ = ready.value("incremental", false);
-  }
+  TokenizerBridge(const Config& cfg, const std::string& helper)
+      : cfg_(cfg), helper_(helper) { launch_child(); }
 
-  ~TokenizerBridge() {
-    if (input_ >= 0) close(input_);
-    if (output_ >= 0) close(output_);
-    if (pid_ > 0) { int status = 0; while (waitpid(pid_, &status, 0) < 0 && errno == EINTR) {} }
-  }
+  ~TokenizerBridge() { stop_child(); }
 
   std::vector<int> encode(const json& messages, bool thinking) {
     json response = call({{"op", "encode"}, {"messages", messages}, {"thinking", thinking}});
@@ -170,6 +151,71 @@ class TokenizerBridge {
   }
 
  private:
+  void stop_child() {
+    if (input_ >= 0) { close(input_); input_ = -1; }
+    if (output_ >= 0) { close(output_); output_ = -1; }
+    pending_.clear();
+    incremental_ = false;
+    if (pid_ <= 0) return;
+    const pid_t child = pid_;
+    pid_ = -1;
+    int status = 0;
+    auto wait_for_exit = [&] {
+      for (int i = 0; i < 20; ++i) {
+        const pid_t done = waitpid(child, &status, WNOHANG);
+        if (done == child || (done < 0 && errno == ECHILD)) return true;
+        if (done < 0 && errno != EINTR) return false;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      }
+      return false;
+    };
+    if (wait_for_exit()) return;
+    kill(child, SIGTERM);
+    if (wait_for_exit()) return;
+    kill(child, SIGKILL);
+    while (waitpid(child, &status, 0) < 0 && errno == EINTR) {}
+  }
+
+  void launch_child() {
+    int to_child[2] = {-1, -1}, from_child[2] = {-1, -1};
+    if (pipe(to_child) != 0) throw std::runtime_error("tokenizer input pipe failed");
+    if (pipe(from_child) != 0) {
+      close(to_child[0]); close(to_child[1]);
+      throw std::runtime_error("tokenizer output pipe failed");
+    }
+    const pid_t child = fork();
+    if (child < 0) {
+      close(to_child[0]); close(to_child[1]);
+      close(from_child[0]); close(from_child[1]);
+      throw std::runtime_error("tokenizer bridge fork failed");
+    }
+    if (child == 0) {
+      close(to_child[1]); close(from_child[0]);
+      if (dup2(to_child[0], STDIN_FILENO) < 0 || dup2(from_child[1], STDOUT_FILENO) < 0) _exit(126);
+      close(to_child[0]); close(from_child[1]);
+      char* args[] = {
+        const_cast<char*>(cfg_.python.c_str()), const_cast<char*>(helper_.c_str()),
+        const_cast<char*>("--tokenizer"), const_cast<char*>(cfg_.tokenizer.c_str()),
+        const_cast<char*>("--model"), const_cast<char*>(cfg_.model.c_str()),
+        const_cast<char*>("--gguf-dump"), const_cast<char*>(cfg_.gguf_dump.c_str()), nullptr
+      };
+      execv(cfg_.python.c_str(), args);
+      _exit(127);
+    }
+    pid_ = child;
+    close(to_child[0]); close(from_child[1]);
+    input_ = to_child[1]; output_ = from_child[0];
+    try {
+      json ready = json::parse(read_line());
+      if (!ready.value("ready", false))
+        throw std::runtime_error("tokenizer startup: " + ready.value("error", "no ready response"));
+      incremental_ = ready.value("incremental", false);
+    } catch (...) {
+      stop_child();
+      throw;
+    }
+  }
+
   static bool write_all(int fd, const char* data, std::size_t size) {
     while (size) {
       ssize_t n = write(fd, data, size);
@@ -188,6 +234,12 @@ class TokenizerBridge {
         pending_.erase(0, newline + 1);
         return line;
       }
+      // Avoid wedging all clients on a stuck Python/Jinja subprocess.
+      pollfd watch{output_, POLLIN, 0};
+      const int ready = poll(&watch, 1, 15000);
+      if (ready < 0 && errno == EINTR) continue;
+      if (ready < 0) throw std::runtime_error("tokenizer bridge poll failed");
+      if (ready == 0) throw std::runtime_error("tokenizer bridge timed out");
       char buffer[4096];
       ssize_t n = read(output_, buffer, sizeof(buffer));
       if (n < 0 && errno == EINTR) continue;
@@ -199,13 +251,35 @@ class TokenizerBridge {
 
   json call(const json& request) {
     std::lock_guard<std::mutex> lock(mutex_);
-    std::string line = request.dump() + "\n";
-    if (!write_all(input_, line.data(), line.size())) throw std::runtime_error("tokenizer bridge write failed");
-    json response = json::parse(read_line());
+    const std::string line = request.dump() + "\n";
+    auto transact = [&]() {
+      if (input_ < 0 || !write_all(input_, line.data(), line.size()))
+        throw std::runtime_error("tokenizer bridge write failed");
+      return json::parse(read_line());
+    };
+    json response;
+    try {
+      response = transact();
+    } catch (const std::exception& e) {
+      const std::string failure = e.what();
+      // Encode and full decode are idempotent. A broken bridge can be
+      // restarted and retried once. Stream state must fail closed.
+      const std::string op = request.value("op", "");
+      const bool retry = op == "encode" || op == "decode";
+      stop_child();
+      try { launch_child(); }
+      catch (const std::exception& restart) {
+        throw std::runtime_error("tokenizer unavailable: " + std::string(restart.what()));
+      }
+      if (!retry) throw std::runtime_error("tokenizer state lost after restart: " + failure);
+      response = transact();
+    }
     if (response.contains("error")) throw std::runtime_error(response.value("error", "tokenizer error"));
     return response;
   }
 
+  Config cfg_;
+  std::string helper_;
   pid_t pid_ = -1;
   int input_ = -1, output_ = -1;
   std::string pending_;
@@ -216,6 +290,7 @@ class TokenizerBridge {
 struct Metrics {
   std::atomic<std::uint64_t> requests{0}, accepted{0}, completed{0}, rejected{0};
   std::atomic<std::uint64_t> cancelled{0}, errors{0}, prompt_tokens{0}, completion_tokens{0};
+  std::atomic<std::uint64_t> stream_backpressure{0};
 };
 
 struct Job {
@@ -224,10 +299,14 @@ struct Job {
   std::vector<int> prompt;
   std::vector<int> output;
   std::string text;
+  std::string decoded_text; // Unfiltered output, only needed for text stop sequences.
+  std::vector<std::string> stops;
   std::size_t sent_bytes = 0;
   std::string error;
   json response;
   bool stream = false;
+  bool include_usage = false;
+  bool stop_matched = false;
   int max_new_tokens = 32;
   int http_status = 200;
   std::size_t prompt_pos = 0;
@@ -241,6 +320,7 @@ struct Job {
   std::mutex mutex;
   std::condition_variable cv;
   std::deque<std::string> stream_chunks;
+  std::size_t stream_buffered_bytes = 0;
 };
 
 class Scheduler {
@@ -300,6 +380,7 @@ class Scheduler {
     out += "# TYPE hermes_requests_completed_total counter\nhermes_requests_completed_total " + std::to_string(m.completed.load()) + "\n";
     out += "# TYPE hermes_requests_rejected_total counter\nhermes_requests_rejected_total " + std::to_string(m.rejected.load()) + "\n";
     out += "# TYPE hermes_requests_cancelled_total counter\nhermes_requests_cancelled_total " + std::to_string(m.cancelled.load()) + "\n";
+    out += "# TYPE hermes_stream_backpressure_total counter\nhermes_stream_backpressure_total " + std::to_string(m.stream_backpressure.load()) + "\n";
     out += "# TYPE hermes_inference_errors_total counter\nhermes_inference_errors_total " + std::to_string(m.errors.load()) + "\n";
     out += "# TYPE hermes_requests_active gauge\nhermes_requests_active " + std::to_string(active) + "\n";
     out += "# TYPE hermes_requests_queued gauge\nhermes_requests_queued " + std::to_string(queued) + "\n";
@@ -324,6 +405,34 @@ class Scheduler {
   }
 
  private:
+  static void update_visible_text(Job& job, bool final) {
+    if (job.stop_matched) return;
+    if (job.stops.empty()) return;
+    std::size_t stop_at = std::string::npos;
+    for (const auto& stop : job.stops) {
+      const auto at = job.decoded_text.find(stop);
+      if (at != std::string::npos && (stop_at == std::string::npos || at < stop_at))
+        stop_at = at;
+    }
+    if (stop_at != std::string::npos) {
+      job.stop_matched = true;
+      job.text.assign(job.decoded_text, 0, stop_at);
+      return;
+    }
+    std::size_t hold = 0;
+    if (!final) {
+      // A partial stop prefix must never reach SSE: a subsequent token may
+      // complete it. This also handles stop boundaries inside ByteLevel tokens.
+      for (const auto& stop : job.stops) {
+        for (std::size_t n = 1; n < stop.size() && n <= job.decoded_text.size(); ++n) {
+          if (job.decoded_text.compare(job.decoded_text.size() - n, n, stop, 0, n) == 0)
+            hold = std::max(hold, n);
+        }
+      }
+    }
+    job.text.assign(job.decoded_text, 0, job.decoded_text.size() - hold);
+  }
+
   static json chunk(const Job& job, json delta, const char* finish) {
     json choice = {{"index", 0}, {"delta", std::move(delta)}, {"finish_reason", nullptr}};
     if (finish) choice["finish_reason"] = finish;
@@ -331,9 +440,16 @@ class Scheduler {
             {"model", job.model}, {"choices", json::array({choice})}};
   }
 
-  static void push_stream_locked(Job& job, const json& payload) {
-    job.stream_chunks.push_back("data: " + payload.dump() + "\n\n");
+  static bool push_stream_locked(Job& job, const json& payload, bool terminal = false) {
+    std::string chunk = "data: " + payload.dump() + "\n\n";
+    if (!terminal && (job.stream_chunks.size() >= kMaxBufferedStreamChunks ||
+        job.stream_buffered_bytes + chunk.size() > kMaxBufferedStreamBytes)) {
+      return false;
+    }
+    job.stream_buffered_bytes += chunk.size();
+    job.stream_chunks.push_back(std::move(chunk));
     job.cv.notify_all();
+    return true;
   }
 
   void stream_text(const std::shared_ptr<Job>& job) {
@@ -345,8 +461,15 @@ class Scheduler {
     // All updates append stable decoded characters, so a byte offset is
     // sufficient. Copying/comparing the entire sent prefix was O(n^2).
     const std::string delta = job->text.substr(job->sent_bytes);
+    if (!delta.empty() && !push_stream_locked(*job, chunk(*job, {{"content", delta}}, nullptr))) {
+      bool expected = false;
+      if (job->cancel.compare_exchange_strong(expected, true)) {
+        metrics_.cancelled.fetch_add(1);
+        metrics_.stream_backpressure.fetch_add(1);
+      }
+      return;
+    }
     job->sent_bytes = job->text.size();
-    if (!delta.empty()) push_stream_locked(*job, chunk(*job, {{"content", delta}}, nullptr));
   }
 
   void complete(const std::shared_ptr<Job>& job, int status, std::string error,
@@ -357,7 +480,11 @@ class Scheduler {
     const bool was_incremental = job->stream_started;
     if (was_incremental) {
       try {
-        if (status == 200) job->text += tokenizer_.stream_finish(job->id);
+        if (status == 200) {
+          std::string tail = tokenizer_.stream_finish(job->id);
+          if (job->stops.empty()) job->text += tail;
+          else job->decoded_text += tail;
+        }
         else tokenizer_.stream_abort(job->id);
       } catch (const std::exception& e) {
         status = 500;
@@ -370,16 +497,21 @@ class Scheduler {
         // One reference decode verifies exact final parity (also for invalid
         // Unicode / byte fallback) and serves non-stream clients directly.
         std::string reference = tokenizer_.decode(job->output);
-        if (was_incremental && job->text != reference)
+        if (was_incremental &&
+            (job->stops.empty() ? job->text : job->decoded_text) != reference)
           throw std::runtime_error("incremental decoder output mismatch");
-        job->text = std::move(reference);
+        if (job->stops.empty()) job->text = std::move(reference);
+        else {
+          job->decoded_text = std::move(reference);
+          update_visible_text(*job, true);
+        }
       }
       catch (const std::exception& e) { status = 500; error = std::string("detokenization failed: ") + e.what(); }
     }
     if (status == 200) stream_text(job);
 
     if (status == 200) {
-      const std::string reason = was_cancelled ? "cancelled" : finish_reason;
+      const std::string reason = was_cancelled ? "cancelled" : (job->stop_matched ? "stop" : finish_reason);
       job->response = {
         {"id", job->id}, {"object", "chat.completion"}, {"created", job->created}, {"model", job->model},
         {"choices", json::array({{{"index", 0}, {"message", {{"role", "assistant"}, {"content", job->text}}}, {"finish_reason", reason}}})},
@@ -393,9 +525,25 @@ class Scheduler {
       job->http_status = status;
       job->error = std::move(error);
       if (job->stream) {
-        if (status == 200) push_stream_locked(*job, chunk(*job, json::object(), was_cancelled ? "cancelled" : finish_reason.c_str()));
-        else push_stream_locked(*job, {{"error", {{"message", job->error}, {"type", "server_error"}}}});
-        job->stream_chunks.push_back("data: [DONE]\n\n");
+        if (status == 200) {
+          const char* reason = was_cancelled ? "cancelled" : (job->stop_matched ? "stop" : finish_reason.c_str());
+          push_stream_locked(*job, chunk(*job, json::object(), reason), true);
+          if (job->include_usage) {
+            const std::string usage_chunk = "data: " + json({
+              {"id", job->id}, {"object", "chat.completion.chunk"}, {"created", job->created},
+              {"model", job->model}, {"choices", json::array()},
+              {"usage", {{"prompt_tokens", job->prompt.size()},
+                         {"completion_tokens", job->output.size()},
+                         {"total_tokens", job->prompt.size() + job->output.size()}}}
+            }).dump() + "\n\n";
+            job->stream_buffered_bytes += usage_chunk.size();
+            job->stream_chunks.push_back(usage_chunk);
+          }
+        }
+        else push_stream_locked(*job, {{"error", {{"message", job->error}, {"type", "server_error"}}}}, true);
+        static constexpr char done[] = "data: [DONE]\n\n";
+        job->stream_buffered_bytes += sizeof(done) - 1;
+        job->stream_chunks.emplace_back(done);
       }
       job->done.store(true);
       job->cv.notify_all();
@@ -407,9 +555,10 @@ class Scheduler {
     } else {
       metrics_.errors.fetch_add(1);
     }
-    std::fprintf(stderr, "request id=%s status=%d prompt_tokens=%zu completion_tokens=%zu finish=%s ids=",
+    // Token IDs can reconstruct generated content: do not write them to
+    // production logs. Counters, request ID and errors remain diagnosable.
+    std::fprintf(stderr, "request id=%s status=%d prompt_tokens=%zu completion_tokens=%zu finish=%s",
                  job->id.c_str(), status, job->prompt.size(), job->output.size(), finish_reason.c_str());
-    for (std::size_t i = 0; i < job->output.size(); ++i) std::fprintf(stderr, "%s%d", i ? "," : "", job->output[i]);
     if (!job->error.empty()) std::fprintf(stderr, " error=%s", job->error.c_str());
     std::fputc('\n', stderr);
     std::fflush(stderr);
@@ -493,7 +642,7 @@ class Scheduler {
         }
         job->state_ready = true;
         if (job->cancel.load()) { complete(job, 200, {}, "cancelled"); continue; }
-        if (job->stream && tokenizer_.incremental_supported()) {
+        if ((job->stream || !job->stops.empty()) && tokenizer_.incremental_supported()) {
           try {
             tokenizer_.stream_start(job->id);
             job->stream_started = true;
@@ -561,11 +710,29 @@ class Scheduler {
         if (token < 0) { complete(job, 500, "greedy selection failed: " + errors[i], "length"); finished.push_back(job); continue; }
         job->output.push_back(token);
         if (job->stream_started) {
-          try { job->text += tokenizer_.stream_push(job->id, token); }
+          try {
+            const std::string delta = tokenizer_.stream_push(job->id, token);
+            if (job->stops.empty()) job->text += delta;
+            else {
+              job->decoded_text += delta;
+              update_visible_text(*job, false);
+            }
+          }
           catch (const std::exception& e) { complete(job, 500, std::string("incremental detokenization failed: ") + e.what(), "length"); finished.push_back(job); continue; }
           stream_text(job);
+        } else if (!job->stops.empty()) {
+          // Safe fallback for non-ByteLevel tokenizers: detect stop strings
+          // against the reference decoder, but stream only the final text.
+          try {
+            job->decoded_text = tokenizer_.decode(job->output);
+            update_visible_text(*job, false);
+          } catch (const std::exception& e) {
+            complete(job, 500, std::string("stop decoding failed: ") + e.what(), "length");
+            finished.push_back(job);
+            continue;
+          }
         }
-        if (token == eos_) { complete(job, 200, {}, "stop"); finished.push_back(job); }
+        if (job->stop_matched || token == eos_) { complete(job, 200, {}, "stop"); finished.push_back(job); }
         else if (static_cast<int>(job->output.size()) >= job->max_new_tokens) {
           complete(job, 200, {}, "length"); finished.push_back(job);
         }
@@ -612,6 +779,22 @@ bool authorize(const httplib::Request& req, const Config& cfg, httplib::Response
   return false;
 }
 
+bool require_json_content_type(const httplib::Request& req, httplib::Response& res) {
+  std::string type = req.get_header_value("Content-Type");
+  const auto semicolon = type.find(';');
+  if (semicolon != std::string::npos) type.resize(semicolon);
+  const auto begin = type.find_first_not_of(" \t");
+  const auto end = type.find_last_not_of(" \t");
+  if (begin == std::string::npos) type.clear();
+  else type = type.substr(begin, end - begin + 1);
+  std::transform(type.begin(), type.end(), type.begin(),
+                 [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  if (type == "application/json") return true;
+  set_error(res, 415, "Content-Type must be application/json",
+            "invalid_request_error", "Content-Type", "unsupported_media_type");
+  return false;
+}
+
 bool is_loopback(const std::string& host) {
   return host == "127.0.0.1" || host == "localhost" || host == "::1";
 }
@@ -619,7 +802,7 @@ bool is_loopback(const std::string& host) {
 bool unsupported(const json& body, httplib::Response& res) {
   static const std::set<std::string> allowed = {
     "model", "messages", "max_tokens", "max_completion_tokens", "temperature", "top_p", "n",
-    "stream", "reasoning", "presence_penalty", "frequency_penalty", "user"
+    "stream", "stream_options", "stop", "reasoning", "presence_penalty", "frequency_penalty", "user"
   };
   for (auto it = body.begin(); it != body.end(); ++it) {
     if (!allowed.count(it.key())) {
@@ -638,39 +821,68 @@ bool read_messages(const json& body, json& messages, httplib::Response& res) {
   }
   messages = json::array();
   for (const auto& message : *it) {
-    if (!message.is_object() || message.size() != 2 || !message.contains("role") || !message.contains("content") ||
-        !message["role"].is_string() || !message["content"].is_string()) {
-      set_error(res, 400, "messages support only role and plain-text content", "invalid_request_error", "messages", "unsupported_value");
+    if (!message.is_object() || !message.contains("role") || !message.contains("content") ||
+        !message["role"].is_string() || message.size() > 3 ||
+        (message.size() == 3 && (!message.contains("name") || !message["name"].is_string()))) {
+      set_error(res, 400, "messages require role, text content, and optional string name", "invalid_request_error", "messages", "unsupported_value");
       return false;
     }
-    const std::string role = message["role"].get<std::string>();
-    if (role != "system" && role != "user" && role != "assistant") {
-      set_error(res, 400, "supported message roles: system, user, assistant", "invalid_request_error", "messages.role", "unsupported_value");
+    std::string role = message["role"].get<std::string>();
+    if (role != "system" && role != "developer" && role != "user" && role != "assistant") {
+      set_error(res, 400, "supported message roles: system, developer, user, assistant", "invalid_request_error", "messages.role", "unsupported_value");
       return false;
     }
-    messages.push_back({{"role", role}, {"content", message["content"]}});
+    // Qwen's template has no developer role. Map it to system while keeping
+    // role ordering; this is an explicit text-only compatibility adaptation.
+    if (role == "developer") role = "system";
+    std::string content;
+    const auto& parts = message["content"];
+    if (parts.is_string()) content = parts.get<std::string>();
+    else if (parts.is_array() && !parts.empty()) {
+      for (const auto& part : parts) {
+        if (!part.is_object() || part.size() != 2 ||
+            !part.contains("type") || !part["type"].is_string() ||
+            part["type"] != "text" || !part.contains("text") ||
+            !part["text"].is_string()) {
+          set_error(res, 400, "only text content parts are supported", "invalid_request_error",
+                    "messages.content", "unsupported_value");
+          return false;
+        }
+        content += part["text"].get<std::string>();
+      }
+    } else {
+      set_error(res, 400, "content must be a string or non-empty text-parts array",
+                "invalid_request_error", "messages.content", "unsupported_value");
+      return false;
+    }
+    messages.push_back({{"role", role}, {"content", content}});
   }
   return true;
 }
 
 bool read_request_options(const json& body, const Config& cfg, bool& stream, bool& thinking,
-                          int& max_tokens, httplib::Response& res) {
+                          int& max_tokens, std::vector<std::string>& stops,
+                          bool& include_usage, httplib::Response& res) {
   stream = false; thinking = true; max_tokens = std::min(32, cfg.context);
+  stops.clear(); include_usage = false;
   if (body.contains("model")) {
     if (!body["model"].is_string() || body["model"].get<std::string>() != cfg.model_id) {
       set_error(res, 404, "model not found", "invalid_request_error", "model", "model_not_found");
       return false;
     }
   }
-  if (body.contains("stream")) {
+  if (body.contains("stream") && !body["stream"].is_null()) {
     if (!body["stream"].is_boolean()) { set_error(res, 400, "stream must be boolean", "invalid_request_error", "stream", "invalid_type"); return false; }
     stream = body["stream"].get<bool>();
   }
+  if (body.contains("max_tokens") && body.contains("max_completion_tokens") &&
+      !body["max_tokens"].is_null() && !body["max_completion_tokens"].is_null()) {
+    set_error(res, 400, "provide only one token limit", "invalid_request_error", "max_tokens", "invalid_value");
+    return false;
+  }
   for (const char* name : {"max_tokens", "max_completion_tokens"}) {
     if (!body.contains(name)) continue;
-    if (body.contains("max_tokens") && body.contains("max_completion_tokens")) {
-      set_error(res, 400, "provide only one token limit", "invalid_request_error", "max_tokens", "invalid_value"); return false;
-    }
+    if (body[name].is_null()) continue;
     if (!body[name].is_number_integer()) { set_error(res, 400, "token limit must be an integer", "invalid_request_error", name, "invalid_type"); return false; }
     const bool within_limit = body[name].is_number_unsigned()
       ? (body[name].get<std::uint64_t>() >= 1 && body[name].get<std::uint64_t>() <= static_cast<std::uint64_t>(cfg.context))
@@ -681,21 +893,66 @@ bool read_request_options(const json& body, const Config& cfg, bool& stream, boo
     }
     max_tokens = body[name].get<int>();
   }
-  if (body.contains("temperature") && (!body["temperature"].is_number() || body["temperature"].get<double>() != 0.0)) {
+  if (body.contains("temperature") && !body["temperature"].is_null() &&
+      (!body["temperature"].is_number() || body["temperature"].get<double>() != 0.0)) {
     set_error(res, 400, "only greedy temperature=0 is supported", "invalid_request_error", "temperature", "unsupported_value"); return false;
   }
-  if (body.contains("top_p") && (!body["top_p"].is_number() || body["top_p"].get<double>() != 1.0)) {
+  if (body.contains("top_p") && !body["top_p"].is_null() &&
+      (!body["top_p"].is_number() || body["top_p"].get<double>() != 1.0)) {
     set_error(res, 400, "only top_p=1 is supported by greedy decoding", "invalid_request_error", "top_p", "unsupported_value"); return false;
   }
-  if (body.contains("n") && (!body["n"].is_number_integer() || body["n"].get<int>() != 1)) {
-    set_error(res, 400, "only n=1 is supported", "invalid_request_error", "n", "unsupported_value"); return false;
+  if (body.contains("n") && !body["n"].is_null()) {
+    const auto& n = body["n"];
+    const bool one = n.is_number_unsigned() ? n.get<std::uint64_t>() == 1
+                    : (n.is_number_integer() && n.get<std::int64_t>() == 1);
+    if (!one) {
+      set_error(res, 400, "only n=1 is supported", "invalid_request_error", "n", "unsupported_value");
+      return false;
+    }
   }
   for (const char* name : {"presence_penalty", "frequency_penalty"}) {
-    if (body.contains(name) && (!body[name].is_number() || body[name].get<double>() != 0.0)) {
+    if (body.contains(name) && !body[name].is_null() &&
+        (!body[name].is_number() || body[name].get<double>() != 0.0)) {
       set_error(res, 400, "non-zero penalties require sampling and are unsupported", "invalid_request_error", name, "unsupported_value"); return false;
     }
   }
-  if (body.contains("reasoning")) {
+  if (body.contains("user") && !body["user"].is_null() && !body["user"].is_string()) {
+    set_error(res, 400, "user must be a string", "invalid_request_error", "user", "invalid_type");
+    return false;
+  }
+  if (body.contains("stop") && !body["stop"].is_null()) {
+    const auto& stop = body["stop"];
+    if (stop.is_string()) stops.push_back(stop.get<std::string>());
+    else if (stop.is_array() && stop.size() >= 1 && stop.size() <= 4) {
+      for (const auto& value : stop) {
+        if (!value.is_string()) {
+          set_error(res, 400, "stop must contain strings", "invalid_request_error", "stop", "invalid_value");
+          return false;
+        }
+        stops.push_back(value.get<std::string>());
+      }
+    } else {
+      set_error(res, 400, "stop must be a string or array of 1..4 strings", "invalid_request_error", "stop", "invalid_value");
+      return false;
+    }
+    for (const auto& value : stops) {
+      if (value.empty() || value.size() > 256) {
+        set_error(res, 400, "stop entries must contain 1..256 UTF-8 bytes", "invalid_request_error", "stop", "invalid_value");
+        return false;
+      }
+    }
+  }
+  if (body.contains("stream_options") && !body["stream_options"].is_null()) {
+    const auto& options = body["stream_options"];
+    if (!stream || !options.is_object() || options.size() != 1 ||
+        !options.contains("include_usage") || !options["include_usage"].is_boolean()) {
+      set_error(res, 400, "stream_options requires stream=true and {include_usage:boolean}",
+                "invalid_request_error", "stream_options", "invalid_value");
+      return false;
+    }
+    include_usage = options["include_usage"].get<bool>();
+  }
+  if (body.contains("reasoning") && !body["reasoning"].is_null()) {
     const auto& reasoning = body["reasoning"];
     if (!reasoning.is_object() || reasoning.size() != 1) {
       set_error(res, 400, "reasoning accepts only {enabled:boolean} or {effort:string}", "invalid_request_error", "reasoning", "unsupported_value"); return false;
@@ -726,6 +983,25 @@ int main(int argc, char** argv) {
   Config cfg;
   bool show_help = false;
   if (!parse_args(argc, argv, cfg, show_help)) return show_help ? 0 : 2;
+  if (!cfg.api_key_file.empty()) {
+    if (!cfg.api_key.empty()) {
+      std::fprintf(stderr, "choose --api-key or --api-key-file, not both\n");
+      return 2;
+    }
+    struct stat st {};
+    if (stat(cfg.api_key_file.c_str(), &st) != 0 || !S_ISREG(st.st_mode) ||
+        (st.st_mode & (S_IRWXG | S_IRWXO)) != 0) {
+      std::fprintf(stderr, "api-key-file must be a regular file accessible only to its owner (mode 0600)\n");
+      return 2;
+    }
+    std::ifstream file(cfg.api_key_file, std::ios::binary);
+    std::getline(file, cfg.api_key);
+    if (!cfg.api_key.empty() && cfg.api_key.back() == '\r') cfg.api_key.pop_back();
+    if (!file || cfg.api_key.empty() || cfg.api_key.size() > 256 || file.peek() != EOF) {
+      std::fprintf(stderr, "api-key-file must contain exactly one non-empty key of at most 256 bytes\n");
+      return 2;
+    }
+  }
   if (!std::filesystem::exists(cfg.model) || !std::filesystem::exists(cfg.tokenizer) ||
       !std::filesystem::exists(cfg.gguf_dump) || !std::filesystem::exists(cfg.python)) {
     std::fprintf(stderr, "model/tokenizer/gguf_dump/python path missing\n"); return 2;
@@ -762,7 +1038,11 @@ int main(int argc, char** argv) {
     httplib::Server server;
     server.set_payload_max_length(kMaxBody);
     server.set_keep_alive_timeout(5);
-    server.new_task_queue = [] { return new httplib::ThreadPool(64); };
+    server.set_read_timeout(15, 0);
+    server.set_write_timeout(15, 0);
+    // Bound both HTTP workers and requests waiting before reaching the
+    // inference queue; otherwise cpp-httplib defaults to unbounded jobs.
+    server.new_task_queue = [] { return new httplib::ThreadPool(64, 64, 64); };
 
     server.Get("/health", [&](const httplib::Request& req, httplib::Response& res) {
       if (!authorize(req, cfg, res)) return;
@@ -778,6 +1058,7 @@ int main(int argc, char** argv) {
     });
     server.Post("/v1/cancel", [&](const httplib::Request& req, httplib::Response& res) {
       if (!authorize(req, cfg, res)) return;
+      if (!require_json_content_type(req, res)) return;
       json body;
       try { body = json::parse(req.body); }
       catch (...) { set_error(res, 400, "invalid JSON body", "invalid_request_error", "body", "invalid_json"); return; }
@@ -792,14 +1073,17 @@ int main(int argc, char** argv) {
     server.Post("/v1/chat/completions", [&](const httplib::Request& req, httplib::Response& res) {
       scheduler.request();
       if (!authorize(req, cfg, res)) { scheduler.rejected(); return; }
+      if (!require_json_content_type(req, res)) { scheduler.rejected(); return; }
       json body;
       try { body = json::parse(req.body); }
       catch (...) { scheduler.rejected(); set_error(res, 400, "invalid JSON body", "invalid_request_error", "body", "invalid_json"); return; }
       if (!body.is_object()) { scheduler.rejected(); set_error(res, 400, "request body must be a JSON object", "invalid_request_error", "body", "invalid_type"); return; }
       if (unsupported(body, res)) { scheduler.rejected(); return; }
       bool stream = false, thinking = true;
+      bool include_usage = false;
+      std::vector<std::string> stops;
       int max_tokens = 32;
-      if (!read_request_options(body, cfg, stream, thinking, max_tokens, res)) { scheduler.rejected(); return; }
+      if (!read_request_options(body, cfg, stream, thinking, max_tokens, stops, include_usage, res)) { scheduler.rejected(); return; }
       json messages;
       if (!read_messages(body, messages, res)) { scheduler.rejected(); return; }
 
@@ -822,6 +1106,8 @@ int main(int argc, char** argv) {
       job->prompt = std::move(prompt);
       job->max_new_tokens = max_tokens;
       job->stream = stream;
+      job->stops = std::move(stops);
+      job->include_usage = include_usage;
       job->created = std::time(nullptr);
       if (!scheduler.enqueue(job)) {
         scheduler.rejected();
@@ -857,7 +1143,11 @@ int main(int argc, char** argv) {
               {
                 std::unique_lock<std::mutex> lock(job->mutex);
                 job->cv.wait_for(lock, std::chrono::milliseconds(250), [&] { return !job->stream_chunks.empty() || job->done.load(); });
-                if (!job->stream_chunks.empty()) { chunk_text = std::move(job->stream_chunks.front()); job->stream_chunks.pop_front(); }
+                if (!job->stream_chunks.empty()) {
+                  chunk_text = std::move(job->stream_chunks.front());
+                  job->stream_buffered_bytes -= chunk_text.size();
+                  job->stream_chunks.pop_front();
+                }
                 else if (job->done.load()) { sink.done(); return true; }
               }
               if (!chunk_text.empty() && !sink.write(chunk_text.data(), chunk_text.size())) { scheduler.cancel(job->id); return false; }
@@ -894,7 +1184,12 @@ int main(int argc, char** argv) {
     std::thread listener([&] { server.listen_after_bind(); server_finished.store(true); });
     std::thread watcher([&] {
       while (!g_shutdown.load() && !server_finished.load()) std::this_thread::sleep_for(std::chrono::milliseconds(100));
-      if (g_shutdown.load() && !server_finished.load()) server.stop();
+      if (g_shutdown.load() && !server_finished.load()) {
+        // Wake pending non-stream and SSE handlers before joining the HTTP
+        // listener. Joining the listener first could wait forever for them.
+        scheduler.stop();
+        server.stop();
+      }
     });
     listener.join();
     g_shutdown.store(true);

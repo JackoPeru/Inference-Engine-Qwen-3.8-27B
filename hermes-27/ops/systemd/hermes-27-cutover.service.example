@@ -1,0 +1,28 @@
+# DO NOT enable or start as part of installation. Requires an approved cutover.
+# The file paths in ExecStart/ExecStopPost must match the deployed checkout.
+[Unit]
+Description=HERMES-27 guarded maintenance cutover (restores Tabby on stop)
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/hermes/hermes-27.json
+
+[Service]
+Type=simple
+User=matteo
+Group=matteo
+WorkingDirectory=/home/matteo/hermes-27
+Environment=PYTHONUNBUFFERED=1
+UMask=0077
+RuntimeDirectory=hermes-27
+RuntimeDirectoryMode=0700
+ExecStart=/usr/bin/python3 /home/matteo/hermes-27/ops/production_deploy.py run --config /etc/hermes/hermes-27.json --authorized
+ExecStopPost=/usr/bin/python3 /home/matteo/hermes-27/ops/production_deploy.py recover --config /etc/hermes/hermes-27.json --authorized
+Restart=no
+KillMode=control-group
+TimeoutStartSec=300
+TimeoutStopSec=600
+StandardOutput=journal
+StandardError=journal
+
+# No [Install] section on purpose: this unit is a one-shot opt-in maintenance
+# supervisor. It should not be automatically enabled on server boot.

@@ -9,7 +9,10 @@ import urllib.request
 
 def request(url, payload=None, headers=None, timeout=180):
     data = None if payload is None else json.dumps(payload).encode()
-    req = urllib.request.Request(url, data=data, headers=headers or {}, method="GET" if payload is None else "POST")
+    outgoing = dict(headers or {})
+    if payload is not None and "Content-Type" not in outgoing:
+        outgoing["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=outgoing, method="GET" if payload is None else "POST")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as res:
             return res.status, res.read()
