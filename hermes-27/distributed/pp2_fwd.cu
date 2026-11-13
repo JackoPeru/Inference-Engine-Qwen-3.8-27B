@@ -262,7 +262,16 @@ static WEntry* find_w(const std::string& n){
   return nullptr;
 }
 static void gemv_batch(const uint16_t* d_in, const uint8_t* d_W, float* d_out, int H, int N, int T){
-  for(int t=0;t<T;++t) nvfp4_gemv_cuda(d_in+(size_t)t*H, d_W, d_out+(size_t)t*N, H, N);
+  // Experimental CUDA GEMV A/B. Preserve the already-validated scalar path
+  // unless explicitly opted into the new raw-GGUF Warp4 implementation.
+  // The flag is read only once per process; changing it requires a restart.
+  static const Nvfp4GemvVariant variant = [] {
+    const char* value=std::getenv("HERMES_NVFP4_GEMV");
+    return (value && std::strcmp(value,"warp4")==0)
+      ? Nvfp4GemvVariant::Warp4 : Nvfp4GemvVariant::Scalar;
+  }();
+  for(int t=0;t<T;++t)
+    nvfp4_gemv_cuda_variant(d_in+(size_t)t*H,d_W,d_out+(size_t)t*N,H,N,variant);
 }
 
 static bool run_gdn_layer(int li, float* d_x, int T, std::string& err){

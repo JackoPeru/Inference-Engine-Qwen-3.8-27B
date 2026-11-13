@@ -84,7 +84,63 @@ __global__ void nvfp4_gemv_k(const __nv_bfloat16* x, const uint8_t* Wq, float* y
   for(int s=blockDim.x/2;s>0;s>>=1){ if(threadIdx.x<s) sh[threadIdx.x]+=sh[threadIdx.x+s]; __syncthreads(); }
   if(threadIdx.x==0) y[i]=sh[0];
 }
+// One warp per GGUF output row, four rows per CTA. The 32 lanes read one
+// contiguous 32-byte E2M1 payload from each 36-byte GGUF block. Each byte
+// stores two weights separated by eight elements in its 16-value sub-block.
+// All lanes of a participating warp stay active through the reductions.
+__device__ __forceinline__ float d_e2m1_warp(unsigned q){
+  unsigned m=q&7u;
+  // E2M1: {0, .5, 1, 1.5, 2, 3, 4, 6}, with the sign in bit 3.
+  unsigned mant=(m&1u) & (m!=1u);
+  unsigned bits=((126u+(m>>1))<<23) | (mant<<22);
+  bits &= 0u-(unsigned)(m!=0u);
+  bits |= (q&8u)<<28;
+  return __uint_as_float(bits);
+}
+__device__ __forceinline__ float d_ue4m3_warp(unsigned q){
+  if(q==0u || q==0x7fu) return 0.0f;
+  unsigned e=q>>3, m=q&7u;
+  if(e==0u) return (float)m * 0x1p-9f;
+  return __uint_as_float(((e+120u)<<23) | (m<<20));
+}
+__global__ void nvfp4_gemv_warp4_k(const __nv_bfloat16* __restrict__ x,
+                                    const uint8_t* __restrict__ Wq,
+                                    float* __restrict__ y, int H, int F){
+  const int lane=(int)threadIdx.x&31;
+  const int row=(int)blockIdx.x*4+((int)threadIdx.x>>5);
+  if(row>=F) return; // whole warp exits; no inter-warp synchronization
+  const int nb=H/64;
+  const uint8_t* wrow=Wq+(size_t)row*nb*36;
+  float acc=0.0f;
+  const int sub=lane>>3, j=lane&7;
+  for(int b=0;b<nb;++b){
+    const uint8_t* block=wrow+(size_t)b*36;
+    // GGUF rows and blocks are four-byte aligned, so one lane can fetch all
+    // four scales; warp shuffle broadcasts them without per-lane byte loads.
+    unsigned packed=(lane==0) ? *reinterpret_cast<const unsigned*>(block) : 0u;
+    packed=__shfl_sync(0xffffffffu,packed,0);
+    float scale=d_ue4m3_warp((packed>>(sub*8))&0xffu);
+    unsigned q=block[4+lane];
+    int k=b*64+sub*16+j;
+    float a=(float)x[k], c=(float)x[k+8];
+    acc=fmaf(scale, a*d_e2m1_warp(q&15u)+c*d_e2m1_warp(q>>4),acc);
+  }
+  for(int delta=16;delta;delta>>=1)
+    acc+=__shfl_down_sync(0xffffffffu,acc,delta);
+  if(lane==0) y[row]=acc;
+}
+void nvfp4_gemv_cuda_variant(const uint16_t* x, const uint8_t* Wq, float* y,
+                            int H, int F, Nvfp4GemvVariant variant,
+                            cudaStream_t stream){
+  if(variant==Nvfp4GemvVariant::Warp4 && H>=64 && H%64==0 && F>0 &&
+     (reinterpret_cast<uintptr_t>(Wq)&3u)==0u){
+    nvfp4_gemv_warp4_k<<<(F+3)/4,128,0,stream>>>(
+        (const __nv_bfloat16*)x,Wq,y,H,F);
+  } else {
+    nvfp4_gemv_k<<<F,256,0,stream>>>((const __nv_bfloat16*)x,Wq,y,H,F);
+  }
+}
 void nvfp4_gemv_cuda(const uint16_t* x, const uint8_t* Wq, float* y, int H, int F){
-  nvfp4_gemv_k<<<F,256>>>((const __nv_bfloat16*)x,Wq,y,H,F);
+  nvfp4_gemv_cuda_variant(x,Wq,y,H,F,Nvfp4GemvVariant::Scalar);
 }
 }

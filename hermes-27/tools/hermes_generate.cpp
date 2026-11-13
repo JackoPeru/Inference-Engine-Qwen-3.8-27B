@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <charconv>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <limits>
@@ -209,6 +210,7 @@ int main(int argc, char** argv) {
     }
     std::fprintf(stderr, "SEED prompt=%zu mode=token-by-token capacity=%d\n", pi, context_capacity);
     std::vector<float> logits;
+    const auto seed_started = std::chrono::steady_clock::now();
     for(std::size_t pos = 0; pos < prompt.size(); ++pos) {
       logits = pp2::decode_step(prompt[pos], state, (long)pos, err);
       if(logits.empty()) {
@@ -218,6 +220,7 @@ int main(int argc, char** argv) {
         return 1;
       }
     }
+    const auto seed_ended = std::chrono::steady_clock::now();
 
     if(opts.verify_prefill) {
       double max_abs = 0.0, mean_abs = 0.0;
@@ -247,6 +250,7 @@ int main(int argc, char** argv) {
     std::vector<int> generated;
     generated.reserve((std::size_t)opts.max_new_tokens);
     std::string stop_reason = "length";
+    const auto generation_started = std::chrono::steady_clock::now();
     for(int step = 0; step < opts.max_new_tokens; ++step) {
       int next = -1;
       if(!argmax(logits, next, err)) {
@@ -267,6 +271,14 @@ int main(int argc, char** argv) {
         return 1;
       }
     }
+    const auto generation_ended = std::chrono::steady_clock::now();
+    const double seed_ms = std::chrono::duration<double,std::milli>(seed_ended-seed_started).count();
+    const double generation_ms = std::chrono::duration<double,std::milli>(generation_ended-generation_started).count();
+    const std::size_t decode_steps = generated.empty() ? 0 : generated.size()-1;
+    std::fprintf(stderr,
+      "TIMING prompt=%zu seed_tokens=%zu seed_ms=%.3f decode_steps=%zu generation_ms=%.3f decode_steps_per_s=%.5f\n",
+      pi,prompt.size(),seed_ms,decode_steps,generation_ms,
+      generation_ms>0.0 ? (1000.0*decode_steps/generation_ms) : 0.0);
     pp2::decode_free(state);
 
     std::fprintf(json, "{\"prompt_index\":%zu,\"prompt_ids\":", pi);
