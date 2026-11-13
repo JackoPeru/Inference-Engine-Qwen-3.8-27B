@@ -1,0 +1,61 @@
+{
+  "schema": "hermes.q8_1_dp4a_isolated_gpu_ab.v1",
+  "date": "2026-11-13",
+  "provenance": "prime-reported real-GPU results; raw console logs not included",
+  "model_sha256": "db17acbca53da5a7b0e861175b198cc6fd467865e99d1ad53d9dca584257a1a1",
+  "tensor": "blk.0.attn_qkv.weight",
+  "shape": {"N": 10240, "K": 5120},
+  "hardware": "NVIDIA RTX 5060 Ti 16 GB",
+  "opt_in_flag": "--dp4a-ab",
+  "baseline_kernel": "gemv_q8_1_nvfp4",
+  "candidate_kernel": "gemv_q8_1_nvfp4_dp4a_batched",
+  "quality_gate": "PASS: isolated layer0 QKV A/B only; not full-model",
+  "measurements": [
+    {
+      "T": 1,
+      "same_process": true,
+      "original_q8_gemv_ms": 0.928848,
+      "batched_dp4a_gemv_ms": 0.804874,
+      "strict_ab_pass": true
+    },
+    {
+      "T": 64,
+      "same_process": true,
+      "original_q8_gemv_ms": 57.990173,
+      "batched_dp4a_gemv_ms": 6.722262,
+      "strict_ab_pass": true,
+      "outputs_compared": 655360,
+      "dp4a_vs_original_maxabs": 0.0000076293945,
+      "dp4a_vs_original_rmse": 0.000000307,
+      "determinism_repetitions": 10,
+      "determinism_result": "bitwise identical"
+    }
+  ],
+  "authentic_first_token_llama_qkv": {
+    "token_id": 6205,
+    "absolute_position": 0,
+    "output_values": 10240,
+    "maxabs": 0.0000038146973,
+    "rmse": 0.000000181917
+  },
+  "remaining_T64_rows": "63 synthetic deterministic perturbations, not independent llama captures",
+  "reported_post_test_idle_vram_mib": {
+    "gpu0_used": 486,
+    "gpu1_used": 1289,
+    "gpu_slots_released": true
+  },
+  "temporary_q8_activation_bytes_T64_K5120": 368640,
+  "persistent_extra_weight_copy_bytes": 0,
+  "separate_run_reference": {
+    "warp4_T64_gemv_ms": 9.056,
+    "same_process_comparison_with_dp4a": false
+  },
+  "not_verified": [
+    "full-model llama.cpp logit and argmax quality",
+    "complete PP2 prefill/decode performance",
+    "1/4/8-user aggregate throughput",
+    "production integration"
+  ],
+  "default_routing": "unchanged",
+  "production_promotion": "NO-GO: opt-in isolated experiment only"
+}

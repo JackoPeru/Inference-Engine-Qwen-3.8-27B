@@ -65,6 +65,7 @@ or reinterpreting a uint16 buffer as float is invalid.
 - kernels/tests/q8_1_real_capture_cpu.cpp
 - kernels/tests/q8_1_gpu_bench.cu
 - kernels/tests/q8_1_dp4a_cpu_test.py
+- kernels/tests/q8_1_dp4a_gpu_results.json
 - kernels/tests/Q8_1_EXPERIMENT.md
 
 No production source/CMake routing modifications.
@@ -256,3 +257,48 @@ no gate is loosened. After quality PASS, CUDA events measure Q8
 quantization, original and DP4A GEMV, and full quant+GEMV pipelines
 in the same process. Even this local PASS would NOT authorize
 production, PP2 routing or full-model quality parity.
+
+### Prime's real-GPU A/B results (13 November 2026)
+
+Prime executed the bounded CUDA benchmark against the genuine GGUF
+layer0 QKV matrix on an RTX 5060 Ti. The original Q8_1 GEMV and
+the DP4A candidate were timed **in the same process**. Both T1 and
+T64 passed the unmodified strict projection A/B gate. These results
+were reported by prime; raw GPU console logs are not embedded here.
+
+| Same-process CUDA GEMV latency | T1 | T64 |
+|---|---:|---:|
+| Original Q8_1 | 0.928848 ms | 57.990173 ms |
+| Experimental DP4A batched Q8_1 | **0.804874 ms** | **6.722262 ms** |
+| Speedup vs original Q8_1 | 1.154x | 8.627x |
+
+For T64, all **655,360 FP32 outputs** (64 x 10,240) compared
+against the original Q8_1 path with maximum absolute difference
+**7.6293945e-6** and RMSE **3.07e-7**. Ten DP4A
+repetitions were **bitwise identical**. The real first-token
+DP4A output compared with the independent llama.cpp QKV capture:
+maximum absolute difference **3.8146973e-6**, RMSE **1.81917e-7**
+over all 10,240 columns.
+
+Important provenance: only the first token uses a genuine llama.cpp
+capture. At T64, the other 63 activation rows are deterministic
+synthetic perturbations of that capture. The above GPU checks do NOT
+establish all 64 real llama positions or full-model logit parity.
+
+Prime confirmed post-test GPU memory returned to the prior idle
+baseline: GPU0 **486 MiB**, GPU1 **1,289 MiB** used; both GPU
+slots were released. These are idle-memory readings, **not**
+the DP4A peak allocation. T64 Q8 activation scratch is
+**368,640 bytes** (360 KiB); no persistent extra GGUF weight copy.
+
+The previously reported **9.056 ms Warp4 T64** measurement was
+from a **separate run**. It is not a controlled same-process A/B
+against the 6.722262 ms DP4A measurement. Therefore, do not
+claim an end-to-end PP2 or multiuser speedup from these timings.
+
+**Decision remains NO-GO for default routing or production.**
+Keep the original Q8_1 GEMV unchanged for A/B/rollback.
+The strict full-model logits/argmax and stateful 1/4/8-user
+quality/throughput gates have NOT been completed for DP4A.
+Previously observed BF16 full-model T64 argmax mismatches remain
+unresolved and are not grounds to relax any threshold.
