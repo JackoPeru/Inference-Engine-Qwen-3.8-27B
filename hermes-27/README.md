@@ -65,6 +65,15 @@ prompt processing is still token-by-token and long contexts are slow.
 - `benchmarks/HEAD_AB_2026-11-13.md`: optional BF16 output head, numerical
   and complete-engine A/B timings.
 - `benchmarks/PROFILING_GUIDE.md`: GPU profiling procedure.
+- `kernels/tests/README_nvfp4_prefill_prototype.md`: **research only**,
+  CUTLASS SM120 W4A4 batched prefill microbench on the real GGUF. Device
+  activation quantization and weight repacking work, but the measured ~4.5%
+  relative projection error has **not** passed a full-model logit check.
+  Neither the benchmark nor the prefill prototype is wired into PP2.
+- `tests/bench_ab_engine.py`: repeatable full-engine token-equality and
+  timing benchmark across the four scalar/Warp4/head/async combinations;
+  use `--self-test` without GPUs or run with `--engine`/`--gguf` during an
+  exclusive GPU window.
 
 Three strictly optional CUDA switches can be combined:
 
