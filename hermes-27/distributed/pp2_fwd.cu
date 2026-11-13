@@ -30,6 +30,24 @@ static const int NQ=24, NKV=4, HD=256;
 static const int KD=2048, VDD=6144, CC=10240, HV=48, KHD=128, VHD=128;
 static const int SPLIT_LAST0=31; // GPU0: 0..31, GPU1: 32..63
 
+// P6 arene persistenti decode T=1 (byte esatti, documentati in P5_BATCH.md appendice):
+// GDN decode: h 20480 + hb 10240 + q1 40960 + cv 40960 + zl 24576
+//   + b/ar/be/gl 4x192=768 + q/k/v/o 4x24576=98304 + g 24576 + core 20480
+//   + gg/uu/hid 3x69632=208896 + down 20480 + h2b 10240 + gb 12288 + hidb 34816
+//   = 568064 B.
+// FULL decode: h 20480 + hb 10240 + qq 49152 + kk 4096 + vv 4096 + Q 24576
+//   + K1 4096 + V1 4096 + G 24576 + att 24576 + core 20480
+//   + gg/uu/hid 3x69632=208896 + down 20480 + h2b 10240 + hidb 34816 + gb 12288
+//   = 477184 B.
+// WS_BYTES = max = 568064. Extra per DecodeState: ids 4 (GPU0), x0/x1/xn 3x20480,
+// logits VOC*4=993280 (GPU1). Tot ~2.07 MiB/req. Stessi kernel, stesso ordine,
+// stessi input, default-stream sincrono (no Graphs in questo task).
+static const size_t WS_GDN_BYTES = 568064;
+static const size_t WS_FULL_BYTES = 477184;
+static const size_t WS_BYTES = 568064;
+static const size_t WS_X_BYTES = 5120u*4u;      // 20480
+static const size_t WS_LOG_BYTES = 248320u*4u;  // 993280
+
 struct WEntry { std::string name; int dev=-1; void* d=nullptr; size_t bytes=0; int ne0=0, ne1=0; int gtype=-1; };
 static GgufWeightBackend g_be;
 static bool g_up=false;
@@ -861,21 +879,33 @@ static bool run_gdn_decode_layer(int li, float* d_x, DecodeState& ds, std::strin
          *wFg=find_w(P+"ffn_gate.weight"), *wFu=find_w(P+"ffn_up.weight"), *wFd=find_w(P+"ffn_down.weight");
   if(!wNorm||!wQkv||!wGate||!wBeta||!wAlpha||!wC||!wA||!wDT||!wN||!wOut||!wPost||!wFg||!wFu||!wFd){ err="missing w gdn dec "+P; return false; }
   if(!ds.S[li]||!ds.CS[li]){ err="decode state null gdn "+P; return false; }
+  void* wsbase = (li<=SPLIT_LAST0)? ds.ws0 : ds.ws1;
+  if(!wsbase){ err="decode ws null gdn "+P; return false; }
   const int T=1; size_t nH=(size_t)T*HID;
-  float *d_h=nullptr, *d_q1=nullptr, *d_cv=nullptr, *d_zl=nullptr, *d_b=nullptr, *d_ar=nullptr,
-        *d_be=nullptr, *d_gl=nullptr, *d_q=nullptr, *d_k=nullptr, *d_v=nullptr, *d_o=nullptr,
-        *d_g=nullptr, *d_core=nullptr, *d_gg=nullptr, *d_uu=nullptr, *d_hid=nullptr, *d_down=nullptr;
-  uint16_t *d_hb=nullptr, *d_h2b=nullptr, *d_gb=nullptr, *d_hidb=nullptr;
-  cudaMalloc(&d_h,nH*4); cudaMalloc(&d_hb,nH*2);
-  cudaMalloc(&d_q1,(size_t)CC*4); cudaMalloc(&d_cv,(size_t)CC*4);
-  cudaMalloc(&d_zl,(size_t)VDD*4); cudaMalloc(&d_b,(size_t)HV*4); cudaMalloc(&d_ar,(size_t)HV*4);
-  cudaMalloc(&d_be,(size_t)HV*4); cudaMalloc(&d_gl,(size_t)HV*4);
-  cudaMalloc(&d_q,(size_t)HV*KHD*4); cudaMalloc(&d_k,(size_t)HV*KHD*4); cudaMalloc(&d_v,(size_t)HV*VHD*4);
-  cudaMalloc(&d_o,(size_t)HV*VHD*4);
-  cudaMalloc(&d_g,(size_t)VDD*4); cudaMalloc(&d_core,nH*4);
-  cudaMalloc(&d_gg,(size_t)FFN*4); cudaMalloc(&d_uu,(size_t)FFN*4);
-  cudaMalloc(&d_hid,(size_t)FFN*4); cudaMalloc(&d_down,nH*4);
-  cudaMalloc(&d_h2b,nH*2); cudaMalloc(&d_gb,(size_t)VDD*2); cudaMalloc(&d_hidb,(size_t)FFN*2);
+  // P6: carve arena persistente (stesso ordine/tipi dei vecchi malloc, nessun malloc/free).
+  uint8_t* ws = (uint8_t*)wsbase;
+  float*    d_h    = (float*)(ws+0);        // 20480
+  uint16_t* d_hb   = (uint16_t*)(ws+20480); // 10240
+  float*    d_q1   = (float*)(ws+30720);    // 40960
+  float*    d_cv   = (float*)(ws+71680);    // 40960
+  float*    d_zl   = (float*)(ws+112640);   // 24576
+  float*    d_b    = (float*)(ws+137216);   // 192
+  float*    d_ar   = (float*)(ws+137408);   // 192
+  float*    d_be   = (float*)(ws+137600);   // 192
+  float*    d_gl   = (float*)(ws+137792);   // 192
+  float*    d_q    = (float*)(ws+137984);   // 24576
+  float*    d_k    = (float*)(ws+162560);   // 24576
+  float*    d_v    = (float*)(ws+187136);   // 24576
+  float*    d_o    = (float*)(ws+211712);   // 24576
+  float*    d_g    = (float*)(ws+236288);   // 24576
+  float*    d_core = (float*)(ws+260864);   // 20480
+  float*    d_gg   = (float*)(ws+281344);   // 69632
+  float*    d_uu   = (float*)(ws+350976);   // 69632
+  float*    d_hid  = (float*)(ws+420608);   // 69632
+  float*    d_down = (float*)(ws+490240);   // 20480
+  uint16_t* d_h2b  = (uint16_t*)(ws+510720);// 10240
+  uint16_t* d_gb   = (uint16_t*)(ws+520960);// 12288
+  uint16_t* d_hidb = (uint16_t*)(ws+533248);// 34816 (fine 568064)
   rms_f32_k<<<T,512,(size_t)512*4>>>(d_h,d_x,(float*)wNorm->d,T,HID);
   f32_to_bf16_k<<<(int)((nH+255)/256),256>>>(d_hb,d_h,(int)nH);
   gemv_batch(d_hb,(uint8_t*)wQkv->d,d_q1,HID,CC,T);
@@ -911,10 +941,7 @@ static bool run_gdn_decode_layer(int li, float* d_x, DecodeState& ds, std::strin
   gemv_batch(d_hidb,(uint8_t*)wFd->d,d_down,FFN,HID,T);
   add_k<<<(int)((nH+255)/256),256>>>(d_x,d_down,(int)nH);
   cudaDeviceSynchronize();
-  cudaFree(d_h);cudaFree(d_hb);cudaFree(d_q1);cudaFree(d_cv);cudaFree(d_zl);cudaFree(d_b);cudaFree(d_ar);
-  cudaFree(d_be);cudaFree(d_gl);cudaFree(d_q);cudaFree(d_k);cudaFree(d_v);cudaFree(d_o);
-  cudaFree(d_g);cudaFree(d_core);cudaFree(d_gg);cudaFree(d_uu);cudaFree(d_hid);cudaFree(d_down);
-  cudaFree(d_h2b);cudaFree(d_gb);cudaFree(d_hidb);
+  // P6: nessun free (arena persistente ds.ws0/ws1).
   return true;
 }
 
@@ -933,17 +960,28 @@ static bool run_full_decode_layer(int li, float* d_x, DecodeState& ds, long pos,
   if((long)L!=pos){ err="klen/pos mismatch "+P+" klen="+std::to_string(L)+" pos="+std::to_string(pos); return false; }
   const int T=1; size_t nH=(size_t)T*HID;
   const int NQQ=12288, NKK=1024, NQHD=6144;
-  float *d_h=nullptr,*d_qq=nullptr,*d_kk=nullptr,*d_vv=nullptr,*d_Q=nullptr,*d_K1=nullptr,*d_V1=nullptr,
-        *d_G=nullptr,*d_att=nullptr,*d_core=nullptr,*d_gg=nullptr,*d_uu=nullptr,*d_hid=nullptr,*d_down=nullptr;
-  uint16_t *d_hb=nullptr,*d_h2b=nullptr,*d_hidb=nullptr,*d_gb=nullptr;
-  cudaMalloc(&d_h,nH*4); cudaMalloc(&d_hb,nH*2);
-  cudaMalloc(&d_qq,(size_t)NQQ*4); cudaMalloc(&d_kk,(size_t)NKK*4); cudaMalloc(&d_vv,(size_t)NKK*4);
-  cudaMalloc(&d_Q,(size_t)NQHD*4); cudaMalloc(&d_K1,(size_t)NKK*4); cudaMalloc(&d_V1,(size_t)NKK*4);
-  cudaMalloc(&d_G,(size_t)NQHD*4); cudaMalloc(&d_att,(size_t)NQHD*4);
-  cudaMalloc(&d_core,nH*4);
-  cudaMalloc(&d_gg,(size_t)FFN*4); cudaMalloc(&d_uu,(size_t)FFN*4);
-  cudaMalloc(&d_hid,(size_t)FFN*4); cudaMalloc(&d_down,nH*4);
-  cudaMalloc(&d_h2b,nH*2); cudaMalloc(&d_hidb,(size_t)FFN*2); cudaMalloc(&d_gb,(size_t)NQHD*2);
+  void* wsbase = (li<=SPLIT_LAST0)? ds.ws0 : ds.ws1;
+  if(!wsbase){ err="decode ws null full "+P; return false; }
+  // P6: carve arena persistente (stesso ordine/tipi dei vecchi malloc, nessun malloc/free).
+  uint8_t* ws = (uint8_t*)wsbase;
+  float*    d_h    = (float*)(ws+0);        // 20480
+  uint16_t* d_hb   = (uint16_t*)(ws+20480); // 10240
+  float*    d_qq   = (float*)(ws+30720);    // 49152
+  float*    d_kk   = (float*)(ws+79872);    // 4096
+  float*    d_vv   = (float*)(ws+83968);    // 4096
+  float*    d_Q    = (float*)(ws+88064);    // 24576
+  float*    d_K1   = (float*)(ws+112640);   // 4096
+  float*    d_V1   = (float*)(ws+116736);   // 4096
+  float*    d_G    = (float*)(ws+120832);   // 24576
+  float*    d_att  = (float*)(ws+145408);   // 24576
+  float*    d_core = (float*)(ws+169984);   // 20480
+  float*    d_gg   = (float*)(ws+190464);   // 69632
+  float*    d_uu   = (float*)(ws+260096);   // 69632
+  float*    d_hid  = (float*)(ws+329728);   // 69632
+  float*    d_down = (float*)(ws+399360);   // 20480
+  uint16_t* d_h2b  = (uint16_t*)(ws+419840);// 10240
+  uint16_t* d_hidb = (uint16_t*)(ws+430080);// 34816
+  uint16_t* d_gb   = (uint16_t*)(ws+464896);// 12288 (fine 477184 < 568064)
   rms_f32_k<<<T,512,(size_t)512*4>>>(d_h,d_x,(float*)wNorm->d,T,HID);
   f32_to_bf16_k<<<(int)((nH+255)/256),256>>>(d_hb,d_h,(int)nH);
   gemv_batch(d_hb,(uint8_t*)wQ->d,d_qq,HID,NQQ,T);
@@ -969,15 +1007,15 @@ static bool run_full_decode_layer(int li, float* d_x, DecodeState& ds, long pos,
   add_k<<<(int)((nH+255)/256),256>>>(d_x,d_down,(int)nH);
   cudaDeviceSynchronize();
   ds.klen[li]=L+1;
-  cudaFree(d_h);cudaFree(d_hb);cudaFree(d_qq);cudaFree(d_kk);cudaFree(d_vv);
-  cudaFree(d_Q);cudaFree(d_K1);cudaFree(d_V1);cudaFree(d_G);cudaFree(d_att);cudaFree(d_core);
-  cudaFree(d_gg);cudaFree(d_uu);cudaFree(d_hid);cudaFree(d_down);cudaFree(d_h2b);cudaFree(d_hidb);cudaFree(d_gb);
+  // P6: nessun free (arena persistente ds.ws0/ws1).
   return true;
 }
 
 bool decode_init(DecodeState& ds, std::string& err){
   if(!g_up){ err="not uploaded"; return false; }
   for(int i=0;i<64;++i){ ds.S[i]=nullptr; ds.CS[i]=nullptr; ds.Kc[i]=nullptr; ds.Vc[i]=nullptr; ds.klen[i]=0; }
+  ds.ws0=nullptr; ds.ws1=nullptr; ds.idsbuf=nullptr; ds.x0buf=nullptr;
+  ds.x1buf=nullptr; ds.xnbuf=nullptr; ds.logbuf=nullptr; ds.ws_bytes=0;
   for(int li=0;li<NL;++li){
     int dev=(li<=SPLIT_LAST0)?0:1;
     cudaSetDevice(dev);
@@ -998,6 +1036,24 @@ bool decode_init(DecodeState& ds, std::string& err){
       cudaMemset(s,0,sbytes); cudaMemset(c,0,cbytes);
       ds.S[li]=s; ds.CS[li]=c;
     }
+  }
+  // P6: arene persistenti + buffer step (1x alloc, mai per-layer/per-step).
+  {
+    void *w0=nullptr,*w1=nullptr;
+    int* ids=nullptr; float *x0=nullptr,*x1=nullptr,*xn=nullptr,*lg=nullptr;
+    cudaSetDevice(0);
+    if(cudaMalloc(&w0,WS_BYTES)!=cudaSuccess){ err="OOM ws0"; return false; }
+    if(cudaMalloc(&ids,4)!=cudaSuccess){ err="OOM idsbuf"; cudaFree(w0); return false; }
+    if(cudaMalloc(&x0,WS_X_BYTES)!=cudaSuccess){ err="OOM x0buf"; cudaFree(w0); cudaFree(ids); return false; }
+    cudaMemset(w0,0,WS_BYTES);
+    cudaSetDevice(1);
+    if(cudaMalloc(&w1,WS_BYTES)!=cudaSuccess){ err="OOM ws1"; cudaSetDevice(0); cudaFree(w0); cudaFree(ids); cudaFree(x0); return false; }
+    if(cudaMalloc(&x1,WS_X_BYTES)!=cudaSuccess){ err="OOM x1buf"; return false; }
+    if(cudaMalloc(&xn,WS_X_BYTES)!=cudaSuccess){ err="OOM xnbuf"; return false; }
+    if(cudaMalloc(&lg,WS_LOG_BYTES)!=cudaSuccess){ err="OOM logbuf"; return false; }
+    cudaMemset(w1,0,WS_BYTES);
+    ds.ws0=w0; ds.ws1=w1; ds.idsbuf=ids; ds.x0buf=x0;
+    ds.x1buf=x1; ds.xnbuf=xn; ds.logbuf=lg; ds.ws_bytes=WS_BYTES;
   }
   // VRAM hard abort 15GB
   {
@@ -1024,6 +1080,17 @@ void decode_free(DecodeState& ds){
     if(ds.Vc[li]){ cudaFree(ds.Vc[li]); ds.Vc[li]=nullptr; }
     ds.klen[li]=0;
   }
+  // P6: rilascia arene + buffer step persistenti.
+  cudaSetDevice(0);
+  if(ds.ws0){ cudaFree(ds.ws0); ds.ws0=nullptr; }
+  if(ds.idsbuf){ cudaFree(ds.idsbuf); ds.idsbuf=nullptr; }
+  if(ds.x0buf){ cudaFree(ds.x0buf); ds.x0buf=nullptr; }
+  cudaSetDevice(1);
+  if(ds.ws1){ cudaFree(ds.ws1); ds.ws1=nullptr; }
+  if(ds.x1buf){ cudaFree(ds.x1buf); ds.x1buf=nullptr; }
+  if(ds.xnbuf){ cudaFree(ds.xnbuf); ds.xnbuf=nullptr; }
+  if(ds.logbuf){ cudaFree(ds.logbuf); ds.logbuf=nullptr; }
+  ds.ws_bytes=0;
   ds.inited=false;
 }
 
@@ -1032,10 +1099,13 @@ std::vector<float> decode_step(int tok, DecodeState& ds, long pos, std::string& 
   if(!ds.inited){ err="decode not inited"; return {}; }
   if(pos<0||pos>=DecodeState::MAXL){ err="pos OOB"; return {}; }
   const int T=1; size_t nH=(size_t)T*HID;
+  // P6: zero malloc/free — buffer persistenti da decode_init.
+  if(!ds.ws0||!ds.ws1||!ds.idsbuf||!ds.x0buf||!ds.x1buf||!ds.xnbuf||!ds.logbuf){
+    err="decode ws not inited"; return {};
+  }
   cudaSetDevice(0);
-  int* d_ids=nullptr; float* d_x0=nullptr;
-  if(cudaMalloc(&d_ids,4)!=cudaSuccess){ err="OOM d_ids"; return {}; }
-  if(cudaMalloc(&d_x0,nH*4)!=cudaSuccess){ err="OOM d_x0"; return {}; }
+  int* d_ids = ds.idsbuf;
+  float* d_x0 = ds.x0buf;
   cudaMemcpy(d_ids,&tok,4,cudaMemcpyHostToDevice);
   {
     auto it=g_w0.find("token_embd.weight");
@@ -1043,40 +1113,37 @@ std::vector<float> decode_step(int tok, DecodeState& ds, long pos, std::string& 
     embed_gather_k<<<(int)((nH+255)/256),256>>>(d_x0,(uint16_t*)it->second.d,d_ids,T);
     cudaDeviceSynchronize();
   }
-  cudaFree(d_ids);
   for(int li=0;li<=SPLIT_LAST0;++li){
     bool is_full=(li%4==3);
     bool ok=is_full? run_full_decode_layer(li,d_x0,ds,pos,err) : run_gdn_decode_layer(li,d_x0,ds,err);
-    if(!ok){ cudaFree(d_x0); return {}; }
+    if(!ok){ return {}; }
   }
   // P5: xfer atomico sotto lock per batch parallelo (stesso pinned condiviso).
   // Compute GPU0 sopra resta fuori dal lock -> overlap reale con GPU1 di altro thread.
-  float* d_x1=nullptr;
+  float* d_x1 = ds.x1buf;
   {
     std::lock_guard<std::mutex> lk(g_xfer_mu);
     cudaMemcpy(g_pinned,d_x0,nH*4,cudaMemcpyDeviceToHost);
-    cudaFree(d_x0); d_x0=nullptr;
     cudaSetDevice(1);
-    cudaMalloc(&d_x1,nH*4);
     cudaMemcpy(d_x1,g_pinned,nH*4,cudaMemcpyHostToDevice);
   }
   for(int li=SPLIT_LAST0+1;li<NL;++li){
     bool is_full=(li%4==3);
     bool ok=is_full? run_full_decode_layer(li,d_x1,ds,pos,err) : run_gdn_decode_layer(li,d_x1,ds,err);
-    if(!ok){ cudaFree(d_x1); return {}; }
+    if(!ok){ return {}; }
   }
   {
     auto itn=g_w1.find("output_norm.weight");
     auto itw=g_w1.find("output.weight");
-    if(itn==g_w1.end()||itw==g_w1.end()){ err="no head"; cudaFree(d_x1); return {}; }
-    float* d_xn=nullptr; cudaMalloc(&d_xn,nH*4);
+    if(itn==g_w1.end()||itw==g_w1.end()){ err="no head"; return {}; }
+    float* d_xn = ds.xnbuf;
     rms_f32_k<<<T,512,(size_t)512*4>>>(d_xn,d_x1,(float*)itn->second.d,T,HID);
-    float* d_log=nullptr; cudaMalloc(&d_log,(size_t)VOC*4);
+    float* d_log = ds.logbuf;
     head_bf16_k<<<(int)(((size_t)VOC+255)/256),256>>>(d_log,d_xn,(uint16_t*)itw->second.d,T);
     cudaDeviceSynchronize();
     std::vector<float> logits((size_t)VOC);
     cudaMemcpy(logits.data(),d_log,(size_t)VOC*4,cudaMemcpyDeviceToHost);
-    cudaFree(d_xn); cudaFree(d_log); cudaFree(d_x1);
+    // P6: nessun free (persistenti).
     return logits;
   }
 }

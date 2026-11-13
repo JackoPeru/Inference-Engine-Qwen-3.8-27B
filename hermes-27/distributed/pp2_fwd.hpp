@@ -44,6 +44,16 @@ struct DecodeState {
   float* Vc[64];  // full V cache [MAXL*4*256], nullptr per GDN layer
   int klen[64];   // len per full layer (host mirror)
   bool inited = false;
+  // P6 workspace persistenti (no malloc/free in decode hot path, T=1 fisso):
+  // arena riusata layer-per-layer, own device (ws0 GPU0, ws1 GPU1).
+  void* ws0 = nullptr;    // [WS_BYTES=568064] GPU0
+  void* ws1 = nullptr;    // [WS_BYTES=568064] GPU1
+  int* idsbuf = nullptr;  // [1] GPU0 (tok input)
+  float* x0buf = nullptr; // [HID=5120] GPU0 (residuo stream 0..31)
+  float* x1buf = nullptr; // [HID=5120] GPU1 (residuo stream 32..63)
+  float* xnbuf = nullptr; // [HID=5120] GPU1 (head norm)
+  float* logbuf = nullptr;// [VOC=248320] GPU1 (head logits)
+  size_t ws_bytes = 0;    // == 568064 quando inited
 };
 
 // Alloca/stati zero su GPU proprietaria (richiede upload già fatto). Ritorna false su errore/OOM.
