@@ -1,0 +1,48 @@
+# Local models, weights, training assets and other large artifacts
+**/models/
+**/checkpoints/
+**/thirdparty/
+**/benchmarks/
+*.gguf
+*.safetensors
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.bin
+
+# Build products and Python caches
+**/build/
+**/cmake-build-*/
+**/CMakeFiles/
+**/__pycache__/
+**/.pytest_cache/
+**/.venv/
+**/venv/
+*.o
+*.obj
+*.exe
+*.dll
+*.so
+*.a
+*.lib
+*.pyc
+*.log
+
+# Machine-local settings, secrets, credentials
+**/.env
+**/.env.*
+!**/.env.example
+*.pem
+*.key
+**/secrets/
+**/credentials/
+**/tokens/
+**/config.local.*
+
+# Editor and operating-system metadata
+.vs/
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
