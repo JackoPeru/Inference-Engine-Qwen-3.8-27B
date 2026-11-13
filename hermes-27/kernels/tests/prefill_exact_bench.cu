@@ -86,11 +86,11 @@ struct EventPair {
   cudaEvent_t start=nullptr,stop=nullptr;
   EventPair(){cu(cudaEventCreate(&start),"cudaEventCreate");cu(cudaEventCreate(&stop),"cudaEventCreate");}
   ~EventPair(){if(start)cudaEventDestroy(start);if(stop)cudaEventDestroy(stop);}
-  template<class Fn> float measure(Fn f,int loops) {
+  template<class Fn> float measure(Fn f,int loops,cudaStream_t stream=0) {
     f();cu(cudaDeviceSynchronize(),"warmup synchronize");
-    cu(cudaEventRecord(start),"event start");
+    cu(cudaEventRecord(start,stream),"event start");
     for(int i=0;i<loops;++i)f();
-    cu(cudaEventRecord(stop),"event stop");
+    cu(cudaEventRecord(stop,stream),"event stop");
     cu(cudaEventSynchronize(stop),"event sync");
     float elapsed=0;cu(cudaEventElapsedTime(&elapsed,start,stop),"elapsed");
     return elapsed/loops;
@@ -224,6 +224,10 @@ static void run(const RealGguf& m,int T,int repeats,bool full_weight_proof) {
   auto unpack=[&] {
     cu(pe::dequantize_gguf_to_bf16(dWraw,dWbf16,N,K),"unpack GGUF");
   };
+  auto unpack_vector=[&] {
+    cu(pe::dequantize_gguf_to_bf16_vector(dWraw,dWbf16,N,K),
+       "unpack GGUF warp-vector");
+  };
   auto fused=[&] { unpack();gemm(); };
   scalar();direct();warp4();gemm();
   cu(cudaDeviceSynchronize(),"quality sync");
@@ -269,20 +273,121 @@ static void run(const RealGguf& m,int T,int repeats,bool full_weight_proof) {
   float warp4_ms=timer.measure(warp4,repeats);
   float direct_ms=timer.measure(direct,repeats);
   float unpack_ms=timer.measure(unpack,repeats);
+  float unpack_vec_ms=timer.measure(unpack_vector,repeats);
   float gemm_ms=timer.measure(gemm,repeats);
   float pipeline_ms=timer.measure(fused,repeats);
   std::printf("CUDA_EVENTS repeats=%d scalar_repeated_ms=%.4f warp4_repeated_ms=%.4f "
               "direct_batch4_ms=%.4f device_unpack_ms=%.4f "
               "BF16_TC_GEMM_ms=%.4f unpack_plus_GEMM_ms=%.4f\n",
               repeats,scalar_ms,warp4_ms,direct_ms,unpack_ms,gemm_ms,pipeline_ms);
+  std::printf("UNPACK_AB_MS scalar=%.5f warp_vector=%.5f "
+              "speedup=%.3f (new decoder MUST be checked bit-exact)\n",
+              unpack_ms,unpack_vec_ms,unpack_ms/unpack_vec_ms);
+  if(full_weight_proof) {
+    std::vector<uint16_t> actual(size_t(N)*K);
+    cu(cudaMemcpy(actual.data(),dWbf16,actual.size()*2,cudaMemcpyDeviceToHost),
+       "read warp-vector GGUF weights");
+    full_bf16_weight_proof(m,actual);
+  }
   std::printf("QUALITY_GATE=PASS per-matrix only (NOT whole-model/logits)\n");
+}
+
+// Slot-only benchmark: NO separate full-weight BF16 allocation. The supplied
+// scratch is truly only 8/32/105MiB; it is tiled across weight output rows.
+// Two streams deliberately alternate W and sign-flipped W to catch unsafe
+// scratch reuse, and force last-projection output to match first projection.
+static void run_slot(const RealGguf& m,int T,int repeats,int scratch_mib) {
+  using pe::ScratchResult;
+  const int N=m.N,K=m.K;
+  auto X=m.x(T);
+  size_t scratch_bytes=size_t(scratch_mib)*1024*1024;
+  if(scratch_bytes<pe::bf16_weight_scratch_bytes(1,K))
+    throw std::runtime_error("scratch too small for one row");
+  std::vector<uint8_t> flipped=m.W;
+  for(size_t row=0;row<size_t(N);++row)for(int b=0;b<K/64;++b) {
+    uint8_t* ptr=flipped.data()+row*(K/64*36)+b*36;
+    for(int j=4;j<36;++j)ptr[j]^=0x88u; // flip sign bit in each nibble
+  }
+  Gpu dev;
+  size_t before=0,after=0,total=0;
+  cu(cudaMemGetInfo(&before,&total),"slot mem before");
+  uint16_t* dX=dev.alloc<uint16_t>(X.size());
+  uint8_t* dRaw=dev.alloc<uint8_t>(m.W.size());
+  uint8_t* dNeg=dev.alloc<uint8_t>(flipped.size());
+  float* dBaseline=dev.alloc<float>(size_t(T)*N);
+  float* d0=dev.alloc<float>(size_t(T)*N);
+  float* d1=dev.alloc<float>(size_t(T)*N);
+  float* d2=dev.alloc<float>(size_t(T)*N);
+  uint8_t* dScratch=dev.alloc<uint8_t>(scratch_bytes);
+  cu(cudaMemcpy(dX,X.data(),X.size()*2,cudaMemcpyHostToDevice),"slot H2D X");
+  cu(cudaMemcpy(dRaw,m.W.data(),m.W.size(),cudaMemcpyHostToDevice),"slot H2D weights");
+  cu(cudaMemcpy(dNeg,flipped.data(),flipped.size(),cudaMemcpyHostToDevice),
+     "slot H2D negative weights");
+  pe::ReusableBF16WeightScratch slot;
+  auto gate=[&](ScratchResult rc,const char* where) {
+    if(rc.ok())return;
+    throw std::runtime_error(std::string(where)+" scratch code="+
+                             std::to_string(int(rc.code))+" cuda="+
+                             std::to_string(int(rc.cuda_error))+" blas="+
+                             std::to_string(int(rc.blas_error)));
+  };
+  gate(slot.init(dScratch,scratch_bytes),"scratch init");
+  cu(cudaMemGetInfo(&after,&total),"slot mem after");
+  std::printf("SCRATCH_ONLY T=%d N=%d K=%d cap_MiB=%d "
+              "allocated_bytes=%zu total_delta_bytes=%zu\n",
+              T,N,K,scratch_mib,scratch_bytes,before-after);
+
+  cu(pe::repeated_warp4_gguf(dX,dRaw,dBaseline,T,N,K),
+     "slot baseline Warp4");
+  cu(cudaDeviceSynchronize(),"slot baseline sync");
+  cudaStream_t s0=nullptr,s1=nullptr;
+  cu(cudaStreamCreateWithFlags(&s0,cudaStreamNonBlocking),"stream0 create");
+  cu(cudaStreamCreateWithFlags(&s1,cudaStreamNonBlocking),"stream1 create");
+  // Each enqueue returns before completion. Events in the slot serialize
+  // accesses to the same BF16 tile even when the stream switches.
+  gate(slot.enqueue(dRaw,dX,d0,T,N,K,s0),"slot submission 0");
+  gate(slot.enqueue(dNeg,dX,d1,T,N,K,s1),"slot submission 1");
+  gate(slot.enqueue(dRaw,dX,d2,T,N,K,s0),"slot submission 2");
+  cu(cudaStreamSynchronize(s0),"slot stream0 sync");
+  cu(cudaStreamSynchronize(s1),"slot stream1 sync");
+  std::vector<float> base(size_t(T)*N),o0(base.size()),o1(base.size()),o2(base.size());
+  cu(cudaMemcpy(base.data(),dBaseline,base.size()*4,cudaMemcpyDeviceToHost),"slot base D2H");
+  cu(cudaMemcpy(o0.data(),d0,o0.size()*4,cudaMemcpyDeviceToHost),"slot y0 D2H");
+  cu(cudaMemcpy(o1.data(),d1,o1.size()*4,cudaMemcpyDeviceToHost),"slot y1 D2H");
+  cu(cudaMemcpy(o2.data(),d2,o2.size()*4,cudaMemcpyDeviceToHost),"slot y2 D2H");
+  Metric m0,m1,m2;
+  for(size_t i=0;i<base.size();++i) {
+    m0.add(o0[i],base[i]);
+    m1.add(o1[i],-base[i]);
+    m2.add(o2[i],base[i]);
+  }
+  m0.report("SLOT_CROSS_STREAM_original");
+  m1.report("SLOT_CROSS_STREAM_negated");
+  m2.report("SLOT_CROSS_STREAM_original_again");
+  auto ok=[](const Metric& m) {return m.max_abs<=0.01 && m.rel()<=0.001;};
+  if(!ok(m0)||!ok(m1)||!ok(m2))
+    throw std::runtime_error("slot cross-stream/tiling numeric error");
+
+  EventPair timer;
+  // Single-stream end-to-end timing of serial reusable scratch. No weights
+  // cached across calls: every timed enqueue performs ALL tile unpacks.
+  auto full=[&] {gate(slot.enqueue(dRaw,dX,d0,T,N,K,s0),"slot timed");};
+  const float time=timer.measure(full,repeats,s0);
+  std::printf("SLOT_LATENCY T=%d scratch_MiB=%d repeats=%d "
+              "unpack_plus_cublas_ms=%.5f (real GGUF, stream-safe)\n",
+              T,scratch_mib,repeats,time);
+  gate(slot.shutdown(),"slot shutdown");
+  cu(cudaStreamDestroy(s0),"destroy stream0");
+  cu(cudaStreamDestroy(s1),"destroy stream1");
+  std::printf("SLOT_QUALITY_GATE=PASS (one projection only)\n");
 }
 
 int main(int argc,char**argv) {
   try {
     std::string path;
     int T=64,device=1,repeats=3;
-    bool all=false,cpu_only=false;
+    int scratch_mib=32;
+    bool all=false,cpu_only=false,slot_only=false;
     for(int i=1;i<argc;++i) {
       std::string op=argv[i];
       auto val=[&] {
@@ -295,23 +400,29 @@ int main(int argc,char**argv) {
       else if(op=="--repeats")repeats=std::stoi(val());
       else if(op=="--all")all=true;
       else if(op=="--cpu-only")cpu_only=true;
+      else if(op=="--slot-only")slot_only=true;
+      else if(op=="--scratch-mib")scratch_mib=std::stoi(val());
       else if(op=="--help") {
         std::printf("usage: prefill_exact_bench [--cpu-only] [--gguf FILE] "
-                    "[--T 16|64|128|256|--all] [--device 1] [--repeats 3]\n");
+                    "[--T 16|64|128|256|--all] [--device 1] [--repeats 3]\n"
+                    "       [--slot-only --scratch-mib 8|32|105] "
+                    "(cross-stream correctness and peak VRAM)\n");
         return 0;
       } else throw std::runtime_error("unknown argument "+op);
     }
     exhaustive_scale_proof();
     if(cpu_only)return 0;
     if(path.empty() || (T!=16&&T!=64&&T!=128&&T!=256) ||
-       repeats<1 || repeats>30) throw std::runtime_error("invalid --gguf/T/repeats");
+       repeats<1 || repeats>30 || scratch_mib<1 || scratch_mib>256)
+      throw std::runtime_error("invalid --gguf/T/repeats/scratch");
     RealGguf m(path,all?256:T);
     cu(cudaSetDevice(device),"cudaSetDevice");
     cudaDeviceProp prop{};
     cu(cudaGetDeviceProperties(&prop,device),"GPU properties");
     std::printf("DEVICE=%d %s SM=%d.%d\n",device,prop.name,prop.major,prop.minor);
     if(prop.major<12) throw std::runtime_error("SM120 required");
-    if(all) for(int t:{16,64,128,256})run(m,t,repeats,t==16);
+    if(slot_only)run_slot(m,T,repeats,scratch_mib);
+    else if(all) for(int t:{16,64,128,256})run(m,t,repeats,t==16);
     else run(m,T,repeats,true);
     return 0;
   } catch(const std::exception& e) {

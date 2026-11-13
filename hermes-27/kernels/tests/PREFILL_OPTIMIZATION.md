@@ -1,7 +1,7 @@
 # HERMES-27: prefill NVFP4 con attivazioni BF16
 
-**Stato: prototipo isolato, validato su una proiezione reale; fuori da
-CMake e PP2.** Il precedente W4A4 ha una RMSE relativa del 4.3-4.6%
+**Stato: prototipo validato su una proiezione reale e compilato in CMake,
+ma non abilitato nel percorso di produzione.** Il precedente W4A4 ha una RMSE relativa del 4.3-4.6%
 sull'uscita della prima proiezione. Questi percorsi preservano le
 attivazioni BF16 senza requantizzazione A4. La parita dei logit
 del modello completo NON e ancora dimostrata.
@@ -24,6 +24,57 @@ Per N=10240 K=5120: raw 29,491,200 B, scratch BF16 104,857,600 B.
 Non mantenere una seconda copia BF16 permanente dell'intero modello.
 Misura decompressione+GEMM insieme: il GEMM puro esclude la lettura
 GGUF e la scrittura di oltre 100MB per matrice.
+
+### Follow-up: decoder vettoriale + scratch riusabile
+
+- L'implementazione precedente usa una lane per byte E2M1, ma scrive
+  due BF16 a distanza di 8 elementi nel gruppo di 16.
+- Il nuovo decoder vector usa una warp per blocco GGUF da 64 valori,
+  carica 32 byte E2M1, trasmette le quattro scale UE4M3 via shuffle,
+  ricostruisce l'ordine dei nibble e scrive 32 coppie BF16 contigue,
+  cioe 32 scritture a 32 bit. Una warp elabora quattro blocchi in loop.
+- Il risultato deve corrispondere **bit per bit** al decoder CPU GGUF
+  e al precedente decoder CUDA. L'ottimizzazione non cambia ne i
+  pesi ne le attivazioni. Il miglioramento di latenza, se presente,
+  va misurato sullo stesso GGUF e GPU.
+
+La classe ReusableBF16WeightScratch riceve una sola allocazione esterna
+BF16, riusabile su layer e richieste della **stessa GPU**. Possiede un
+handle cuBLAS privato e un evento CUDA. Le chiamate enqueue da thread
+diversi sono serializzate da mutex; se lo stream cambia, il nuovo stream
+attende l'evento emesso **dopo** il GEMM precedente. Il buffer non viene
+mai letto/scritto da operazioni concorrenti non coordinate.
+Nessuna allocazione o sincronizzazione dispositivo nel percorso enqueue.
+La chiusura sincronizza l'ultimo evento prima di restituire il buffer.
+Se un enqueue fallisce, la classe non accetta altri lavori fino alla
+chiusura (fail-closed). CUDA Graph capture non e supportato.
+
+Il buffer puo essere inferiore a N*K*2: il wrapper dequantizza blocchi
+di righe W, calcola GEMM e scrive direttamente nel risultato row-major
+Y[T,N]. Il leading dimension cuBLAS rimane N; i tile non sono matrici
+contigue di output da sovrascrivere. Esempio N=10240, K=5120:
+
+| Scratch BF16 | Righe per tile | Numero di tile |
+|---|---:|---:|
+| 8 MiB | 768 | 14 |
+| 32 MiB | 3200 | 4 |
+| 105 MiB | 10240 | 1 |
+
+I tile richiedono piu lanci di decoder+GEMM: usare meno memoria puo
+**ridurre** le prestazioni. Non presumere una convenienza automatica.
+Per carichi multiutente ad alta concorrenza e preferibile testare un
+piccolo slot per stream attivo: un solo slot condiviso tra N stream
+serializza intenzionalmente i prodotti e limita il throughput. Non
+riutilizzare la stessa scratch fuori dalla classe fino alla shutdown.
+
+La forma matematica e la stessa del GEMV PP2 solo se X e gia BF16:
+il percorso prefill mantiene lo stato hidden in FP32 e lo converte
+esplicitamente in BF16 con f32_to_bf16_k prima di gemv_batch.
+L'API GEMM riceve il relativo puntatore BF16, **non** il float32
+originale. W e' GGUF NVFP4 -> BF16 esatto; cuBLAS effettua
+BF16 x BF16 con accumulo FP32, e restituisce FP32 [T,N].
+Differenze nell'ordine di accumulo sono inevitabili e vanno
+confrontate rispetto al baseline con logit finali.
 
 ## Percorso B: direct batch4 su GGUF raw
 
@@ -59,6 +110,8 @@ nvcc=/usr/local/cuda-12.8/bin/nvcc
   "$root/build/libhermes_kernels.a" "$root/build/libhermes_gguf.a" -lcublas
 
 "$s/bench" --cpu-only
+# Test CPU del nuovo decoder vettoriale, dei tile e del formato BF16
+python3 "$root/kernels/tests/prefill_unpack_cpu.py"
 ```
 
 Esegui i benchmark GPU **soltanto con GPU esclusiva autorizzata**:
@@ -71,6 +124,15 @@ timeout 90 /tmp/hermes_prefill_exact_worker2/bench \
 # Soltanto dopo aver verificato T64:
 timeout 90 /tmp/hermes_prefill_exact_worker2/bench \
   --gguf "$model" --all --device 1 --repeats 5
+# Solo quando la GPU e libera: vecchio vs nuovo unpack sulla stessa W
+timeout 90 /tmp/hermes_prefill_exact_worker2/bench \
+  --gguf "$model" --T 64 --device 1 --repeats 10
+# Profilo reale dei buffer, senza seconda copia BF16 permanente:
+for scratch in 8 32 105; do
+  timeout 90 /tmp/hermes_prefill_exact_worker2/bench \
+    --gguf "$model" --T 64 --device 1 --repeats 5 \
+    --slot-only --scratch-mib "$scratch"
+done
 ```
 
 Input: veri embedding GGUF, normalizzazione del blocco 0, BF16.
@@ -80,6 +142,55 @@ Per ogni proiezione il gate richiede maxabs<=0.01 e RMSE relativa<=0.001
 sia rispetto al GEMV sia all'oracle CPU; altrimenti esce con errore.
 Eventi CUDA misurano GEMV, direct-batch4, decompressione, GEMM e pipeline.
 Riporta separatamente delta VRAM e scratch della matrice BF16.
+L'output UNPACK_AB_MS confronta il vecchio e il nuovo decoder; il
+controllo WEIGHT_UNPACK_FULL_CHECK deve passare anche sulla versione
+vettoriale. Con --slot-only il test usa *due stream CUDA*, alterna
+GGUF originale e GGUF con pesi di segno invertito e confronta la
+prima e l'ultima uscita contro Warp4: un ordine di eventi errato
+non deve passare il gate.
+
+### Misure del follow-up decoder vettoriale e riuso scratch (GPU1)
+
+T=64, N=10240, K=5120. Input: BF16 derivati dagli embedding GGUF reali.
+10 ripetizioni CUDA-event dopo warmup. Tutti i 52,428,800 pesi BF16
+del nuovo decoder sono bit-identici alla decodifica CPU GGUF.
+La comparazione di output per i due stream usa 655,360 valori ciascuno.
+La scratch non mantiene copie dequantizzate persistenti dopo il GEMM.
+
+| Misura | Tempo |
+|---|---:|
+| Vecchio unpack, stesso GGUF | 1.71469 ms |
+| Nuovo unpack warp-vector + E2M1 bitcast | **0.36210 ms** |
+| Riduzione del solo unpack | **4.735x** |
+| Warp4 di riferimento, 64 lanci | 9.1103 ms |
+
+| Scratch esterna | Tile seriali | Unpack+GEMM T64 | VRAM allocata nel test | Errore massimo vs Warp4 | Test due stream |
+|---|---:|---:|---:|---:|---|
+| **8 MiB** | 14 | **0.48368 ms** | 96,468,992 B | 0.00001145 | PASS |
+| 32 MiB | 4 | 0.70335 ms | 121,634,816 B | 0.00016404 | PASS |
+| 105 MiB | 1 | Non testato con decoder finale | Non misurata | Non misurato | Non testato |
+
+In questo caso, 8 MiB sono sufficienti e piu veloci di 32 MiB
+**nel microbenchmark isolato**, ma l'effetto puo dipendere dalla
+taglia del GEMM, dall'occupazione, dal caching e dal traffico. Non
+estrapolare il rapporto 9.1103/0.48368 al PP2 completo.
+Il totale VRAM in tabella include due copie GGUF nel *test*
+(una con segno invertito), gli input e piu output. Non e il consumo
+addizionale di PP2. Il beneficio di scratch BF16, invece, e reale:
+8,388,608 B allocati anziche 104,857,600 B per questa matrice.
+
+Il test cross-stream accoda, senza sincronizzare dopo ogni chiamata:
+W originale sullo stream A, W con i segni invertiti sullo stream B,
+e nuovamente W originale su A. Gli output del primo e ultimo lancio
+devono coincidere con il baseline (entro la tolleranza del GEMM),
+quello centrale con il suo negativo. PASS con entrambi i buffer
+8/32 MiB. Confronto sul caso 8MiB: RMSE relativa 1.11e-7 e
+massimo errore assoluto 1.14e-5. Non equivale a una prova generale
+di sicurezza concorrente su ogni scheduler.
+
+I risultati numerici e le limitazioni sono anche in
+kernels/tests/prefill_unpack_results.json. La GPU e stata rilasciata,
+con nvidia-smi tornato ai valori prima del test (486/1289 MiB usati).
 
 ## GO / NO-GO per il sistema completo
 

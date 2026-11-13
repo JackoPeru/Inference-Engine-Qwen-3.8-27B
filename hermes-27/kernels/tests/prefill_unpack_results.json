@@ -1,0 +1,76 @@
+{
+  "status": "isolated_projection_only_no_full_model_approval",
+  "date": "2026-11-13",
+  "model_path": "/home/matteo/hermes-27/models/Qwen3.8-27B-Uncensored-NVFP4-MTP.gguf",
+  "tensor": "blk.0.attn_qkv.weight",
+  "dimensions": {
+    "N": 10240,
+    "K": 5120,
+    "T": 64
+  },
+  "hardware": {
+    "gpu": "NVIDIA GeForce RTX 5060 Ti 16 GB",
+    "device": 1,
+    "compute_capability": "12.0",
+    "cuda_compiler": "12.8"
+  },
+  "isolated_build": "/tmp/hermes_prefill_exact_worker2/bench_reuse",
+  "cpu_proof": {
+    "ue4m3_e2m1_pairs_exact_bf16": 4096,
+    "gguf_blocks_vector_order_verified": 7500,
+    "tile_addressing_cases_verified": 32
+  },
+  "gpu_weight_proof": {
+    "verified_values": 52428800,
+    "different_bf16_words_vs_cpu": 0
+  },
+  "measured_cuda_event_ms": {
+    "warmup": true,
+    "repetitions": 10,
+    "baseline_repeated_warp4": 9.1103,
+    "baseline_scalar_dequant_unpack": 1.71469,
+    "optimized_vector_unpack": 0.36210,
+    "unpack_improvement_factor": 4.735,
+    "old_full_unpacked_bf16_gemm_pipeline": 2.3182
+  },
+  "scratch_slot_results": [
+    {
+      "scratch_mib": 8,
+      "scratch_allocated_bytes": 8388608,
+      "sequential_weight_tiles": 14,
+      "gpu_process_delta_bytes": 96468992,
+      "repetitions": 10,
+      "cuda_event_unpack_plus_gemm_ms": 0.48368,
+      "cross_stream_original_negative_original": "PASS",
+      "output_values_compared_per_run": 655360,
+      "max_abs_diff_vs_warp4": 0.0000114440918,
+      "relative_rmse_vs_warp4": 1.10949262e-7
+    },
+    {
+      "scratch_mib": 32,
+      "scratch_allocated_bytes": 33554432,
+      "sequential_weight_tiles": 4,
+      "gpu_process_delta_bytes": 121634816,
+      "repetitions": 10,
+      "cuda_event_unpack_plus_gemm_ms": 0.70335,
+      "cross_stream_original_negative_original": "PASS",
+      "output_values_compared_per_run": 655360,
+      "max_abs_diff_vs_warp4": 0.000164031982,
+      "relative_rmse_vs_warp4": 1.23600679e-6
+    }
+  ],
+  "not_run": [
+    "Optimized scratch slot with 105 MiB buffer",
+    "PP2 full-model end-to-end logits and llama.cpp comparison",
+    "PP2 full-model throughput and multiuser load",
+    "CUDA graph capture",
+    "32GB complete checkpoint VRAM residency"
+  ],
+  "limitations": [
+    "GPU delta includes duplicated GGUF sign-flip fixture and multiple output buffers; not a PP2 VRAM profile",
+    "CUDA events measure isolated device-stream timing with warmup, not HTTP request latency",
+    "Scratch events serialize one slot across streams and can reduce multiuser throughput",
+    "The existing PP2 FP32 hidden vector must be explicitly converted to BF16 before this GEMM",
+    "No quality or speedup guarantee for the complete model"
+  ]
+}

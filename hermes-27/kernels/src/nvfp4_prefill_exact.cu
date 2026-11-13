@@ -2,8 +2,10 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
+#include <algorithm>
 #include <cstdint>
 #include <limits>
+#include <mutex>
 
 namespace hermes::prefill_exact {
 namespace {
@@ -28,6 +30,17 @@ __device__ __forceinline__ float e2m1(unsigned c) {
   }
 }
 
+// Branch-free E2M1 float32 bitcast for the vectorized unpack only.
+// Preserve +0 for nibble 0x8 (-0) so the resulting BF16 words match the
+// original GGUF decoder *bit for bit* (not only as equal floats).
+__device__ __forceinline__ float e2m1_exact_bits(unsigned q) {
+  unsigned m=q&7u;
+  unsigned fraction=(m&1u)&(m!=1u);
+  unsigned bits=((126u+(m>>1))<<23) | (fraction<<22) | ((q&8u)<<28);
+  bits &= 0u-(unsigned)(m!=0u);
+  return __uint_as_float(bits);
+}
+
 // One lane per GGUF pair: writes k and k+8 BF16 into the same 16 group.
 // Each 64-weight block is 36B: scale[4] followed by 32 E2M1 bytes.
 __global__ void unpack_exact_k(const uint8_t* __restrict__ gguf,
@@ -45,6 +58,43 @@ __global__ void unpack_exact_k(const uint8_t* __restrict__ gguf,
   size_t o=size_t(n)*K+size_t(b)*64+s*16+j;
   dst[o]=__float2bfloat16_rn(scale*e2m1(q&15));
   dst[o+8]=__float2bfloat16_rn(scale*e2m1(q>>4));
+}
+
+// GGUF 64-value block: [4 UE4M3 scale bytes, 32 E2M1 packed bytes].
+// One warp loads the 32 packed bytes exactly once. Each lane writes a
+// *contiguous* 32-bit BF16 pair, rather than two split-half 16-bit stores.
+// Reconstruct [0..7,8..15] nibble pairing via shfl; never requantize W.
+// PER_WARP lets one warp process multiple blocks in a loop, reducing CTA
+// scheduling overhead. Output W remains row-major [N,K].
+template<int PER_WARP>
+__global__ void unpack_vector_k(const uint8_t* __restrict__ gguf,
+                                uint16_t* __restrict__ dst,
+                                int K, size_t total_blocks) {
+  const int lane=int(threadIdx.x)&31;
+  const int warp=int(threadIdx.x)>>5;
+  constexpr int WARPS_PER_CTA=8;
+  const size_t first=(size_t(blockIdx.x)*WARPS_PER_CTA+size_t(warp))*PER_WARP;
+  #pragma unroll
+  for(int it=0;it<PER_WARP;++it) {
+    size_t block=first+it;
+    if(block>=total_blocks) continue; // uniform within this warp
+    const uint8_t* src=gguf+block*36;
+    unsigned packed_scales=lane==0 ? *reinterpret_cast<const uint32_t*>(src) : 0u;
+    packed_scales=__shfl_sync(0xffffffffu,packed_scales,0);
+    unsigned byte=src[4+lane];
+    const int sub=lane>>3, pair=lane&7;
+    const int source_lane=sub*8+(pair&3)*2;
+    unsigned q0=__shfl_sync(0xffffffffu,byte,source_lane);
+    unsigned q1=__shfl_sync(0xffffffffu,byte,source_lane+1);
+    if(pair>=4) {q0>>=4;q1>>=4;}
+    const float sf=ue4m3((packed_scales>>(sub*8))&0xffu);
+    const __nv_bfloat16 lo=__float2bfloat16_rn(sf*e2m1_exact_bits(q0&15u));
+    const __nv_bfloat16 hi=__float2bfloat16_rn(sf*e2m1_exact_bits(q1&15u));
+    const unsigned bf16pair=unsigned(__bfloat16_as_ushort(lo)) |
+                            (unsigned(__bfloat16_as_ushort(hi))<<16);
+    // Block corresponds to contiguous 64 weights, since K%64=0.
+    reinterpret_cast<unsigned*>(dst)[block*32+lane]=bf16pair;
+  }
 }
 
 // Four rows per CTA, one independent warp per row. Adjacent GGUF data
@@ -162,6 +212,21 @@ cudaError_t dequantize_gguf_to_bf16(const uint8_t* gguf_w,
   return cudaGetLastError();
 }
 
+cudaError_t dequantize_gguf_to_bf16_vector(
+    const uint8_t* gguf_w,uint16_t* weight_bf16,
+    int N,int K,cudaStream_t stream) {
+  if(!gguf_w || !weight_bf16 || !bf16_weight_scratch_bytes(N,K))
+    return cudaErrorInvalidValue;
+  constexpr int PER_WARP=4;
+  constexpr int CTA_WARPS=8;
+  const size_t blocks=size_t(N)*size_t(K/64);
+  const size_t ctas=(blocks+PER_WARP*CTA_WARPS-1)/(PER_WARP*CTA_WARPS);
+  if(ctas>size_t(std::numeric_limits<int>::max()))return cudaErrorInvalidConfiguration;
+  unpack_vector_k<PER_WARP><<<unsigned(ctas),256,0,stream>>>(
+      gguf_w,weight_bf16,K,blocks);
+  return cudaGetLastError();
+}
+
 cublasStatus_t gemm_bf16_fp32(cublasHandle_t handle,
                               const uint16_t* x_bf16,
                               const uint16_t* weight_bf16,
@@ -178,6 +243,172 @@ cublasStatus_t gemm_bf16_fp32(cublasHandle_t handle,
      x_bf16,CUDA_R_16BF,K,
      &beta,y_fp32,CUDA_R_32F,N,
      CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+}
+
+ReusableBF16WeightScratch::~ReusableBF16WeightScratch() {
+  (void)shutdown();
+}
+
+ScratchResult ReusableBF16WeightScratch::init(
+    void* buffer,size_t capacity_bytes) {
+  std::lock_guard<std::mutex> lock(submit_mutex_);
+  if(buffer_ || handle_ || ready_event_ || poisoned_)
+    return {ScratchCode::InvalidArguments};
+  if(!buffer || capacity_bytes<2 || (reinterpret_cast<uintptr_t>(buffer)&15u))
+    return {ScratchCode::InvalidArguments};
+  int device=-1;
+  cudaError_t err=cudaGetDevice(&device);
+  if(err!=cudaSuccess) return {ScratchCode::CudaFailure,err};
+  cudaPointerAttributes attr{};
+  err=cudaPointerGetAttributes(&attr,buffer);
+  if(err!=cudaSuccess) return {ScratchCode::CudaFailure,err};
+  if(attr.device!=device || attr.type!=cudaMemoryTypeDevice)
+    return {ScratchCode::WrongDevice};
+
+  cudaEvent_t ev=nullptr;
+  err=cudaEventCreateWithFlags(&ev,cudaEventDisableTiming);
+  if(err!=cudaSuccess) return {ScratchCode::CudaFailure,err};
+  cublasHandle_t blas=nullptr;
+  cublasStatus_t st=cublasCreate(&blas);
+  if(st!=CUBLAS_STATUS_SUCCESS) {
+    cudaEventDestroy(ev);
+    return {ScratchCode::CublasFailure,cudaSuccess,st};
+  }
+  buffer_=reinterpret_cast<uint16_t*>(buffer);
+  capacity_bytes_=capacity_bytes;
+  device_=device;
+  ready_event_=ev;
+  handle_=blas;
+  event_recorded_=false;
+  poisoned_=false;
+  return {};
+}
+
+ScratchResult ReusableBF16WeightScratch::enqueue(
+    const uint8_t* gguf_w,const uint16_t* x_bf16,float* y_fp32,
+    int T,int N,int K,cudaStream_t stream) {
+  std::lock_guard<std::mutex> lock(submit_mutex_);
+  if(!buffer_ || !handle_ || !ready_event_)
+    return {ScratchCode::Uninitialized};
+  if(poisoned_)return {ScratchCode::Poisoned};
+  if(!gguf_w || !x_bf16 || !y_fp32 || T<=0 || N<=0 ||
+     K<=0 || K%64!=0 || size_t(K)>SIZE_MAX/2)
+    return {ScratchCode::InvalidArguments};
+  const size_t row_bytes=size_t(K)*2;
+  if(capacity_bytes_<row_bytes)return {ScratchCode::InsufficientCapacity};
+  // Memory objects are device-specific. This also detects a caller thread
+  // moving the slot to another CUDA device after initialization.
+  int active=-1;
+  cudaError_t ce=cudaGetDevice(&active);
+  if(ce!=cudaSuccess)return {ScratchCode::CudaFailure,ce};
+  if(active!=device_)return {ScratchCode::WrongDevice};
+
+  cudaStreamCaptureStatus capture=cudaStreamCaptureStatusNone;
+  ce=cudaStreamIsCapturing(stream,&capture);
+  if(ce!=cudaSuccess)return {ScratchCode::CudaFailure,ce};
+  if(capture!=cudaStreamCaptureStatusNone)
+    return {ScratchCode::InvalidArguments}; // Not CUDA-graph-safe.
+
+  // CUDA event wait captures the most recently recorded generation. Holding
+  // the mutex through the final record guarantees that next submissions see
+  // a well-defined predecessor even on different host threads/streams.
+  if(event_recorded_) {
+    ce=cudaStreamWaitEvent(stream,ready_event_,0);
+    if(ce!=cudaSuccess){poisoned_=true;return {ScratchCode::CudaFailure,ce};}
+  }
+
+  // Any failure after the first enqueue POISONS this slot. Attempt to record
+  // a completion event for already queued work so shutdown can wait safely.
+  auto fail_cuda=[&](cudaError_t failure)->ScratchResult {
+    poisoned_=true;
+    cudaError_t rec=cudaEventRecord(ready_event_,stream);
+    if(rec==cudaSuccess)event_recorded_=true;
+    else event_unknown_=true;
+    return {ScratchCode::CudaFailure,failure};
+  };
+  auto fail_blas=[&](cublasStatus_t failure)->ScratchResult {
+    poisoned_=true;
+    cudaError_t rec=cudaEventRecord(ready_event_,stream);
+    if(rec==cudaSuccess)event_recorded_=true;
+    else event_unknown_=true;
+    return {ScratchCode::CublasFailure,cudaSuccess,failure};
+  };
+  cublasStatus_t st=cublasSetStream(handle_,stream);
+  if(st!=CUBLAS_STATUS_SUCCESS){
+    poisoned_=true;
+    return {ScratchCode::CublasFailure,cudaSuccess,st};
+  }
+  const float alpha=1.f,beta=0.f;
+
+  size_t max_rows=capacity_bytes_/row_bytes;
+  max_rows=std::min(max_rows,size_t(N));
+  // Align tile row count for efficient Tensor Core GEMM, if possible.
+  if(max_rows>=128)max_rows=(max_rows/128)*128;
+  const int tile_rows=int(max_rows);
+  for(int base=0;base<N;base+=tile_rows) {
+    const int rows=std::min(tile_rows,N-base);
+    const size_t raw_row_bytes=size_t(K/64)*36;
+    ce=dequantize_gguf_to_bf16_vector(
+      gguf_w+size_t(base)*raw_row_bytes,buffer_,rows,K,stream);
+    if(ce!=cudaSuccess)return fail_cuda(ce);
+    // Column-major Y[N,T], identical memory to C-row-major Y[T,N].
+    // The base offset in Y applies to output rows, ldc remains full N.
+    st=cublasGemmEx(handle_,CUBLAS_OP_T,CUBLAS_OP_N,
+       rows,T,K,&alpha,
+       buffer_,CUDA_R_16BF,K,
+       x_bf16,CUDA_R_16BF,K,
+       &beta,y_fp32+base,CUDA_R_32F,N,
+       CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    if(st!=CUBLAS_STATUS_SUCCESS)return fail_blas(st);
+  }
+  ce=cudaEventRecord(ready_event_,stream);
+  if(ce!=cudaSuccess){
+    poisoned_=true;
+    event_unknown_=true;
+    return {ScratchCode::CudaFailure,ce};
+  }
+  event_recorded_=true;
+  return {};
+}
+
+ScratchResult ReusableBF16WeightScratch::shutdown_locked() {
+  if(!buffer_ && !handle_ && !ready_event_)return {};
+  int active=-1;
+  cudaError_t ce=cudaGetDevice(&active);
+  if(ce!=cudaSuccess)return {ScratchCode::CudaFailure,ce};
+  if(active!=device_)return {ScratchCode::WrongDevice};
+  if(event_unknown_) {
+    // Do not wait on an OLD event generation if the new one failed to
+    // record. The global sync is limited to this error-only teardown.
+    ce=cudaDeviceSynchronize();
+    if(ce!=cudaSuccess)return {ScratchCode::CudaFailure,ce};
+  } else if(event_recorded_) {
+    ce=cudaEventSynchronize(ready_event_);
+    if(ce!=cudaSuccess)return {ScratchCode::CudaFailure,ce};
+  } else if(poisoned_) {
+    // An event record may have failed after a kernel launch. A full device
+    // sync is acceptable on this *exception-only* teardown path.
+    ce=cudaDeviceSynchronize();
+    if(ce!=cudaSuccess)return {ScratchCode::CudaFailure,ce};
+  }
+  cublasStatus_t st=cublasDestroy(handle_);
+  if(st!=CUBLAS_STATUS_SUCCESS)
+    return {ScratchCode::CublasFailure,cudaSuccess,st};
+  handle_=nullptr;
+  ce=cudaEventDestroy(ready_event_);
+  if(ce!=cudaSuccess)return {ScratchCode::CudaFailure,ce};
+  ready_event_=nullptr;
+  buffer_=nullptr;
+  capacity_bytes_=0;
+  device_=-1;
+  event_recorded_=false;
+  event_unknown_=false;
+  poisoned_=false;
+  return {};
+}
+ScratchResult ReusableBF16WeightScratch::shutdown() {
+  std::lock_guard<std::mutex> lock(submit_mutex_);
+  return shutdown_locked();
 }
 
 cudaError_t batch4_direct_gguf(const uint16_t* x_bf16,
