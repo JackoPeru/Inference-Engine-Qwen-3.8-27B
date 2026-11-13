@@ -1,0 +1,33 @@
+{
+  "engine": "HERMES-27 PP2 (GPU0 blk0-31 + GPU1 blk32-63)",
+  "checkpoint": "Qwen3.8-27B-Uncensored-NVFP4-MTP.gguf (19694360544 B)",
+  "prompt_tokens": 11,
+  "ids": [6205, 161421, 303, 220, 17, 1374, 9911, 1147, 27053, 6059, 13],
+  "measured": {
+    "upload_cold_s": 9.6,
+    "upload_warm_s": 2.8,
+    "prefill_11_ms": 6788.1,
+    "prefill_tps": 1.62,
+    "ttft_s": 6.8,
+    "decode_ms_per_tok": 654,
+    "decode_tps": 1.53,
+    "tpot_ms": 654,
+    "xfer_boundary_ms": 0.06,
+    "vram0_peak_MiB": 9869,
+    "vram1_peak_MiB": 11482,
+    "vram0_steady_MiB": 9856,
+    "vram1_steady_MiB": 11470,
+    "gpu_util_pattern": "bursty 0/99 alternating per stage (no microbatch overlap yet)",
+    "leak_check": "486/1289 MiB before==after"
+  },
+  "correctness_vs_cpu_fp32_E1E2": {
+    "prefill_top5": "MATCH [220,1374,27053,17,1147]",
+    "full_logits_maxerr": 6.553,
+    "full_logits_meanerr": 0.242,
+    "argmax_match": "9/11, last token exact",
+    "note": "gap is bf16-activation + W4A4 noise vs fp32 reference, not a functional bug; decode-vs-prefill is bit-exact"
+  },
+  "decode_vs_prefill": "bit-exact all 11 tokens (maxerr 0.0)",
+  "greedy_gen": [220, 17, 1374, 220],
+  "environment": "2x RTX 5060 Ti 16GB, CUDA 12.8 build, driver 595.99, no P2P, host-pinned xfer"
+}
