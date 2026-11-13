@@ -211,6 +211,12 @@ endif()
 add_executable(hermes_generate tools/hermes_generate.cpp)
 target_link_libraries(hermes_generate PRIVATE hermes_pp2)
 add_dependencies(hermes_generate gguf_dump)
+if(Python3_Interpreter_FOUND)
+  add_test(NAME generate_batched_args_cpu COMMAND
+    ${Python3_EXECUTABLE} -B ${CMAKE_SOURCE_DIR}/tools/test_generate_args_cpu.py
+    $<TARGET_FILE:hermes_generate>)
+  set_tests_properties(generate_batched_args_cpu PROPERTIES TIMEOUT 60)
+endif()
 add_executable(test_pp2_fwd distributed/test_pp2_fwd.cu)
 target_link_libraries(test_pp2_fwd PRIVATE hermes_pp2 hermes_gguf hermes_kernels)
 if(HERMES_REGISTER_GPU_TESTS)

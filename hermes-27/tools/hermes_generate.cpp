@@ -34,6 +34,7 @@ struct Options {
   int max_new_tokens = 4;
   int eos_token = -1;
   bool verify_prefill = false;
+  bool batched_prefill = false;
   std::string logits_dump_dir;
 };
 
@@ -41,10 +42,13 @@ void usage(FILE* out) {
   std::fprintf(out,
     "Usage: hermes_generate --model FILE.gguf --prompt-ids ID[,ID...] "
     "[--prompt-ids ID[,ID...]] [--max-new-tokens N] [--eos-token ID] "
-    "[--verify-prefill] [--dump-logits-dir EXISTING_DIRECTORY]\n"
+    "[--verify-prefill] [--batched-prefill] [--dump-logits-dir EXISTING_DIRECTORY]\n"
     "Greedy PP2 token-ID generation. EOS defaults to GGUF metadata.\n"
     "Each prompt gets fresh decode state. Context limit: 8192 tokens.\n"
-    "Prompt seed runs decode_step per token (sequential T=1), not chunked prefill.\n"
+    "Default seed runs decode_step per token (sequential T=1).\n"
+    "--batched-prefill seeds the persistent decode state with one T<=64 PP2 prefill;\n"
+    "default GEMV uses raw GGUF; HERMES_PP2_PREFILL_BF16=1 remains a strict\n"
+    "experimental quality gate and can reject the request.\n"
     "--verify-prefill compares seed logits with full prefill (prompt <= 64).\n"
     "Chunked prefill and MTP are not supported by this path.\n"
     "Optional logits dump creates prompt_<index>_step_<index>.f32 files;\n"
@@ -109,6 +113,7 @@ bool parse_options(int argc, char** argv, Options& opts) {
     const std::string_view arg(argv[i]);
     if(arg == "--help" || arg == "-h") { usage(stdout); return false; }
     if(arg == "--verify-prefill") { opts.verify_prefill = true; continue; }
+    if(arg == "--batched-prefill") { opts.batched_prefill = true; continue; }
     if(i + 1 >= argc) {
       std::fprintf(stderr, "ERROR: missing value for %.*s\n", (int)arg.size(), arg.data());
       return false;
@@ -158,6 +163,10 @@ bool parse_options(int argc, char** argv, Options& opts) {
     }
     if(opts.verify_prefill && size > kPrefillMax) {
       std::fprintf(stderr, "ERROR: prompt %zu exceeds full-prefill limit %zu for --verify-prefill\n", i, kPrefillMax);
+      return false;
+    }
+    if(opts.batched_prefill && size > kPrefillMax) {
+      std::fprintf(stderr, "ERROR: prompt %zu exceeds batched state prefill limit %zu\n", i, kPrefillMax);
       return false;
     }
   }
@@ -250,16 +259,29 @@ int main(int argc, char** argv) {
       pp2::free_all();
       return 1;
     }
-    std::fprintf(stderr, "SEED prompt=%zu mode=token-by-token capacity=%d\n", pi, context_capacity);
+    std::fprintf(stderr, "SEED prompt=%zu mode=%s capacity=%d\n",
+                 pi, opts.batched_prefill ? "batched-raw-gguf" : "token-by-token", context_capacity);
     std::vector<float> logits;
     const auto seed_started = std::chrono::steady_clock::now();
-    for(std::size_t pos = 0; pos < prompt.size(); ++pos) {
-      logits = pp2::decode_step(prompt[pos], state, (long)pos, err);
-      if(logits.empty()) {
-        std::fprintf(stderr, "ERROR: prompt %zu token-by-token seed failed at pos %zu: %s\n", pi, pos, err.c_str());
+    if(opts.batched_prefill) {
+      pp2::Stats prefill_stats;
+      auto all = pp2::prefill_into_decode_state(prompt, state, prefill_stats, err);
+      if(all.size() != prompt.size() * (std::size_t)kVocab) {
+        std::fprintf(stderr, "ERROR: prompt %zu batched seeded prefill failed: %s\n", pi, err.c_str());
         pp2::decode_free(state);
         pp2::free_all();
         return 1;
+      }
+      logits.assign(all.end() - kVocab, all.end());
+    } else {
+      for(std::size_t pos = 0; pos < prompt.size(); ++pos) {
+        logits = pp2::decode_step(prompt[pos], state, (long)pos, err);
+        if(logits.empty()) {
+          std::fprintf(stderr, "ERROR: prompt %zu token-by-token seed failed at pos %zu: %s\n", pi, pos, err.c_str());
+          pp2::decode_free(state);
+          pp2::free_all();
+          return 1;
+        }
       }
     }
     const auto seed_ended = std::chrono::steady_clock::now();
