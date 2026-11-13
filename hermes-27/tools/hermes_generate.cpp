@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <filesystem>
 #include <limits>
 #include <string>
 #include <string_view>
@@ -33,18 +34,51 @@ struct Options {
   int max_new_tokens = 4;
   int eos_token = -1;
   bool verify_prefill = false;
+  std::string logits_dump_dir;
 };
 
 void usage(FILE* out) {
   std::fprintf(out,
     "Usage: hermes_generate --model FILE.gguf --prompt-ids ID[,ID...] "
     "[--prompt-ids ID[,ID...]] [--max-new-tokens N] [--eos-token ID] "
-    "[--verify-prefill]\n"
+    "[--verify-prefill] [--dump-logits-dir EXISTING_DIRECTORY]\n"
     "Greedy PP2 token-ID generation. EOS defaults to GGUF metadata.\n"
     "Each prompt gets fresh decode state. Context limit: 8192 tokens.\n"
     "Prompt seed runs decode_step per token (sequential T=1), not chunked prefill.\n"
     "--verify-prefill compares seed logits with full prefill (prompt <= 64).\n"
-    "Chunked prefill and MTP are not supported by this path.\n");
+    "Chunked prefill and MTP are not supported by this path.\n"
+    "Optional logits dump creates prompt_<index>_step_<index>.f32 files;\n"
+    "step 0 is post-seed logits for the first greedy generated token.\n");
+}
+
+bool dump_logits(const std::string& dir, std::size_t prompt_index, int step,
+                 const std::vector<float>& logits, std::string& err) {
+  if(logits.size() != (std::size_t)kVocab) {
+    err = "logits dump: unexpected logit count";
+    return false;
+  }
+  const std::string final_path =
+      dir + "/prompt_" + std::to_string(prompt_index) +
+      "_step_" + std::to_string(step) + ".f32";
+  const std::string partial = final_path + ".partial";
+  FILE* out = std::fopen(partial.c_str(), "wb");
+  if(!out) {
+    err = "logits dump: cannot open " + partial;
+    return false;
+  }
+  const std::size_t written = std::fwrite(logits.data(), sizeof(float), logits.size(), out);
+  const bool closed = std::fclose(out) == 0;
+  if(written != logits.size() || !closed) {
+    std::remove(partial.c_str());
+    err = "logits dump: short write or close error at " + partial;
+    return false;
+  }
+  if(std::rename(partial.c_str(), final_path.c_str()) != 0) {
+    std::remove(partial.c_str());
+    err = "logits dump: failed to finalize " + final_path;
+    return false;
+  }
+  return true;
 }
 
 bool parse_int(std::string_view s, int& value) {
@@ -81,6 +115,7 @@ bool parse_options(int argc, char** argv, Options& opts) {
     }
     const std::string_view value(argv[++i]);
     if(arg == "--model") opts.model.assign(value);
+    else if(arg == "--dump-logits-dir") opts.logits_dump_dir.assign(value);
     else if(arg == "--prompt-ids") {
       std::vector<int> ids;
       if(!parse_ids(value, ids)) {
@@ -107,6 +142,13 @@ bool parse_options(int argc, char** argv, Options& opts) {
     std::fprintf(stderr, "ERROR: --model and at least one --prompt-ids are required\n");
     usage(stderr);
     return false;
+  }
+  if(!opts.logits_dump_dir.empty()) {
+    std::error_code ec;
+    if(!std::filesystem::is_directory(opts.logits_dump_dir, ec) || ec) {
+      std::fprintf(stderr, "ERROR: --dump-logits-dir requires an existing directory\n");
+      return false;
+    }
   }
   for(std::size_t i = 0; i < opts.prompts.size(); ++i) {
     const auto size = opts.prompts[i].size();
@@ -255,6 +297,13 @@ int main(int argc, char** argv) {
       int next = -1;
       if(!argmax(logits, next, err)) {
         std::fprintf(stderr, "ERROR: prompt %zu greedy selection failed: %s\n", pi, err.c_str());
+        pp2::decode_free(state);
+        pp2::free_all();
+        return 1;
+      }
+      if(!opts.logits_dump_dir.empty() &&
+         !dump_logits(opts.logits_dump_dir, pi, step, logits, err)) {
+        std::fprintf(stderr, "ERROR: prompt %zu logit dump step %d: %s\n", pi, step, err.c_str());
         pp2::decode_free(state);
         pp2::free_all();
         return 1;
