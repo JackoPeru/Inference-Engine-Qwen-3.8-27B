@@ -73,9 +73,9 @@ __global__ void conv_silu_k(const float* qkv, const float* Wc, float* cv, int T,
   int idx=(int)(blockIdx.x*blockDim.x+threadIdx.x);
   int N=T*C; if(idx>=N) return;
   int t=idx/C, c=idx%C;
-  float acc=0;
-  for(int j=0;j<4;++j){ int tt=t-(3-j); float xv=(tt<0)?0.f:qkv[(size_t)tt*C+c]; acc+=xv*Wc[(size_t)c*4+j]; }
-  cv[idx]=acc/(1.f+expf(-acc));
+  float acc=0.f;
+  for(int j=0;j<4;++j){ int tt=t-(3-j); float xv=(tt<0)?0.f:qkv[(size_t)tt*C+c]; acc=__fmaf_rn(xv,Wc[(size_t)c*4+j],acc); } // FMA esplicito: identico a conv_decode_k
+  cv[idx]=acc/(1.f+expf(-acc)); // SiLU division form: acc*sigmoid(acc)
 }
 __global__ void wa_gemm_k(const float* h, const float* Wa, float* ar, int T, int N, int K){
   int idx=(int)(blockIdx.x*blockDim.x+threadIdx.x);
@@ -297,6 +297,15 @@ static bool run_gdn_layer(int li, float* d_x, int T, std::string& err){
   f32_to_bf16_k<<<(int)(((size_t)T*VDD+255)/256),256>>>(d_gb,d_g,(int)((size_t)T*VDD));
   gemv_batch(d_gb,(uint8_t*)wOut->d,d_core,VDD,HID,T);
   add_k<<<(int)((nH+255)/256),256>>>(d_x,d_core,(int)nH);
+  if(getenv("HERMES_L26") && li==26){
+    std::vector<float> hg((size_t)T*VDD), hc((size_t)T*HID), ho((size_t)T*HV*VHD), hx2((size_t)T*HID);
+    cudaMemcpy(hg.data(),d_g,(size_t)T*VDD*4,cudaMemcpyDeviceToHost);
+    cudaMemcpy(hc.data(),d_core,nH*4,cudaMemcpyDeviceToHost);
+    cudaMemcpy(ho.data(),d_o,(size_t)T*HV*VHD*4,cudaMemcpyDeviceToHost);
+    cudaMemcpy(hx2.data(),d_x,nH*4,cudaMemcpyDeviceToHost);
+    FILE *ff=fopen("/tmp/l26_pre.bin","wb"); fwrite(hg.data(),4,hg.size(),ff); fwrite(hc.data(),4,hc.size(),ff); fwrite(ho.data(),4,ho.size(),ff); fwrite(hx2.data(),4,hx2.size(),ff); fclose(ff);
+    printf("l26 pre saved\n"); fflush(stdout);
+  }
   // 9 post + mlp
   rms_f32_k<<<T,512,(size_t)512*4>>>(d_h,d_x,(float*)wPost->d,T,HID);
   f32_to_bf16_k<<<(int)((nH+255)/256),256>>>(d_h2b,d_h,(int)nH);
@@ -760,6 +769,843 @@ int check_blk32_gpu1(){
   }
   if(mx/(rms+1e-12)>=0.2) return 1;
   printf("GATE2 blk32 GPU1 PASS\n");
+  return 0;
+}
+
+// ---------- P4 decode incrementale ----------
+__global__ void conv_decode_k(const float* q1, const float* Wc, float* CS, float* cv, int C){
+  int c=(int)(blockIdx.x*blockDim.x+threadIdx.x);
+  if(c>=C) return;
+  float c0=CS[(size_t)c*3+0], c1=CS[(size_t)c*3+1], c2=CS[(size_t)c*3+2];
+  float acc=0.f;
+  acc=__fmaf_rn(c0,Wc[(size_t)c*4+0],acc);
+  acc=__fmaf_rn(c1,Wc[(size_t)c*4+1],acc);
+  acc=__fmaf_rn(c2,Wc[(size_t)c*4+2],acc);
+  acc=__fmaf_rn(q1[c],Wc[(size_t)c*4+3],acc); // stessa catena FMA di conv_silu_k
+  cv[c]=acc/(1.f+expf(-acc)); // SiLU division form: acc*sigmoid(acc)
+  CS[(size_t)c*3+0]=c1; CS[(size_t)c*3+1]=c2; CS[(size_t)c*3+2]=q1[c];
+}
+__global__ void q_norm_rope_pos_k(const float* qq, const float* qn, float* Q, int pos){
+  int bh=(int)blockIdx.x; int head=bh; int tid=(int)threadIdx.x;
+  __shared__ float sh[256]; __shared__ float sq[256];
+  float v=qq[(size_t)head*512+tid];
+  sh[tid]=v*v; __syncthreads();
+  for(int s=128;s>0;s>>=1){ if(tid<s) sh[tid]+=sh[tid+s]; __syncthreads(); }
+  float inv=1.f/sqrtf(sh[0]/256.f+1e-6f);
+  float qnrm=v*inv*qn[tid];
+  sq[tid]=qnrm; __syncthreads();
+  float y;
+  if(tid<64){ int i=tid<32?tid:tid-32;
+    float fr=1.f/powf(10000000.f,(float)(2*i)/64.f);
+    float ang=(float)pos*fr, cc=cosf(ang), ss=sinf(ang);
+    float a=sq[i], b=sq[32+i];
+    y=(tid<32)?(a*cc-b*ss):(a*ss+b*cc);
+  } else y=qnrm;
+  Q[(size_t)head*256+tid]=y;
+}
+__global__ void k_norm_rope_pos_k(const float* kk, const float* kn, float* K_, int pos){
+  int bh=(int)blockIdx.x; int head=bh; int tid=(int)threadIdx.x;
+  __shared__ float sh[256]; __shared__ float sq[256];
+  float v=kk[(size_t)head*256+tid];
+  sh[tid]=v*v; __syncthreads();
+  for(int s=128;s>0;s>>=1){ if(tid<s) sh[tid]+=sh[tid+s]; __syncthreads(); }
+  float inv=1.f/sqrtf(sh[0]/256.f+1e-6f);
+  float qnrm=v*inv*kn[tid];
+  sq[tid]=qnrm; __syncthreads();
+  float y;
+  if(tid<64){ int i=tid<32?tid:tid-32;
+    float fr=1.f/powf(10000000.f,(float)(2*i)/64.f);
+    float ang=(float)pos*fr, cc=cosf(ang), ss=sinf(ang);
+    float a=sq[i], b=sq[32+i];
+    y=(tid<32)?(a*cc-b*ss):(a*ss+b*cc);
+  } else y=qnrm;
+  K_[(size_t)head*256+tid]=y;
+}
+__global__ void extract_G_k(const float* qq, float* G, int N){
+  int idx=(int)(blockIdx.x*blockDim.x+threadIdx.x);
+  if(idx>=N) return;
+  int hd=idx/256, d=idx%256;
+  G[idx]=qq[(size_t)hd*512+256+d];
+}
+__global__ void sdpa_gqa_decode_k(const float* Q, const float* Kc, const float* Vc, float* ATT, int L){
+  int b=(int)blockIdx.x; int hq=b; int g=hq/6; int tid=(int)threadIdx.x;
+  __shared__ float scores[128]; __shared__ float tmp[256];
+  float qv=Q[(size_t)hq*256+tid];
+  for(int t2=0;t2<=L;++t2){
+    float kv=Kc[(size_t)t2*1024+g*256+tid];
+    tmp[tid]=qv*kv; __syncthreads();
+    for(int s=128;s>0;s>>=1){ if(tid<s) tmp[tid]+=tmp[tid+s]; __syncthreads(); }
+    if(tid==0) scores[t2]=tmp[0]*(1.f/16.f);
+    __syncthreads();
+  }
+  if(tid==0){
+    float mx=-1e30f; for(int t2=0;t2<=L;++t2) if(scores[t2]>mx)mx=scores[t2];
+    float den=0; for(int t2=0;t2<=L;++t2){ scores[t2]=expf(scores[t2]-mx); den+=scores[t2]; }
+    for(int t2=0;t2<=L;++t2) scores[t2]/=den;
+  }
+  __syncthreads();
+  float a=0; for(int t2=0;t2<=L;++t2) a+=scores[t2]*Vc[(size_t)t2*1024+g*256+tid];
+  ATT[(size_t)hq*256+tid]=a;
+}
+
+static bool run_gdn_decode_layer(int li, float* d_x, DecodeState& ds, std::string& err){
+  char Pb[16]; snprintf(Pb,16,"blk.%d.",li); std::string P=Pb;
+  WEntry *wNorm=find_w(P+"attn_norm.weight"), *wQkv=find_w(P+"attn_qkv.weight"),
+         *wGate=find_w(P+"attn_gate.weight"), *wBeta=find_w(P+"ssm_beta.weight"),
+         *wAlpha=find_w(P+"ssm_alpha.weight"), *wC=find_w(P+"ssm_conv1d.weight"),
+         *wA=find_w(P+"ssm_a"), *wDT=find_w(P+"ssm_dt.bias"),
+         *wN=find_w(P+"ssm_norm.weight"), *wOut=find_w(P+"ssm_out.weight"),
+         *wPost=find_w(P+"post_attention_norm.weight"),
+         *wFg=find_w(P+"ffn_gate.weight"), *wFu=find_w(P+"ffn_up.weight"), *wFd=find_w(P+"ffn_down.weight");
+  if(!wNorm||!wQkv||!wGate||!wBeta||!wAlpha||!wC||!wA||!wDT||!wN||!wOut||!wPost||!wFg||!wFu||!wFd){ err="missing w gdn dec "+P; return false; }
+  if(!ds.S[li]||!ds.CS[li]){ err="decode state null gdn "+P; return false; }
+  const int T=1; size_t nH=(size_t)T*HID;
+  float *d_h=nullptr, *d_q1=nullptr, *d_cv=nullptr, *d_zl=nullptr, *d_b=nullptr, *d_ar=nullptr,
+        *d_be=nullptr, *d_gl=nullptr, *d_q=nullptr, *d_k=nullptr, *d_v=nullptr, *d_o=nullptr,
+        *d_g=nullptr, *d_core=nullptr, *d_gg=nullptr, *d_uu=nullptr, *d_hid=nullptr, *d_down=nullptr;
+  uint16_t *d_hb=nullptr, *d_h2b=nullptr, *d_gb=nullptr, *d_hidb=nullptr;
+  cudaMalloc(&d_h,nH*4); cudaMalloc(&d_hb,nH*2);
+  cudaMalloc(&d_q1,(size_t)CC*4); cudaMalloc(&d_cv,(size_t)CC*4);
+  cudaMalloc(&d_zl,(size_t)VDD*4); cudaMalloc(&d_b,(size_t)HV*4); cudaMalloc(&d_ar,(size_t)HV*4);
+  cudaMalloc(&d_be,(size_t)HV*4); cudaMalloc(&d_gl,(size_t)HV*4);
+  cudaMalloc(&d_q,(size_t)HV*KHD*4); cudaMalloc(&d_k,(size_t)HV*KHD*4); cudaMalloc(&d_v,(size_t)HV*VHD*4);
+  cudaMalloc(&d_o,(size_t)HV*VHD*4);
+  cudaMalloc(&d_g,(size_t)VDD*4); cudaMalloc(&d_core,nH*4);
+  cudaMalloc(&d_gg,(size_t)FFN*4); cudaMalloc(&d_uu,(size_t)FFN*4);
+  cudaMalloc(&d_hid,(size_t)FFN*4); cudaMalloc(&d_down,nH*4);
+  cudaMalloc(&d_h2b,nH*2); cudaMalloc(&d_gb,(size_t)VDD*2); cudaMalloc(&d_hidb,(size_t)FFN*2);
+  rms_f32_k<<<T,512,(size_t)512*4>>>(d_h,d_x,(float*)wNorm->d,T,HID);
+  f32_to_bf16_k<<<(int)((nH+255)/256),256>>>(d_hb,d_h,(int)nH);
+  gemv_batch(d_hb,(uint8_t*)wQkv->d,d_q1,HID,CC,T);
+  gemv_batch(d_hb,(uint8_t*)wGate->d,d_zl,HID,VDD,T);
+  gemv_batch(d_hb,(uint8_t*)wBeta->d,d_b,HID,HV,T);
+  wa_gemm_k<<<(int)((T*HV+255)/256),256>>>(d_h,(float*)wAlpha->d,d_ar,T,HV,HID);
+  conv_decode_k<<<(int)((CC+255)/256),256>>>(d_q1,(float*)wC->d,ds.CS[li],d_cv,CC);
+  {
+    size_t nq=(size_t)T*HV*KHD;
+    split_qkv_k<<<(int)((nq+255)/256),256>>>(d_cv,d_q,d_k,d_v,T);
+  }
+  beta_gl_k<<<(int)(((size_t)T*HV+255)/256),256>>>(d_b,d_ar,(float*)wA->d,(float*)wDT->d,d_be,d_gl,(int)((size_t)T*HV));
+  qk_norm_scale_k<<<(T*HV),128>>>(d_q,d_k,T);
+  gdn_step_cuda(d_q,d_k,d_v,d_be,d_gl,ds.S[li],d_o,HV,KHD,VHD);
+  gated_rms_k<<<(T*HV),128>>>(d_o,d_zl,(float*)wN->d,d_g,T);
+  f32_to_bf16_k<<<(int)(((size_t)VDD+255)/256),256>>>(d_gb,d_g,(int)((size_t)VDD));
+  gemv_batch(d_gb,(uint8_t*)wOut->d,d_core,VDD,HID,T);
+  add_k<<<(int)((nH+255)/256),256>>>(d_x,d_core,(int)nH);
+  if(getenv("HERMES_L26") && li==26){
+    std::vector<float> hg((size_t)VDD), hc((size_t)HID), ho((size_t)HV*VHD), hx2((size_t)HID);
+    cudaMemcpy(hg.data(),d_g,(size_t)VDD*4,cudaMemcpyDeviceToHost);
+    cudaMemcpy(hc.data(),d_core,(size_t)HID*4,cudaMemcpyDeviceToHost);
+    cudaMemcpy(ho.data(),d_o,(size_t)HV*VHD*4,cudaMemcpyDeviceToHost);
+    cudaMemcpy(hx2.data(),d_x,(size_t)HID*4,cudaMemcpyDeviceToHost);
+    FILE *ff=fopen("/tmp/l26_dec.bin","ab"); fwrite(hg.data(),4,hg.size(),ff); fwrite(hc.data(),4,hc.size(),ff); fwrite(ho.data(),4,ho.size(),ff); fwrite(hx2.data(),4,hx2.size(),ff); fclose(ff);
+  }
+  rms_f32_k<<<T,512,(size_t)512*4>>>(d_h,d_x,(float*)wPost->d,T,HID);
+  f32_to_bf16_k<<<(int)((nH+255)/256),256>>>(d_h2b,d_h,(int)nH);
+  gemv_batch(d_h2b,(uint8_t*)wFg->d,d_gg,HID,FFN,T);
+  gemv_batch(d_h2b,(uint8_t*)wFu->d,d_uu,HID,FFN,T);
+  silu_mul_k<<<(int)(((size_t)FFN+255)/256),256>>>(d_gg,d_uu,d_hid,(int)((size_t)FFN));
+  f32_to_bf16_k<<<(int)(((size_t)FFN+255)/256),256>>>(d_hidb,d_hid,(int)((size_t)FFN));
+  gemv_batch(d_hidb,(uint8_t*)wFd->d,d_down,FFN,HID,T);
+  add_k<<<(int)((nH+255)/256),256>>>(d_x,d_down,(int)nH);
+  cudaDeviceSynchronize();
+  cudaFree(d_h);cudaFree(d_hb);cudaFree(d_q1);cudaFree(d_cv);cudaFree(d_zl);cudaFree(d_b);cudaFree(d_ar);
+  cudaFree(d_be);cudaFree(d_gl);cudaFree(d_q);cudaFree(d_k);cudaFree(d_v);cudaFree(d_o);
+  cudaFree(d_g);cudaFree(d_core);cudaFree(d_gg);cudaFree(d_uu);cudaFree(d_hid);cudaFree(d_down);
+  cudaFree(d_h2b);cudaFree(d_gb);cudaFree(d_hidb);
+  return true;
+}
+
+static bool run_full_decode_layer(int li, float* d_x, DecodeState& ds, long pos, std::string& err){
+  char Pb[16]; snprintf(Pb,16,"blk.%d.",li); std::string P=Pb;
+  WEntry *wNorm=find_w(P+"attn_norm.weight"),
+         *wQ=find_w(P+"attn_q.weight"), *wK=find_w(P+"attn_k.weight"), *wV=find_w(P+"attn_v.weight"),
+         *wQn=find_w(P+"attn_q_norm.weight"), *wKn=find_w(P+"attn_k_norm.weight"),
+         *wO=find_w(P+"attn_output.weight"),
+         *wPost=find_w(P+"post_attention_norm.weight"),
+         *wFg=find_w(P+"ffn_gate.weight"), *wFu=find_w(P+"ffn_up.weight"), *wFd=find_w(P+"ffn_down.weight");
+  if(!wNorm||!wQ||!wK||!wV||!wQn||!wKn||!wO||!wPost||!wFg||!wFu||!wFd){ err="missing w full dec "+P; return false; }
+  if(!ds.Kc[li]||!ds.Vc[li]){ err="decode state null full "+P; return false; }
+  int L=ds.klen[li];
+  if(L<0||L>=DecodeState::MAXL){ err="klen OOB "+P; return false; }
+  if((long)L!=pos){ err="klen/pos mismatch "+P+" klen="+std::to_string(L)+" pos="+std::to_string(pos); return false; }
+  const int T=1; size_t nH=(size_t)T*HID;
+  const int NQQ=12288, NKK=1024, NQHD=6144;
+  float *d_h=nullptr,*d_qq=nullptr,*d_kk=nullptr,*d_vv=nullptr,*d_Q=nullptr,*d_K1=nullptr,*d_V1=nullptr,
+        *d_G=nullptr,*d_att=nullptr,*d_core=nullptr,*d_gg=nullptr,*d_uu=nullptr,*d_hid=nullptr,*d_down=nullptr;
+  uint16_t *d_hb=nullptr,*d_h2b=nullptr,*d_hidb=nullptr,*d_gb=nullptr;
+  cudaMalloc(&d_h,nH*4); cudaMalloc(&d_hb,nH*2);
+  cudaMalloc(&d_qq,(size_t)NQQ*4); cudaMalloc(&d_kk,(size_t)NKK*4); cudaMalloc(&d_vv,(size_t)NKK*4);
+  cudaMalloc(&d_Q,(size_t)NQHD*4); cudaMalloc(&d_K1,(size_t)NKK*4); cudaMalloc(&d_V1,(size_t)NKK*4);
+  cudaMalloc(&d_G,(size_t)NQHD*4); cudaMalloc(&d_att,(size_t)NQHD*4);
+  cudaMalloc(&d_core,nH*4);
+  cudaMalloc(&d_gg,(size_t)FFN*4); cudaMalloc(&d_uu,(size_t)FFN*4);
+  cudaMalloc(&d_hid,(size_t)FFN*4); cudaMalloc(&d_down,nH*4);
+  cudaMalloc(&d_h2b,nH*2); cudaMalloc(&d_hidb,(size_t)FFN*2); cudaMalloc(&d_gb,(size_t)NQHD*2);
+  rms_f32_k<<<T,512,(size_t)512*4>>>(d_h,d_x,(float*)wNorm->d,T,HID);
+  f32_to_bf16_k<<<(int)((nH+255)/256),256>>>(d_hb,d_h,(int)nH);
+  gemv_batch(d_hb,(uint8_t*)wQ->d,d_qq,HID,NQQ,T);
+  gemv_batch(d_hb,(uint8_t*)wK->d,d_kk,HID,NKK,T);
+  gemv_batch(d_hb,(uint8_t*)wV->d,d_vv,HID,NKK,T);
+  q_norm_rope_pos_k<<<NQ,256>>>(d_qq,(float*)wQn->d,d_Q,(int)pos);
+  k_norm_rope_pos_k<<<NKV,256>>>(d_kk,(float*)wKn->d,d_K1,(int)pos);
+  extract_G_k<<<(int)((NQHD+255)/256),256>>>(d_qq,d_G,NQHD);
+  cudaMemcpy(ds.Kc[li]+(size_t)L*1024,d_K1,(size_t)NKK*4,cudaMemcpyDeviceToDevice);
+  cudaMemcpy(ds.Vc[li]+(size_t)L*1024,d_vv,(size_t)NKK*4,cudaMemcpyDeviceToDevice);
+  sdpa_gqa_decode_k<<<(NQ),256>>>(d_Q,ds.Kc[li],ds.Vc[li],d_att,L);
+  gate_k<<<(int)(((size_t)NQHD+255)/256),256>>>(d_att,d_G,d_G,(int)((size_t)NQHD));
+  f32_to_bf16_k<<<(int)(((size_t)NQHD+255)/256),256>>>(d_gb,d_G,(int)((size_t)NQHD));
+  gemv_batch(d_gb,(uint8_t*)wO->d,d_core,NQHD,HID,T);
+  add_k<<<(int)((nH+255)/256),256>>>(d_x,d_core,(int)nH);
+  rms_f32_k<<<T,512,(size_t)512*4>>>(d_h,d_x,(float*)wPost->d,T,HID);
+  f32_to_bf16_k<<<(int)((nH+255)/256),256>>>(d_h2b,d_h,(int)nH);
+  gemv_batch(d_h2b,(uint8_t*)wFg->d,d_gg,HID,FFN,T);
+  gemv_batch(d_h2b,(uint8_t*)wFu->d,d_uu,HID,FFN,T);
+  silu_mul_k<<<(int)(((size_t)FFN+255)/256),256>>>(d_gg,d_uu,d_hid,(int)((size_t)FFN));
+  f32_to_bf16_k<<<(int)(((size_t)FFN+255)/256),256>>>(d_hidb,d_hid,(int)((size_t)FFN));
+  gemv_batch(d_hidb,(uint8_t*)wFd->d,d_down,FFN,HID,T);
+  add_k<<<(int)((nH+255)/256),256>>>(d_x,d_down,(int)nH);
+  cudaDeviceSynchronize();
+  ds.klen[li]=L+1;
+  cudaFree(d_h);cudaFree(d_hb);cudaFree(d_qq);cudaFree(d_kk);cudaFree(d_vv);
+  cudaFree(d_Q);cudaFree(d_K1);cudaFree(d_V1);cudaFree(d_G);cudaFree(d_att);cudaFree(d_core);
+  cudaFree(d_gg);cudaFree(d_uu);cudaFree(d_hid);cudaFree(d_down);cudaFree(d_h2b);cudaFree(d_hidb);cudaFree(d_gb);
+  return true;
+}
+
+bool decode_init(DecodeState& ds, std::string& err){
+  if(!g_up){ err="not uploaded"; return false; }
+  for(int i=0;i<64;++i){ ds.S[i]=nullptr; ds.CS[i]=nullptr; ds.Kc[i]=nullptr; ds.Vc[i]=nullptr; ds.klen[i]=0; }
+  for(int li=0;li<NL;++li){
+    int dev=(li<=SPLIT_LAST0)?0:1;
+    cudaSetDevice(dev);
+    bool is_full=(li%4==3);
+    if(is_full){
+      size_t bytes=(size_t)DecodeState::MAXL*1024*4;
+      float *k=nullptr,*v=nullptr;
+      if(cudaMalloc(&k,bytes)!=cudaSuccess){ err="OOM Kc li="+std::to_string(li); return false; }
+      if(cudaMalloc(&v,bytes)!=cudaSuccess){ err="OOM Vc li="+std::to_string(li); return false; }
+      cudaMemset(k,0,bytes); cudaMemset(v,0,bytes);
+      ds.Kc[li]=k; ds.Vc[li]=v; ds.klen[li]=0;
+    } else {
+      size_t sbytes=(size_t)HV*KHD*VHD*4;
+      size_t cbytes=(size_t)CC*3*4;
+      float *s=nullptr,*c=nullptr;
+      if(cudaMalloc(&s,sbytes)!=cudaSuccess){ err="OOM S li="+std::to_string(li); return false; }
+      if(cudaMalloc(&c,cbytes)!=cudaSuccess){ err="OOM CS li="+std::to_string(li); return false; }
+      cudaMemset(s,0,sbytes); cudaMemset(c,0,cbytes);
+      ds.S[li]=s; ds.CS[li]=c;
+    }
+  }
+  // VRAM hard abort 15GB
+  {
+    size_t f0=0,t0=0,f1=0,t1=0;
+    cudaSetDevice(0); cudaMemGetInfo(&f0,&t0);
+    cudaSetDevice(1); cudaMemGetInfo(&f1,&t1);
+    size_t u0=t0-f0, u1=t1-f1;
+    const size_t LIM=15ULL*1024*1024*1024;
+    if(u0>LIM||u1>LIM){ err="VRAM>15GB after decode_init used0="+std::to_string(u0)+" used1="+std::to_string(u1); return false; }
+    printf("pp2 decode_init used0=%zu MiB used1=%zu MiB (limit 15360 MiB)\n",u0/1048576,u1/1048576); fflush(stdout);
+  }
+  ds.inited=true;
+  return true;
+}
+
+void decode_free(DecodeState& ds){
+  if(!ds.inited) return;
+  for(int li=0;li<NL;++li){
+    int dev=(li<=SPLIT_LAST0)?0:1;
+    cudaSetDevice(dev);
+    if(ds.S[li]){ cudaFree(ds.S[li]); ds.S[li]=nullptr; }
+    if(ds.CS[li]){ cudaFree(ds.CS[li]); ds.CS[li]=nullptr; }
+    if(ds.Kc[li]){ cudaFree(ds.Kc[li]); ds.Kc[li]=nullptr; }
+    if(ds.Vc[li]){ cudaFree(ds.Vc[li]); ds.Vc[li]=nullptr; }
+    ds.klen[li]=0;
+  }
+  ds.inited=false;
+}
+
+std::vector<float> decode_step(int tok, DecodeState& ds, long pos, std::string& err){
+  if(!g_up){ err="not uploaded"; return {}; }
+  if(!ds.inited){ err="decode not inited"; return {}; }
+  if(pos<0||pos>=DecodeState::MAXL){ err="pos OOB"; return {}; }
+  const int T=1; size_t nH=(size_t)T*HID;
+  cudaSetDevice(0);
+  int* d_ids=nullptr; float* d_x0=nullptr;
+  if(cudaMalloc(&d_ids,4)!=cudaSuccess){ err="OOM d_ids"; return {}; }
+  if(cudaMalloc(&d_x0,nH*4)!=cudaSuccess){ err="OOM d_x0"; return {}; }
+  cudaMemcpy(d_ids,&tok,4,cudaMemcpyHostToDevice);
+  {
+    auto it=g_w0.find("token_embd.weight");
+    if(it==g_w0.end()){ err="no emb"; return {}; }
+    embed_gather_k<<<(int)((nH+255)/256),256>>>(d_x0,(uint16_t*)it->second.d,d_ids,T);
+    cudaDeviceSynchronize();
+  }
+  cudaFree(d_ids);
+  for(int li=0;li<=SPLIT_LAST0;++li){
+    bool is_full=(li%4==3);
+    bool ok=is_full? run_full_decode_layer(li,d_x0,ds,pos,err) : run_gdn_decode_layer(li,d_x0,ds,err);
+    if(!ok){ cudaFree(d_x0); return {}; }
+  }
+  cudaMemcpy(g_pinned,d_x0,nH*4,cudaMemcpyDeviceToHost);
+  cudaFree(d_x0);
+  cudaSetDevice(1);
+  float* d_x1=nullptr; cudaMalloc(&d_x1,nH*4);
+  cudaMemcpy(d_x1,g_pinned,nH*4,cudaMemcpyHostToDevice);
+  for(int li=SPLIT_LAST0+1;li<NL;++li){
+    bool is_full=(li%4==3);
+    bool ok=is_full? run_full_decode_layer(li,d_x1,ds,pos,err) : run_gdn_decode_layer(li,d_x1,ds,err);
+    if(!ok){ cudaFree(d_x1); return {}; }
+  }
+  {
+    auto itn=g_w1.find("output_norm.weight");
+    auto itw=g_w1.find("output.weight");
+    if(itn==g_w1.end()||itw==g_w1.end()){ err="no head"; cudaFree(d_x1); return {}; }
+    float* d_xn=nullptr; cudaMalloc(&d_xn,nH*4);
+    rms_f32_k<<<T,512,(size_t)512*4>>>(d_xn,d_x1,(float*)itn->second.d,T,HID);
+    float* d_log=nullptr; cudaMalloc(&d_log,(size_t)VOC*4);
+    head_bf16_k<<<(int)(((size_t)VOC+255)/256),256>>>(d_log,d_xn,(uint16_t*)itw->second.d,T);
+    cudaDeviceSynchronize();
+    std::vector<float> logits((size_t)VOC);
+    cudaMemcpy(logits.data(),d_log,(size_t)VOC*4,cudaMemcpyDeviceToHost);
+    cudaFree(d_xn); cudaFree(d_log); cudaFree(d_x1);
+    return logits;
+  }
+}
+
+int debug_bisect_layer(const std::vector<int>& ids){
+  int T=(int)ids.size();
+  if(T<=0||T>DecodeState::MAXL){ printf("debug_bisect bad T=%d\n",T); return -2; }
+  if(!g_up){ printf("debug_bisect not uploaded\n"); return -2; }
+  std::string err;
+  size_t nH=(size_t)T*HID;
+  // ---- prefill path con salvataggio ultimo token per layer ----
+  std::vector<std::vector<float>> pre_hid(NL);
+  {
+    cudaSetDevice(0);
+    int* d_ids=nullptr; float* d_x0=nullptr;
+    cudaMalloc(&d_ids,T*4); cudaMemcpy(d_ids,ids.data(),T*4,cudaMemcpyHostToDevice);
+    cudaMalloc(&d_x0,nH*4);
+    {
+      auto it=g_w0.find("token_embd.weight");
+      embed_gather_k<<<(int)((nH+255)/256),256>>>(d_x0,(uint16_t*)it->second.d,d_ids,T);
+      cudaDeviceSynchronize();
+    }
+    cudaFree(d_ids);
+    for(int li=0;li<=SPLIT_LAST0;++li){
+      bool is_full=(li%4==3);
+      bool ok=is_full? run_full_layer(li,d_x0,T,err) : run_gdn_layer(li,d_x0,T,err);
+      if(!ok){ printf("debug pre gpu0 li=%d FAIL %s\n",li,err.c_str()); cudaFree(d_x0); return -2; }
+      std::vector<float> hx(nH); cudaMemcpy(hx.data(),d_x0,nH*4,cudaMemcpyDeviceToHost);
+      pre_hid[li].assign(HID,0.f);
+      for(int i=0;i<HID;++i) pre_hid[li][i]=hx[(size_t)(T-1)*HID+i];
+    }
+    cudaMemcpy(g_pinned,d_x0,nH*4,cudaMemcpyDeviceToHost);
+    cudaFree(d_x0);
+    cudaSetDevice(1);
+    float* d_x1=nullptr; cudaMalloc(&d_x1,nH*4);
+    cudaMemcpy(d_x1,g_pinned,nH*4,cudaMemcpyHostToDevice);
+    for(int li=SPLIT_LAST0+1;li<NL;++li){
+      bool is_full=(li%4==3);
+      bool ok=is_full? run_full_layer(li,d_x1,T,err) : run_gdn_layer(li,d_x1,T,err);
+      if(!ok){ printf("debug pre gpu1 li=%d FAIL %s\n",li,err.c_str()); cudaFree(d_x1); return -2; }
+      std::vector<float> hx(nH); cudaMemcpy(hx.data(),d_x1,nH*4,cudaMemcpyDeviceToHost);
+      pre_hid[li].assign(HID,0.f);
+      for(int i=0;i<HID;++i) pre_hid[li][i]=hx[(size_t)(T-1)*HID+i];
+    }
+    cudaFree(d_x1);
+  }
+  // ---- decode path incrementale con salvataggio ultimo step per layer ----
+  std::vector<std::vector<float>> dec_hid(NL);
+  {
+    DecodeState ds;
+    if(!decode_init(ds,err)){ printf("debug dec init FAIL %s\n",err.c_str()); return -2; }
+    // warmup 0..T-2
+    for(int t=0;t<T-1;++t){
+      auto lg=decode_step(ids[t],ds,(long)t,err);
+      if(lg.empty()){ printf("debug dec warmup t=%d FAIL %s\n",t,err.c_str()); decode_free(ds); return -2; }
+    }
+    // ultimo step con trace per layer (replica decode_step con save)
+    int tok=ids[T-1]; long pos=T-1;
+    cudaSetDevice(0);
+    float* d_x0=nullptr; cudaMalloc(&d_x0,(size_t)HID*4);
+    {
+      int* d_ids=nullptr; cudaMalloc(&d_ids,4); cudaMemcpy(d_ids,&tok,4,cudaMemcpyHostToDevice);
+      auto it=g_w0.find("token_embd.weight");
+      embed_gather_k<<<(int)((HID+255)/256),256>>>(d_x0,(uint16_t*)it->second.d,d_ids,1);
+      cudaDeviceSynchronize(); cudaFree(d_ids);
+    }
+    for(int li=0;li<=SPLIT_LAST0;++li){
+      bool is_full=(li%4==3);
+      bool ok=is_full? run_full_decode_layer(li,d_x0,ds,pos,err) : run_gdn_decode_layer(li,d_x0,ds,err);
+      if(!ok){ printf("debug dec gpu0 li=%d FAIL %s\n",li,err.c_str()); cudaFree(d_x0); decode_free(ds); return -2; }
+      std::vector<float> hx(HID); cudaMemcpy(hx.data(),d_x0,(size_t)HID*4,cudaMemcpyDeviceToHost);
+      dec_hid[li]=hx;
+    }
+    cudaMemcpy(g_pinned,d_x0,(size_t)HID*4,cudaMemcpyDeviceToHost);
+    cudaFree(d_x0);
+    cudaSetDevice(1);
+    float* d_x1=nullptr; cudaMalloc(&d_x1,(size_t)HID*4);
+    cudaMemcpy(d_x1,g_pinned,(size_t)HID*4,cudaMemcpyHostToDevice);
+    for(int li=SPLIT_LAST0+1;li<NL;++li){
+      bool is_full=(li%4==3);
+      bool ok=is_full? run_full_decode_layer(li,d_x1,ds,pos,err) : run_gdn_decode_layer(li,d_x1,ds,err);
+      if(!ok){ printf("debug dec gpu1 li=%d FAIL %s\n",li,err.c_str()); cudaFree(d_x1); decode_free(ds); return -2; }
+      std::vector<float> hx(HID); cudaMemcpy(hx.data(),d_x1,(size_t)HID*4,cudaMemcpyDeviceToHost);
+      dec_hid[li]=hx;
+    }
+    cudaFree(d_x1);
+    decode_free(ds);
+  }
+  int first=-1;
+  for(int li=0;li<NL;++li){
+    double mx=0,me=0; size_t im=0;
+    for(int i=0;i<HID;++i){ double e=fabs((double)dec_hid[li][i]-pre_hid[li][i]); if(e>mx){mx=e;im=i;} me+=e; }
+    me/=HID;
+    bool is_full=(li%4==3);
+    printf("debug layer %2d (%s): maxerr=%.6f at %zu meanerr=%.7f %s\n",li,is_full?"full":"gdn ",mx,im,me,mx<1e-4?"OK":"DIVERGE");
+    fflush(stdout);
+    if(mx>=1e-4 && first<0) first=li;
+  }
+  // Secondo passaggio: confronta tutti i token per i primi layer divergenti (26..27) per capire se carry da token precedenti
+  if(first>=0){
+    printf("debug full-token check for layers %d..%d (T=%d)\n",first,first+1,T); fflush(stdout);
+    // prefill all-token hidden gia disponibile? ricostruisci da pre_hid? No, serve full. Rifai prefill salvando tutto.
+    std::vector<std::vector<float>> pre_all(NL), dec_all(NL);
+    // prefill all
+    {
+      cudaSetDevice(0);
+      int* d_ids=nullptr; float* d_x0=nullptr;
+      cudaMalloc(&d_ids,T*4); cudaMemcpy(d_ids,ids.data(),T*4,cudaMemcpyHostToDevice);
+      cudaMalloc(&d_x0,nH*4);
+      {
+        auto it=g_w0.find("token_embd.weight");
+        embed_gather_k<<<(int)((nH+255)/256),256>>>(d_x0,(uint16_t*)it->second.d,d_ids,T);
+        cudaDeviceSynchronize();
+      }
+      cudaFree(d_ids);
+      for(int li=0;li<=SPLIT_LAST0;++li){
+        bool is_full=(li%4==3);
+        bool ok=is_full? run_full_layer(li,d_x0,T,err) : run_gdn_layer(li,d_x0,T,err);
+        if(!ok){ cudaFree(d_x0); return -2; }
+        std::vector<float> hx(nH); cudaMemcpy(hx.data(),d_x0,nH*4,cudaMemcpyDeviceToHost);
+        pre_all[li]=hx;
+      }
+      cudaMemcpy(g_pinned,d_x0,nH*4,cudaMemcpyDeviceToHost);
+      cudaFree(d_x0);
+      cudaSetDevice(1);
+      float* d_x1=nullptr; cudaMalloc(&d_x1,nH*4);
+      cudaMemcpy(d_x1,g_pinned,nH*4,cudaMemcpyHostToDevice);
+      for(int li=SPLIT_LAST0+1;li<NL;++li){
+        bool is_full=(li%4==3);
+        bool ok=is_full? run_full_layer(li,d_x1,T,err) : run_gdn_layer(li,d_x1,T,err);
+        if(!ok){ cudaFree(d_x1); return -2; }
+        std::vector<float> hx(nH); cudaMemcpy(hx.data(),d_x1,nH*4,cudaMemcpyDeviceToHost);
+        pre_all[li]=hx;
+      }
+      cudaFree(d_x1);
+    }
+    // decode all (trace ogni step)
+    {
+      DecodeState ds2;
+      decode_init(ds2,err);
+      for(int li=0;li<NL;++li) dec_all[li].assign(nH,0.f);
+      for(int t=0;t<T;++t){
+        int tok=ids[t]; long pos=t;
+        cudaSetDevice(0);
+        float* d_x0=nullptr; cudaMalloc(&d_x0,(size_t)HID*4);
+        {
+          int* d_ids=nullptr; cudaMalloc(&d_ids,4); cudaMemcpy(d_ids,&tok,4,cudaMemcpyHostToDevice);
+          auto it=g_w0.find("token_embd.weight");
+          embed_gather_k<<<(int)((HID+255)/256),256>>>(d_x0,(uint16_t*)it->second.d,d_ids,1);
+          cudaDeviceSynchronize(); cudaFree(d_ids);
+        }
+        for(int li=0;li<=SPLIT_LAST0;++li){
+          bool is_full=(li%4==3);
+          bool ok=is_full? run_full_decode_layer(li,d_x0,ds2,pos,err) : run_gdn_decode_layer(li,d_x0,ds2,err);
+          if(!ok){ cudaFree(d_x0); decode_free(ds2); return -2; }
+          std::vector<float> hx(HID); cudaMemcpy(hx.data(),d_x0,(size_t)HID*4,cudaMemcpyDeviceToHost);
+          for(int i=0;i<HID;++i) dec_all[li][(size_t)t*HID+i]=hx[i];
+        }
+        cudaMemcpy(g_pinned,d_x0,(size_t)HID*4,cudaMemcpyDeviceToHost);
+        cudaFree(d_x0);
+        cudaSetDevice(1);
+        float* d_x1=nullptr; cudaMalloc(&d_x1,(size_t)HID*4);
+        cudaMemcpy(d_x1,g_pinned,(size_t)HID*4,cudaMemcpyHostToDevice);
+        for(int li=SPLIT_LAST0+1;li<NL;++li){
+          bool is_full=(li%4==3);
+          bool ok=is_full? run_full_decode_layer(li,d_x1,ds2,pos,err) : run_gdn_decode_layer(li,d_x1,ds2,err);
+          if(!ok){ cudaFree(d_x1); decode_free(ds2); return -2; }
+          std::vector<float> hx(HID); cudaMemcpy(hx.data(),d_x1,(size_t)HID*4,cudaMemcpyDeviceToHost);
+          for(int i=0;i<HID;++i) dec_all[li][(size_t)t*HID+i]=hx[i];
+        }
+        cudaFree(d_x1);
+      }
+      decode_free(ds2);
+    }
+    for(int li=first;li<=first+1 && li<NL;++li){
+      for(int t=0;t<T;++t){
+        double mx=0,me=0; size_t im=0;
+        for(int i=0;i<HID;++i){
+          double e=fabs((double)dec_all[li][(size_t)t*HID+i]-pre_all[li][(size_t)t*HID+i]);
+          if(e>mx){mx=e;im=i;} me+=e;
+        }
+        me/=HID;
+        printf("debug layer %d tok %d: maxerr=%.6f at %zu mean=%.7f %s\n",li,t,mx,im,me,mx<1e-4?"OK":"DIVERGE");
+        fflush(stdout);
+      }
+    }
+  }
+  return first;
+}
+
+int debug_layer26_detail(){
+  if(!g_up){ printf("debug26 not uploaded\n"); return -2; }
+  const int T=4; const int ids[4]={6205,161421,303,220};
+  const int li=26;
+  std::string err;
+  size_t nH=(size_t)T*HID;
+  // ---- ottieni h_in (input a layer26 per tutti i token) via prefill 0..25 ----
+  std::vector<float> h_in((size_t)T*HID);
+  {
+    cudaSetDevice(0);
+    int* d_ids=nullptr; float* d_x0=nullptr;
+    cudaMalloc(&d_ids,T*4); cudaMemcpy(d_ids,ids,T*4,cudaMemcpyHostToDevice);
+    cudaMalloc(&d_x0,nH*4);
+    {
+      auto it=g_w0.find("token_embd.weight");
+      embed_gather_k<<<(int)((nH+255)/256),256>>>(d_x0,(uint16_t*)it->second.d,d_ids,T);
+      cudaDeviceSynchronize();
+    }
+    cudaFree(d_ids);
+    for(int l=0;l<26;++l){
+      bool is_full=(l%4==3);
+      bool ok=is_full? run_full_layer(l,d_x0,T,err) : run_gdn_layer(l,d_x0,T,err);
+      if(!ok){ printf("debug26 pre-up-to-25 l=%d FAIL %s\n",l,err.c_str()); cudaFree(d_x0); return -2; }
+    }
+    cudaMemcpy(h_in.data(),d_x0,nH*4,cudaMemcpyDeviceToHost);
+    cudaFree(d_x0);
+  }
+  // ---- q1 pre (batched) vs q1 dec (single) ----
+  char Pb[16]; snprintf(Pb,16,"blk.%d.",li);
+  std::string P=Pb;
+  WEntry *wNorm=find_w(P+"attn_norm.weight"), *wQkv=find_w(P+"attn_qkv.weight"), *wC=find_w(P+"ssm_conv1d.weight");
+  WEntry *wBeta=find_w(P+"ssm_beta.weight"), *wAlpha=find_w(P+"ssm_alpha.weight");
+  WEntry *wA=find_w(P+"ssm_a"), *wDT=find_w(P+"ssm_dt.bias");
+  if(!wNorm||!wQkv||!wC||!wBeta||!wAlpha||!wA||!wDT){ printf("debug26 missing w\n"); return -2; }
+  cudaSetDevice(0);
+  // rms batched -> h1_pre
+  std::vector<float> h1_pre(nH), q1_pre((size_t)T*CC), cv_pre((size_t)T*CC);
+  std::vector<float> q1_dec_all((size_t)T*CC), cv_dec_all((size_t)T*CC), h1_dec_all(nH);
+  {
+    float *d_x=nullptr,*d_h=nullptr,*d_q1=nullptr,*d_cv=nullptr;
+    uint16_t *d_hb=nullptr;
+    cudaMalloc(&d_x,nH*4); cudaMalloc(&d_h,nH*4); cudaMalloc(&d_hb,nH*2);
+    cudaMalloc(&d_q1,(size_t)T*CC*4); cudaMalloc(&d_cv,(size_t)T*CC*4);
+    cudaMemcpy(d_x,h_in.data(),nH*4,cudaMemcpyHostToDevice);
+    rms_f32_k<<<T,512,(size_t)512*4>>>(d_h,d_x,(float*)wNorm->d,T,HID);
+    cudaDeviceSynchronize();
+    cudaMemcpy(h1_pre.data(),d_h,nH*4,cudaMemcpyDeviceToHost);
+    f32_to_bf16_k<<<(int)((nH+255)/256),256>>>(d_hb,d_h,(int)nH);
+    gemv_batch(d_hb,(uint8_t*)wQkv->d,d_q1,HID,CC,T);
+    cudaDeviceSynchronize();
+    cudaMemcpy(q1_pre.data(),d_q1,(size_t)T*CC*4,cudaMemcpyDeviceToHost);
+    conv_silu_k<<<(int)(((size_t)T*CC+255)/256),256>>>((const float*)d_q1,(const float*)wC->d,d_cv,T,CC);
+    cudaDeviceSynchronize();
+    cudaMemcpy(cv_pre.data(),d_cv,(size_t)T*CC*4,cudaMemcpyDeviceToHost);
+    cudaFree(d_x); cudaFree(d_h); cudaFree(d_hb); cudaFree(d_q1); cudaFree(d_cv);
+  }
+  // decode incr q1/cv
+  {
+    float *d_CS=nullptr; cudaMalloc(&d_CS,(size_t)CC*3*4); cudaMemset(d_CS,0,(size_t)CC*3*4);
+    for(int t=0;t<T;++t){
+      float *d_h1=nullptr,*d_q1=nullptr,*d_cv=nullptr;
+      uint16_t *d_h1b=nullptr;
+      cudaMalloc(&d_h1,(size_t)HID*4); cudaMalloc(&d_h1b,(size_t)HID*2);
+      cudaMalloc(&d_q1,(size_t)CC*4); cudaMalloc(&d_cv,(size_t)CC*4);
+      // h per singolo token
+      cudaMemcpy(d_h1,&h_in[(size_t)t*HID],(size_t)HID*4,cudaMemcpyHostToDevice);
+      // rms T=1: serve d_x e d_h separati; riusa d_h1 come input? rms legge x, scrive h. Facciamo x=h_in[t], h=out
+      float *d_x1=nullptr; cudaMalloc(&d_x1,(size_t)HID*4);
+      cudaMemcpy(d_x1,&h_in[(size_t)t*HID],(size_t)HID*4,cudaMemcpyHostToDevice);
+      rms_f32_k<<<1,512,(size_t)512*4>>>(d_h1,d_x1,(float*)wNorm->d,1,HID);
+      cudaDeviceSynchronize();
+      cudaMemcpy(&h1_dec_all[(size_t)t*HID],d_h1,(size_t)HID*4,cudaMemcpyDeviceToHost);
+      f32_to_bf16_k<<<(int)((HID+255)/256),256>>>(d_h1b,d_h1,(int)HID);
+      gemv_batch(d_h1b,(uint8_t*)wQkv->d,d_q1,HID,CC,1);
+      cudaDeviceSynchronize();
+      cudaMemcpy(&q1_dec_all[(size_t)t*CC],d_q1,(size_t)CC*4,cudaMemcpyDeviceToHost);
+      conv_decode_k<<<(int)((CC+255)/256),256>>>(d_q1,(const float*)wC->d,d_CS,d_cv,CC);
+      cudaDeviceSynchronize();
+      cudaMemcpy(&cv_dec_all[(size_t)t*CC],d_cv,(size_t)CC*4,cudaMemcpyDeviceToHost);
+      cudaFree(d_h1); cudaFree(d_h1b); cudaFree(d_q1); cudaFree(d_cv); cudaFree(d_x1);
+    }
+    cudaFree(d_CS);
+  }
+  for(int t=0;t<T;++t){
+    double mx=0,me=0; size_t im=0;
+    for(int i=0;i<HID;++i){ double e=fabs((double)h1_dec_all[(size_t)t*HID+i]-h1_pre[(size_t)t*HID+i]); if(e>mx){mx=e;im=i;} me+=e; }
+    me/=HID;
+    printf("debug26 li26 tok%d h1: maxerr=%.3e at %zu mean=%.2e %s\n",t,mx,im,me,mx==0.0?"BITEXACT":"DIVERGE");
+    double mx1=0,me1=0; size_t im1=0;
+    for(int i=0;i<CC;++i){ double e=fabs((double)q1_dec_all[(size_t)t*CC+i]-q1_pre[(size_t)t*CC+i]); if(e>mx1){mx1=e;im1=i;} me1+=e; }
+    me1/=CC;
+    printf("debug26 li26 tok%d q1: maxerr=%.3e at %zu mean=%.2e %s\n",t,mx1,im1,me1,mx1==0.0?"BITEXACT":"DIVERGE");
+    double mx2=0,me2=0; size_t im2=0;
+    for(int i=0;i<CC;++i){ double e=fabs((double)cv_dec_all[(size_t)t*CC+i]-cv_pre[(size_t)t*CC+i]); if(e>mx2){mx2=e;im2=i;} me2+=e; }
+    me2/=CC;
+    printf("debug26 li26 tok%d cv: maxerr=%.3e at %zu mean=%.2e %s\n",t,mx2,im2,me2,mx2==0.0?"BITEXACT":"DIVERGE");
+    fflush(stdout);
+  }
+  // beta/ar/gl confronto tok3
+  {
+    std::vector<float> b_pre((size_t)T*HV), ar_pre((size_t)T*HV), beta_pre((size_t)T*HV), gl_pre((size_t)T*HV);
+    std::vector<float> b_dec((size_t)T*HV), ar_dec((size_t)T*HV), beta_dec((size_t)T*HV), gl_dec((size_t)T*HV);
+    float *d_h=nullptr,*d_hb=nullptr,*d_b=nullptr,*d_ar=nullptr,*d_be=nullptr,*d_gl=nullptr;
+    uint16_t *d_hbu=nullptr;
+    cudaMalloc(&d_h,nH*4); cudaMalloc(&d_hbu,nH*2);
+    cudaMalloc(&d_b,(size_t)T*HV*4); cudaMalloc(&d_ar,(size_t)T*HV*4);
+    cudaMalloc(&d_be,(size_t)T*HV*4); cudaMalloc(&d_gl,(size_t)T*HV*4);
+    cudaMemcpy(d_h,h1_pre.data(),nH*4,cudaMemcpyHostToDevice);
+    f32_to_bf16_k<<<(int)((nH+255)/256),256>>>(d_hbu,d_h,(int)nH);
+    gemv_batch(d_hbu,(uint8_t*)wBeta->d,d_b,HID,HV,T);
+    cudaDeviceSynchronize();
+    cudaMemcpy(b_pre.data(),d_b,(size_t)T*HV*4,cudaMemcpyDeviceToHost);
+    // ar pre via wa_gemm
+    {
+      float *d_hf=nullptr; cudaMalloc(&d_hf,nH*4); cudaMemcpy(d_hf,h1_pre.data(),nH*4,cudaMemcpyHostToDevice);
+      wa_gemm_k<<<(int)(((size_t)T*HV+255)/256),256>>>(d_hf,(float*)wAlpha->d,d_ar,T,HV,HID);
+      cudaDeviceSynchronize();
+      cudaMemcpy(ar_pre.data(),d_ar,(size_t)T*HV*4,cudaMemcpyDeviceToHost);
+      cudaFree(d_hf);
+    }
+    beta_gl_k<<<(int)(((size_t)T*HV+255)/256),256>>>(d_b,d_ar,(float*)wA->d,(float*)wDT->d,d_be,d_gl,(int)((size_t)T*HV));
+    cudaDeviceSynchronize();
+    cudaMemcpy(beta_pre.data(),d_be,(size_t)T*HV*4,cudaMemcpyDeviceToHost);
+    cudaMemcpy(gl_pre.data(),d_gl,(size_t)T*HV*4,cudaMemcpyDeviceToHost);
+    cudaFree(d_h); cudaFree(d_hbu); cudaFree(d_b); cudaFree(d_ar); cudaFree(d_be); cudaFree(d_gl);
+    // dec beta/ar/gl per tok (single)
+    for(int t=0;t<T;++t){
+      float *d_h1=nullptr; uint16_t *d_h1b=nullptr;
+      float *d_b1=nullptr,*d_ar1=nullptr,*d_be1=nullptr,*d_gl1=nullptr;
+      cudaMalloc(&d_h1,(size_t)HID*4); cudaMalloc(&d_h1b,(size_t)HID*2);
+      cudaMalloc(&d_b1,(size_t)HV*4); cudaMalloc(&d_ar1,(size_t)HV*4);
+      cudaMalloc(&d_be1,(size_t)HV*4); cudaMalloc(&d_gl1,(size_t)HV*4);
+      cudaMemcpy(d_h1,&h1_dec_all[(size_t)t*HID],(size_t)HID*4,cudaMemcpyHostToDevice);
+      f32_to_bf16_k<<<(int)((HID+255)/256),256>>>(d_h1b,d_h1,(int)HID);
+      gemv_batch(d_h1b,(uint8_t*)wBeta->d,d_b1,HID,HV,1);
+      cudaDeviceSynchronize();
+      cudaMemcpy(&b_dec[(size_t)t*HV],d_b1,(size_t)HV*4,cudaMemcpyDeviceToHost);
+      wa_gemm_k<<<1,256>>>(d_h1,(float*)wAlpha->d,d_ar1,1,HV,HID);
+      cudaDeviceSynchronize();
+      cudaMemcpy(&ar_dec[(size_t)t*HV],d_ar1,(size_t)HV*4,cudaMemcpyDeviceToHost);
+      beta_gl_k<<<1,256>>>(d_b1,d_ar1,(float*)wA->d,(float*)wDT->d,d_be1,d_gl1,HV);
+      cudaDeviceSynchronize();
+      cudaMemcpy(&beta_dec[(size_t)t*HV],d_be1,(size_t)HV*4,cudaMemcpyDeviceToHost);
+      cudaMemcpy(&gl_dec[(size_t)t*HV],d_gl1,(size_t)HV*4,cudaMemcpyDeviceToHost);
+      cudaFree(d_h1); cudaFree(d_h1b); cudaFree(d_b1); cudaFree(d_ar1); cudaFree(d_be1); cudaFree(d_gl1);
+    }
+    for(int t=0;t<T;++t){
+      double mx=0,me=0; size_t im=0;
+      for(int i=0;i<HV;++i){ double e=fabs((double)b_dec[(size_t)t*HV+i]-b_pre[(size_t)t*HV+i]); if(e>mx){mx=e;im=i;} me+=e; }
+      me/=HV;
+      printf("debug26 tok%d b: maxerr=%.3e at %zu mean=%.2e %s\n",t,mx,im,me,mx==0.0?"BITEXACT":"DIVERGE");
+      double mxa=0,mea=0; size_t ima=0;
+      for(int i=0;i<HV;++i){ double e=fabs((double)ar_dec[(size_t)t*HV+i]-ar_pre[(size_t)t*HV+i]); if(e>mxa){mxa=e;ima=i;} mea+=e; }
+      mea/=HV;
+      printf("debug26 tok%d ar: maxerr=%.3e at %zu mean=%.2e %s\n",t,mxa,ima,mea,mxa==0.0?"BITEXACT":"DIVERGE");
+      double mxb=0,meb=0; size_t imb=0;
+      for(int i=0;i<HV;++i){ double e=fabs((double)beta_dec[(size_t)t*HV+i]-beta_pre[(size_t)t*HV+i]); if(e>mxb){mxb=e;imb=i;} meb+=e; }
+      meb/=HV;
+      printf("debug26 tok%d beta: maxerr=%.3e at %zu mean=%.2e %s\n",t,mxb,imb,meb,mxb==0.0?"BITEXACT":"DIVERGE");
+      double mxg=0,meg=0; size_t img=0;
+      for(int i=0;i<HV;++i){ double e=fabs((double)gl_dec[(size_t)t*HV+i]-gl_pre[(size_t)t*HV+i]); if(e>mxg){mxg=e;img=i;} meg+=e; }
+      meg/=HV;
+      printf("debug26 tok%d gl: maxerr=%.3e at %zu mean=%.2e %s\n",t,mxg,img,meg,mxg==0.0?"BITEXACT":"DIVERGE");
+      fflush(stdout);
+    }
+  }
+  // S-step bisect (chiude il buco qn/kn/v/S/o): stessi h_in, prefill-batched vs decode-carry
+  {
+    const size_t nq = (size_t)T*HV*KHD, nv = (size_t)T*HV*VHD;
+    const size_t nS = (size_t)HV*KHD*VHD, no = (size_t)T*HV*VHD;
+    std::vector<float> qn_pre(nq), kn_pre(nq), v_pre(nv), o_pre(no);
+    std::vector<float> qn_dec(nq), kn_dec(nq), v_dec(nv), o_dec(no);
+    std::vector<std::vector<float>> Sp(T, std::vector<float>(nS, 0.f)), Sd(T, std::vector<float>(nS, 0.f));
+    float *d_x=nullptr,*d_h=nullptr,*d_q1=nullptr,*d_cv=nullptr;
+    uint16_t *d_hb=nullptr;
+    float *d_q=nullptr,*d_k=nullptr,*d_v=nullptr,*d_b=nullptr,*d_ar=nullptr,*d_be=nullptr,*d_gl=nullptr;
+    float *d_S=nullptr,*d_o=nullptr;
+    cudaMalloc(&d_x,nH*4); cudaMalloc(&d_h,nH*4); cudaMalloc(&d_hb,nH*2);
+    cudaMalloc(&d_q1,(size_t)T*CC*4); cudaMalloc(&d_cv,(size_t)T*CC*4);
+    cudaMalloc(&d_q,nq*4); cudaMalloc(&d_k,nq*4); cudaMalloc(&d_v,nv*4);
+    cudaMalloc(&d_b,(size_t)T*HV*4); cudaMalloc(&d_ar,(size_t)T*HV*4);
+    cudaMalloc(&d_be,(size_t)T*HV*4); cudaMalloc(&d_gl,(size_t)T*HV*4);
+    cudaMalloc(&d_S,nS*4); cudaMalloc(&d_o,no*4);
+    cudaMemcpy(d_x,h_in.data(),nH*4,cudaMemcpyHostToDevice);
+    rms_f32_k<<<T,512,(size_t)512*4>>>(d_h,d_x,(float*)wNorm->d,T,HID);
+    cudaDeviceSynchronize();
+    f32_to_bf16_k<<<(int)((nH+255)/256),256>>>(d_hb,d_h,(int)nH);
+    gemv_batch(d_hb,(uint8_t*)wQkv->d,d_q1,HID,CC,T);
+    cudaDeviceSynchronize();
+    conv_silu_k<<<(int)(((size_t)T*CC+255)/256),256>>>((const float*)d_q1,(const float*)wC->d,d_cv,T,CC);
+    cudaDeviceSynchronize();
+    { size_t mx=nq>nv?nq:nv; split_qkv_k<<<(int)((mx+255)/256),256>>>(d_cv,d_q,d_k,d_v,T); }
+    cudaDeviceSynchronize();
+    gemv_batch(d_hb,(uint8_t*)wBeta->d,d_b,HID,HV,T);
+    cudaDeviceSynchronize();
+    wa_gemm_k<<<(int)(((size_t)T*HV+255)/256),256>>>(d_h,(float*)wAlpha->d,d_ar,T,HV,HID);
+    cudaDeviceSynchronize();
+    beta_gl_k<<<(int)(((size_t)T*HV+255)/256),256>>>(d_b,d_ar,(float*)wA->d,(float*)wDT->d,d_be,d_gl,(int)((size_t)T*HV));
+    cudaDeviceSynchronize();
+    qk_norm_scale_k<<<(T*HV),128>>>(d_q,d_k,T);
+    cudaDeviceSynchronize();
+    cudaMemcpy(qn_pre.data(),d_q,nq*4,cudaMemcpyDeviceToHost);
+    cudaMemcpy(kn_pre.data(),d_k,nq*4,cudaMemcpyDeviceToHost);
+    cudaMemcpy(v_pre.data(),d_v,nv*4,cudaMemcpyDeviceToHost);
+    cudaMemset(d_S,0,nS*4);
+    for(int t=0;t<T;++t){
+      gdn_step_cuda(d_q+(size_t)t*HV*KHD,d_k+(size_t)t*HV*KHD,d_v+(size_t)t*HV*VHD,
+        d_be+(size_t)t*HV,d_gl+(size_t)t*HV,d_S,d_o+(size_t)t*HV*VHD,HV,KHD,VHD);
+      cudaDeviceSynchronize();
+      cudaMemcpy(Sp[t].data(),d_S,nS*4,cudaMemcpyDeviceToHost);
+      cudaMemcpy(&o_pre[(size_t)t*HV*VHD],d_o+(size_t)t*HV*VHD,(size_t)HV*VHD*4,cudaMemcpyDeviceToHost);
+    }
+    cudaFree(d_x); cudaFree(d_h); cudaFree(d_hb); cudaFree(d_q1); cudaFree(d_cv);
+    cudaFree(d_q); cudaFree(d_k); cudaFree(d_v); cudaFree(d_b); cudaFree(d_ar);
+    cudaFree(d_be); cudaFree(d_gl); cudaFree(d_S); cudaFree(d_o);
+    // decode-style per tok con carry
+    float *d_CS=nullptr;
+    cudaMalloc(&d_CS,(size_t)CC*3*4); cudaMemset(d_CS,0,(size_t)CC*3*4);
+    float *d_S2=nullptr; cudaMalloc(&d_S2,nS*4); cudaMemset(d_S2,0,nS*4);
+    for(int t=0;t<T;++t){
+      float *d_h1=nullptr,*d_x1=nullptr; uint16_t *d_h1b=nullptr;
+      float *d_q1b=nullptr,*d_cvb=nullptr,*d_qb=nullptr,*d_kb=nullptr,*d_vb=nullptr;
+      float *d_bb=nullptr,*d_arb=nullptr,*d_beb=nullptr,*d_glb=nullptr,*d_ob=nullptr;
+      const size_t nq1=(size_t)HV*KHD, nv1=(size_t)HV*VHD, no1=(size_t)HV*VHD;
+      cudaMalloc(&d_h1,(size_t)HID*4); cudaMalloc(&d_x1,(size_t)HID*4); cudaMalloc(&d_h1b,(size_t)HID*2);
+      cudaMalloc(&d_q1b,(size_t)CC*4); cudaMalloc(&d_cvb,(size_t)CC*4);
+      cudaMalloc(&d_qb,nq1*4); cudaMalloc(&d_kb,nq1*4); cudaMalloc(&d_vb,nv1*4);
+      cudaMalloc(&d_bb,(size_t)HV*4); cudaMalloc(&d_arb,(size_t)HV*4);
+      cudaMalloc(&d_beb,(size_t)HV*4); cudaMalloc(&d_glb,(size_t)HV*4); cudaMalloc(&d_ob,no1*4);
+      cudaMemcpy(d_x1,&h_in[(size_t)t*HID],(size_t)HID*4,cudaMemcpyHostToDevice);
+      rms_f32_k<<<1,512,(size_t)512*4>>>(d_h1,d_x1,(float*)wNorm->d,1,HID);
+      cudaDeviceSynchronize();
+      f32_to_bf16_k<<<(int)((HID+255)/256),256>>>(d_h1b,d_h1,(int)HID);
+      gemv_batch(d_h1b,(uint8_t*)wQkv->d,d_q1b,HID,CC,1);
+      cudaDeviceSynchronize();
+      conv_decode_k<<<(int)((CC+255)/256),256>>>(d_q1b,(const float*)wC->d,d_CS,d_cvb,CC);
+      cudaDeviceSynchronize();
+      split_qkv_k<<<(int)((nq1+255)/256),256>>>(d_cvb,d_qb,d_kb,d_vb,1);
+      cudaDeviceSynchronize();
+      gemv_batch(d_h1b,(uint8_t*)wBeta->d,d_bb,HID,HV,1);
+      cudaDeviceSynchronize();
+      wa_gemm_k<<<1,256>>>(d_h1,(float*)wAlpha->d,d_arb,1,HV,HID);
+      cudaDeviceSynchronize();
+      beta_gl_k<<<1,256>>>(d_bb,d_arb,(float*)wA->d,(float*)wDT->d,d_beb,d_glb,HV);
+      cudaDeviceSynchronize();
+      qk_norm_scale_k<<<HV,128>>>(d_qb,d_kb,1);
+      cudaDeviceSynchronize();
+      cudaMemcpy(&qn_dec[(size_t)t*HV*KHD],d_qb,nq1*4,cudaMemcpyDeviceToHost);
+      cudaMemcpy(&kn_dec[(size_t)t*HV*KHD],d_kb,nq1*4,cudaMemcpyDeviceToHost);
+      cudaMemcpy(&v_dec[(size_t)t*HV*VHD],d_vb,nv1*4,cudaMemcpyDeviceToHost);
+      gdn_step_cuda(d_qb,d_kb,d_vb,d_beb,d_glb,d_S2,d_ob,HV,KHD,VHD);
+      cudaDeviceSynchronize();
+      cudaMemcpy(Sd[t].data(),d_S2,nS*4,cudaMemcpyDeviceToHost);
+      cudaMemcpy(&o_dec[(size_t)t*HV*VHD],d_ob,no1*4,cudaMemcpyDeviceToHost);
+      cudaFree(d_h1); cudaFree(d_x1); cudaFree(d_h1b); cudaFree(d_q1b); cudaFree(d_cvb);
+      cudaFree(d_qb); cudaFree(d_kb); cudaFree(d_vb); cudaFree(d_bb); cudaFree(d_arb);
+      cudaFree(d_beb); cudaFree(d_glb); cudaFree(d_ob);
+    }
+    cudaFree(d_CS); cudaFree(d_S2);
+    const char* nm[6]={"qn","kn","v","S","o","z"};
+    for(int k=0;k<5;++k){
+      size_t nn = (k<2)?nq:((k==2)?nv:((k==3)?nS:no));
+      const float *A = (k==0)?qn_pre.data():((k==1)?kn_pre.data():((k==2)?v_pre.data():((k==3)?Sp[T-1].data():o_pre.data())));
+      const float *B = (k==0)?qn_dec.data():((k==1)?kn_dec.data():((k==2)?v_dec.data():((k==3)?Sd[T-1].data():o_dec.data())));
+      (void)nm;
+      for(int t=0;t<T;++t){
+        const float *At, *Bt;
+        size_t per = (k<2)?(size_t)HV*KHD:((k==2)?(size_t)HV*VHD:((k==3)?nS:(size_t)HV*VHD));
+        if(k==3){ At=Sp[t].data(); Bt=Sd[t].data(); }
+        else { At=A+(size_t)t*per; Bt=B+(size_t)t*per; }
+        double mx=0,me=0; size_t im=0; size_t nnz=0;
+        for(size_t i=0;i<per;++i){ double e=fabs((double)At[i]-(double)Bt[i]); if(e>mx){mx=e;im=i;} if(e!=0.0)++nnz; me+=e; }
+        me/=per;
+        printf("sbis %s tok%d: maxerr=%.3e at %zu mean=%.2e nondiff=%zu/%zu %s\n",nm[k],t,mx,im,me,nnz,per,(mx==0.0)?"BITEXACT":"DIVERGE");
+        fflush(stdout);
+      }
+    }
+  }
+  // zl bisect: gate GEMM prefill-batched vs decode-single (h1 ricostr.)
+  {
+    WEntry *wG=find_w("blk.26.attn_gate.weight");
+    if(!wG){ printf("sbis zl: missing wGate\n"); }
+    else {
+    const size_t nzl=(size_t)T*VDD;
+    std::vector<float> zl_pre(nzl), zl_dec(nzl);
+    float *d_h=nullptr,*d_h1=nullptr; uint16_t *d_hb=nullptr; float *d_zl=nullptr;
+    cudaMalloc(&d_h,nH*4); cudaMalloc(&d_h1,nH*4); cudaMalloc(&d_hb,nH*2); cudaMalloc(&d_zl,nzl*4);
+    cudaMemcpy(d_h,h_in.data(),nH*4,cudaMemcpyHostToDevice);
+    rms_f32_k<<<T,512,(size_t)512*4>>>(d_h1,d_h,(float*)wNorm->d,T,HID);
+    cudaDeviceSynchronize();
+    f32_to_bf16_k<<<(int)((nH+255)/256),256>>>(d_hb,d_h1,(int)nH);
+    gemv_batch(d_hb,(uint8_t*)wG->d,d_zl,HID,VDD,T);
+    cudaDeviceSynchronize();
+    cudaMemcpy(zl_pre.data(),d_zl,nzl*4,cudaMemcpyDeviceToHost);
+    cudaFree(d_h); cudaFree(d_h1); cudaFree(d_hb); cudaFree(d_zl);
+    for(int t=0;t<T;++t){
+      float *d_x1=nullptr,*d_h1b=nullptr; uint16_t *d_h1c=nullptr; float *d_z1=nullptr;
+      cudaMalloc(&d_x1,(size_t)HID*4); cudaMalloc(&d_h1b,(size_t)HID*4); cudaMalloc(&d_h1c,(size_t)HID*2);
+      cudaMalloc(&d_z1,(size_t)VDD*4);
+      cudaMemcpy(d_x1,&h_in[(size_t)t*HID],(size_t)HID*4,cudaMemcpyHostToDevice);
+      rms_f32_k<<<1,512,(size_t)512*4>>>(d_h1b,d_x1,(float*)wNorm->d,1,HID);
+      cudaDeviceSynchronize();
+      f32_to_bf16_k<<<(int)((HID+255)/256),256>>>(d_h1c,d_h1b,(int)HID);
+      gemv_batch(d_h1c,(uint8_t*)wG->d,d_z1,HID,VDD,1);
+      cudaDeviceSynchronize();
+      cudaMemcpy(&zl_dec[(size_t)t*VDD],d_z1,(size_t)VDD*4,cudaMemcpyDeviceToHost);
+      cudaFree(d_x1); cudaFree(d_h1b); cudaFree(d_h1c); cudaFree(d_z1);
+    }
+    for(int t=0;t<T;++t){
+      double mx=0,me=0; size_t im=0;
+      for(int i=0;i<VDD;++i){ double e=fabs((double)zl_pre[(size_t)t*VDD+i]-zl_dec[(size_t)t*VDD+i]); if(e>mx){mx=e;im=i;} me+=e; }
+      me/=VDD;
+      printf("sbis zl tok%d: maxerr=%.3e at %zu mean=%.2e %s\n",t,mx,im,me,mx==0.0?"BITEXACT":"DIVERGE");
+      fflush(stdout);
+    }
+    }
+  }
+  // full layer 26 batched vs incr con stessi h_in
+  {
+    // prefill-style full layer
+    float *d_xp=nullptr; cudaMalloc(&d_xp,nH*4);
+    cudaMemcpy(d_xp,h_in.data(),nH*4,cudaMemcpyHostToDevice);
+    if(!run_gdn_layer(26,d_xp,T,err)){ printf("debug26 run_gdn_layer FAIL %s\n",err.c_str()); cudaFree(d_xp); return -2; }
+    std::vector<float> h_out_pre(nH); cudaMemcpy(h_out_pre.data(),d_xp,nH*4,cudaMemcpyDeviceToHost);
+    cudaFree(d_xp);
+    // decode-style incr
+    DecodeState ds26; decode_init(ds26,err);
+    cudaSetDevice(0);
+    // azzera tutto tranne layer26 per isolare? usa ds26 completo ma tanto altri layer non usati
+    std::vector<float> h_out_dec(nH);
+    for(int t=0;t<T;++t){
+      cudaSetDevice(0);
+      float *d_xs=nullptr; cudaMalloc(&d_xs,(size_t)HID*4);
+      cudaMemcpy(d_xs,&h_in[(size_t)t*HID],(size_t)HID*4,cudaMemcpyHostToDevice);
+      if(!run_gdn_decode_layer(26,d_xs,ds26,err)){ printf("debug26 dec layer FAIL t=%d %s\n",t,err.c_str()); cudaFree(d_xs); decode_free(ds26); return -2; }
+      cudaMemcpy(&h_out_dec[(size_t)t*HID],d_xs,(size_t)HID*4,cudaMemcpyDeviceToHost);
+      cudaFree(d_xs);
+    }
+    decode_free(ds26);
+    for(int t=0;t<T;++t){
+      double mx=0,me=0; size_t im=0;
+      for(int i=0;i<HID;++i){ double e=fabs((double)h_out_dec[(size_t)t*HID+i]-h_out_pre[(size_t)t*HID+i]); if(e>mx){mx=e;im=i;} me+=e; }
+      me/=HID;
+      printf("debug26 full layer26 tok%d hout: maxerr=%.6f at %zu mean=%.7f %s\n",t,mx,im,me,mx<1e-4?"OK":"DIVERGE");
+      fflush(stdout);
+    }
+  }
   return 0;
 }
 
