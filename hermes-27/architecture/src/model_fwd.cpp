@@ -158,6 +158,15 @@ std::vector<float> ModelFwd::prefill(const std::vector<int>& ids, float* h_last_
         // gate is sigmoid (transformers Qwen3_5Attention line 714), NOT silu
         for(int i=0;i<6144;++i){ float s=gg[i]; gg[i]=att[(size_t)t*6144+i]/(1.f+expf(-s)); } }
       linear_nvfp4_batch(P+"attn_output.weight", G.data(), core.data(), T);
+      if(getenv("HERMES_BLK3") && li==3){
+        auto dump=[&](const char* p, const void* d, size_t n){ FILE* f=fopen(p,"wb"); fwrite(d,4,n,f); fclose(f); };
+        dump("/tmp/e3_h.bin",h.data(),h.size()); dump("/tmp/e3_qqkv.bin",qqkv.data(),qqkv.size());
+        dump("/tmp/e3_kk.bin",kk.data(),kk.size()); dump("/tmp/e3_vv.bin",vv.data(),vv.size());
+        dump("/tmp/e3_Q.bin",Q.data(),Q.size()); dump("/tmp/e3_K.bin",K_.data(),K_.size());
+        dump("/tmp/e3_V.bin",V.data(),V.size()); dump("/tmp/e3_G.bin",G.data(),G.size());
+        dump("/tmp/e3_att.bin",att.data(),att.size()); dump("/tmp/e3_core.bin",core.data(),core.size());
+        printf("e3 dumps saved T=%d\n",T); fflush(stdout);
+      }
     } else {
       linear_nvfp4_batch(P+"attn_qkv.weight", h.data(), qkv.data(), T);
       // causal depthwise conv k=4 + silu
