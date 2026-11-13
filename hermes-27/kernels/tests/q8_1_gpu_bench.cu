@@ -135,6 +135,7 @@ int main(int argc,char**argv) {
   try {
     std::string gguf,capture;
     int T=64,device=1,loops=10;
+    bool dp4a_ab=false;
     for(int i=1;i<argc;++i) {
       std::string key=argv[i];
       auto val=[&] {
@@ -146,9 +147,11 @@ int main(int argc,char**argv) {
       else if(key=="--T")T=std::stoi(val());
       else if(key=="--device")device=std::stoi(val());
       else if(key=="--loops")loops=std::stoi(val());
+      else if(key=="--dp4a-ab")dp4a_ab=true;
       else if(key=="--help") {
         std::puts("usage: q8_1_gpu_bench --gguf REAL_MODEL --capture LLAMA_DIR "
-                  "[--T 1|16|64|128|256] [--device 1] [--loops 10]");
+                  "[--T 1|16|64|128|256] [--device 1] [--loops 10] "
+                  "[--dp4a-ab (explicit opt-in)]");
         return 0;
       } else throw std::runtime_error("bad option "+key);
     }
@@ -184,6 +187,9 @@ int main(int argc,char**argv) {
     auto* dw=mem.alloc<uint8_t>(raw.size());
     auto* dq=mem.alloc<Block>(cpu.size());
     auto* dy=mem.alloc<float>(size_t(T)*N);
+    // Explicit A/B only; the baseline's allocation and dispatch are
+    // unchanged if --dp4a-ab is absent.
+    float* dFast=dp4a_ab ? mem.alloc<float>(size_t(T)*N) : nullptr;
     ck(cudaMemcpy(dx,x.data(),x.size()*4,cudaMemcpyHostToDevice),"H2D X");
     ck(cudaMemcpy(dw,raw.data(),raw.size(),cudaMemcpyHostToDevice),"H2D W");
     ck(q8::project_f32_q8_1_nvfp4(dx,dw,dq,dy,T,N,K),"Q8_1 projection");
@@ -205,11 +211,13 @@ int main(int argc,char**argv) {
     if(bad_q||bad_d||bad_s)
       throw std::runtime_error("GPU Q8 blocks not byte-identical to source-style CPU");
     double sse=0,maxerr=0,refss=0;
+    std::vector<double> cpu_t0(N);
     // Compare ALL true llama outputs at T=1, and sampled rows for
     // synthetic additional tokens against the exact CPU Q8 projection.
     for(int t=0;t<T;++t)for(int j=0;j<(t==0?N:32);++j) {
       int n=t==0?j:(j*977+19)%N;
       double ref=cpu_projection(cpu,raw.data(),K,t,n);
+      if(t==0)cpu_t0[n]=ref;
       double err=double(y[size_t(t)*N+n])-ref;
       if(!std::isfinite(err))throw std::runtime_error("nonfinite GPU Y");
       sse+=err*err;maxerr=std::max(maxerr,std::abs(err));refss+=ref*ref;
@@ -232,6 +240,78 @@ int main(int argc,char**argv) {
     if(maxerr>1.e-3 || std::sqrt(sse/N)>1.e-4)
       throw std::runtime_error("GPU Q8 vs authentic llama first QKV FAIL");
 
+    if(dp4a_ab) {
+      // Both kernels read the *exact same* prequantized Q8_1 blocks and
+      // raw GGUF weights. This isolates GEMV implementation differences,
+      // including output T,N stride, with no quantization drift.
+      ck(q8::gemv_q8_1_nvfp4_dp4a_batched(dq,dw,dFast,T,N,K),
+         "DP4A batched experiment");
+      ck(cudaDeviceSynchronize(),"DP4A warmup and strict compare");
+      std::vector<float> fast(y.size());
+      ck(cudaMemcpy(fast.data(),dFast,fast.size()*sizeof(float),
+                    cudaMemcpyDeviceToHost),"D2H DP4A");
+      double errss=0,baseline_ss=0,new_llama_ss=0,cpu_ss=0;
+      double max_pair=0,max_llama=0,max_cpu=0;
+      size_t nonfinite=0;
+      for(size_t i=0;i<fast.size();++i) {
+        if(!std::isfinite(fast[i]) || !std::isfinite(y[i])) {
+          ++nonfinite; continue;
+        }
+        const double diff=double(fast[i])-y[i];
+        errss+=diff*diff;
+        baseline_ss+=double(y[i])*y[i];
+        max_pair=std::max(max_pair,std::abs(diff));
+      }
+      // The real independent llama comparison is valid only for token0.
+      // Extra T64 rows are deterministic perturbations, not authentic
+      // captured llama layer positions.
+      for(int n=0;n<N;++n) {
+        if(!std::isfinite(fast[n]))continue;
+        const double ll_diff=double(fast[n])-expected_llama[n];
+        const double cpu_diff=double(fast[n])-cpu_t0[n];
+        new_llama_ss+=ll_diff*ll_diff;
+        cpu_ss+=cpu_diff*cpu_diff;
+        max_llama=std::max(max_llama,std::abs(ll_diff));
+        max_cpu=std::max(max_cpu,std::abs(cpu_diff));
+      }
+      const double rmse_pair=std::sqrt(errss/fast.size());
+      const double rmse_llama=std::sqrt(new_llama_ss/N);
+      const double rmse_cpu=std::sqrt(cpu_ss/N);
+      std::printf("DP4A_AB_all_outputs T=%d n=%zu nonfinite=%zu "
+                  "max_vs_Q8_baseline=%.12g rmse_vs_Q8_baseline=%.12g "
+                  "relative_rmse=%.12g\n",T,fast.size(),nonfinite,
+                  max_pair,rmse_pair,
+                  std::sqrt(errss/std::max(baseline_ss,1.e-20)));
+      std::printf("DP4A_AUTHENTIC_llama_token0 n=%d maxabs=%.12g "
+                  "rmse=%.12g CPU_fp64_maxabs=%.12g CPU_fp64_rmse=%.12g\n",
+                  N,max_llama,rmse_llama,max_cpu,rmse_cpu);
+
+      // Source correctness includes all 10240 output rows per token and
+      // 10 consecutive copies from the same packed activation state.
+      // Memcmp is intentional: determinism requires bitwise FP32 equality.
+      const std::vector<float> first=fast;
+      int changed_runs=0;
+      for(int rep=0;rep<10;++rep) {
+        ck(q8::gemv_q8_1_nvfp4_dp4a_batched(dq,dw,dFast,T,N,K),
+           "DP4A ten-repeat enqueue");
+        ck(cudaMemcpy(fast.data(),dFast,fast.size()*4,
+                      cudaMemcpyDeviceToHost),"DP4A repeat D2H sync");
+        if(std::memcmp(fast.data(),first.data(),fast.size()*4))
+          ++changed_runs;
+      }
+      std::printf("DP4A_DETERMINISM samples_per_run=%zu repeats=10 "
+                  "changed_runs=%d\n",first.size(),changed_runs);
+      if(nonfinite || changed_runs ||
+         // Strict A/B: this is *tighter* than the old diagnostic
+         // max 0.001 and RMSE 0.0001; never relax those thresholds.
+         max_pair>1.e-5 || rmse_pair>2.e-6 ||
+         max_llama>7.62939453125e-6 || rmse_llama>2.e-6 ||
+         max_cpu>1.e-5 || rmse_cpu>2.e-6)
+        throw std::runtime_error(
+          "DP4A STRICT A/B NO-GO: QKV accuracy/determinism gate");
+      std::puts("DP4A_STRICT_LAYER0_A_B_GATE=PASS (not full-model logits)");
+    }
+
     Events timer;
     auto doquant=[&]{ck(q8::quantize_f32_q8_1(dx,dq,T,K),"quant enqueue");};
     auto dogemv=[&]{ck(q8::gemv_q8_1_nvfp4(dq,dw,dy,T,N,K),"GEMV enqueue");};
@@ -243,6 +323,25 @@ int main(int argc,char**argv) {
                 "q8_bytes=%zu gpu_allocation_delta_bytes=%zu\n",
                 T,loops,quant_ms,gemv_ms,combined_ms,q8::q8_1_scratch_bytes(T,K),
                 before-after);
+    if(dp4a_ab) {
+      auto fast_only=[&] {
+        ck(q8::gemv_q8_1_nvfp4_dp4a_batched(dq,dw,dFast,T,N,K),
+           "DP4A GEMV timed");
+      };
+      auto fast_pipeline=[&] {
+        ck(q8::project_f32_q8_1_nvfp4_dp4a_batched(
+             dx,dw,dq,dFast,T,N,K),"DP4A pipeline timed");
+      };
+      const float fast_ms=timer.ms(fast_only,loops);
+      const float fast_pipeline_ms=timer.ms(fast_pipeline,loops);
+      std::printf("DP4A_AB_TIMING T=%d repeats=%d baseline_q8_gemv_ms=%.6f "
+                  "batched_dp4a_gemv_ms=%.6f baseline_pipeline_ms=%.6f "
+                  "batched_dp4a_pipeline_ms=%.6f "
+                  "raw_GGUF_weight_bytes=%zu q8_scratch_bytes=%zu "
+                  "extra_weight_copy_bytes=0\n",
+                  T,loops,gemv_ms,fast_ms,combined_ms,fast_pipeline_ms,
+                  raw.size(),q8::q8_1_scratch_bytes(T,K));
+    }
     std::puts("PASS isolated projection only; NOT PP2 latency/full-model parity");
     return 0;
   } catch(const std::exception& e) {

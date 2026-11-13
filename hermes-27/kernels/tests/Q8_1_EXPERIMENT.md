@@ -1,7 +1,9 @@
 # Q8_1 activation x raw NVFP4 GGUF: isolated accuracy experiment
 
-**State: CPU reference PASS, CUDA12.8 standalone compilation/link PASS.**
-GPU numeric/latency measurements pending **prime-exclusive GPU grant**.
+**State: CPU reference PASS, CUDA12.8 standalone compilation/link PASS,
+DP4A T1 and T64 real-GPU strict A/B PASS as reported by prime.**
+Experiment remains opt-in only; production full-model quality and
+multiuser throughput are NOT established. No default integration.
 No PP2/serving/CMake modification. No production readiness claim.
 
 ## Why Q8_1 matters
@@ -62,6 +64,7 @@ or reinterpreting a uint16 buffer as float is invalid.
 - kernels/tests/q8_1_cpu_test.py
 - kernels/tests/q8_1_real_capture_cpu.cpp
 - kernels/tests/q8_1_gpu_bench.cu
+- kernels/tests/q8_1_dp4a_cpu_test.py
 - kernels/tests/Q8_1_EXPERIMENT.md
 
 No production source/CMake routing modifications.
@@ -154,3 +157,102 @@ Even a GPU QKV match would not prove the complete model. Strict
 full-model logits/argmax, state continuation, and 1/4/8 user
 throughput/VRAM tests remain mandatory. Previous BF16 full-model
 T64 argmax failures must NOT be ignored or used to loosen thresholds.
+
+## New follow-up: explicit batched DP4A NVFP4 x Q8_1 experiment
+
+Prime reported independent real-GPU quality PASS for the ORIGINAL
+Q8 kernel at T1 and T64 (authentic first-token llama layer0 QKV
+maxabs 7.629e-6). However, T64 Q8 GEMV was **58.006 ms** in a
+separate run vs raw Warp4 **9.056 ms**. The old Q8 GEMV kernel is
+not a viable throughput path, even if numerically correct.
+
+The original quantizer, gemv_q8_1_nvfp4, and baseline projection
+API are preserved unchanged. NEW opt-in entrypoints are:
+
+- gemv_q8_1_nvfp4_dp4a_batched(x_q8, rawW, y, T, N, K, stream)
+- project_f32_q8_1_nvfp4_dp4a_batched(x_f32, rawW, q8_scratch, y, T, N, K, stream)
+
+The SAME original quantize_f32_q8_1 function supplies activation
+Q8 blocks. The new projection maps one warp to one GGUF output row,
+reads four contiguous GGUF 64-weight blocks per iteration, and
+reuses those FP4 bytes over up to **8 tokens**. Each warp lane reads
+four consecutive packed FP4 bytes, extracts 4 lower and 4 upper
+E2M1 nibbles, converts each to the EXACT signed E2M1*2 int8, and
+executes two native signed DP4A operations per token.
+Q8 scales remain stored FP16. Output is FP32 row-major.
+The kernel requires K divisible by 256 and four-byte-aligned
+GGUF pointers; other layouts fail closed without fallback.
+
+This changes the intended raw weight rereads for T64 from 64 to
+8 per row, an algorithmic traffic reduction of 8x. Prime's
+T64 same-process GPU benchmark now demonstrates a speedup over
+the **original Q8 GEMV for this one projection**, not an actual
+8x DRAM bandwidth result or an end-to-end model improvement. The
+FP32 summation order differs from llama CUDA and the old Q8 kernel,
+so no numerical equality is presumed. The entire raw GGUF weight
+matrix stays resident in its original representation, with
+**zero additional weight copies**. T64/K5120 Q8 temporary scratch
+remains 368,640 bytes. This approach does not use Tensor Cores.
+
+### CPU/offline gate, completed
+
+- q8_1_cpu_test.py PASS: 3007 Q8 signed int8 quantization blocks
+  and 1000 random GGUF integer dot comparisons.
+- q8_1_dp4a_cpu_test.py PASS: 120 signed nibble/DP4A mapping
+  checks, 999 independent numeric outputs across 18 shapes
+  K=256/512/1024 and T=1/7/8/9/16/64 including tails,
+  ten-repeat deterministic simulation.
+- Standalone CUDA 12.8 SM120a NVCC compile and link PASS.
+- Executable help (no GPU initialization) PASS.
+
+Offline build (DOES NOT RUN GPU):
+
+    root=/home/matteo/hermes-27
+    s=/tmp/h27-q8-dp4a-worker2
+    mkdir -p "$s/src" "$s/include/hermes" "$s/tests"
+    cp "$root/kernels/src/nvfp4_gemv_q8_1_experimental.cu" "$s/src/"
+    cp "$root/kernels/include/hermes/nvfp4_gemv_q8_1_experimental.hpp" "$s/include/hermes/"
+    cp "$root/kernels/tests/q8_1_gpu_bench.cu" "$s/tests/"
+    python3 "$root/kernels/tests/q8_1_cpu_test.py"
+    python3 "$root/kernels/tests/q8_1_dp4a_cpu_test.py"
+    nvcc=/usr/local/cuda-12.8/bin/nvcc
+    "$nvcc" -std=c++20 -O3 -arch=sm_120a -I"$s/include" \
+      -c "$s/src/nvfp4_gemv_q8_1_experimental.cu" -o "$s/q8_dp4a.o"
+    "$nvcc" -std=c++20 -O3 -arch=sm_120a \
+      -I"$s/include" -I"$root/model/include" \
+      -c "$s/tests/q8_1_gpu_bench.cu" -o "$s/bench.o"
+    "$nvcc" -std=c++20 -O3 -arch=sm_120a -o "$s/q8_bench" \
+      "$s/bench.o" "$s/q8_dp4a.o" "$root/build/libhermes_gguf.a"
+    "$s/q8_bench" --help
+
+### Reproducible GPU acceptance: every rerun requires a fresh prime grant
+
+    model=/home/matteo/hermes-27/models/Qwen3.8-27B-Uncensored-NVFP4-MTP.gguf
+    capture=/tmp/h27-layer0-llama-pos0-prime3
+    nvidia-smi --query-gpu=index,memory.used,memory.free,utilization.gpu --format=csv
+    timeout 60 /tmp/h27-q8-dp4a-worker2/q8_bench \
+      --gguf "$model" --capture "$capture" --T 1 \
+      --device 1 --loops 10 --dp4a-ab
+    # T64 only after T1 PASS and while prime retains exclusive grant.
+    timeout 60 /tmp/h27-q8-dp4a-worker2/q8_bench \
+      --gguf "$model" --capture "$capture" --T 64 \
+      --device 1 --loops 10 --dp4a-ab
+
+The flag --dp4a-ab is MANDATORY for this experimental path.
+Without it, the benchmark remains on the original Q8 path.
+For each shape, compare **all T*N outputs** against the original
+same-Q8 GEMV and all 10,240 authentic llama QKV outputs for token0.
+Run 10 DP4A repeats, require **bitwise identical** FP32 output
+arrays and all finite values. For T64 the additional 63 input
+rows are deliberately synthetic perturbations, NOT authentic llama
+positions, and cannot prove full-model accuracy.
+
+Additional strict A/B threshold (tighter than earlier exploratory
+0.001/0.0001): max abs vs original Q8 <=1e-5, RMSE <=2e-6;
+authentic llama maxabs <=7.62939453125e-6, RMSE <=2e-6;
+CPU FP64 QKV maxabs <=1e-5, RMSE <=2e-6.
+**Any violation exits nonzero before DP4A latency is reported**;
+no gate is loosened. After quality PASS, CUDA events measure Q8
+quantization, original and DP4A GEMV, and full quant+GEMV pipelines
+in the same process. Even this local PASS would NOT authorize
+production, PP2 routing or full-model quality parity.

@@ -111,7 +111,9 @@ if(HERMES_BUILD_Q8_1_EXPERIMENT)
   if(Python3_Interpreter_FOUND)
     add_test(NAME q8_1_quant_cpu
       COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_SOURCE_DIR}/kernels/tests/q8_1_cpu_test.py)
-    set_tests_properties(q8_1_quant_cpu PROPERTIES TIMEOUT 60)
+    add_test(NAME q8_1_dp4a_cpu
+      COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_SOURCE_DIR}/kernels/tests/q8_1_dp4a_cpu_test.py)
+    set_tests_properties(q8_1_quant_cpu q8_1_dp4a_cpu PROPERTIES TIMEOUT 60)
   endif()
   # The GPU Q8 benchmark is never an automatic CTest: manual same-GGUF
   # capture plus explicit exclusive-GPU approval are mandatory.

@@ -47,9 +47,27 @@ cudaError_t gemv_q8_1_nvfp4(
     const Q8_1Block* x_q8, const uint8_t* gguf_nvfp4_w,
     float* y_f32, int T, int N, int K, cudaStream_t stream = nullptr);
 
+// OPT-IN alternative, not a replacement for the baseline above.
+// One warp decodes four consecutive raw GGUF 64-weight blocks from one
+// output row, then reuses the loaded 4-bit weights over up to eight
+// successive Q8_1 tokens via native __dp4a (4 signed int8 products/call).
+// W remains raw GGUF NVFP4, no repack, no extra weight buffers.
+// Output Y[T,N] FP32; the caller must compare to the baseline, authentic
+// llama QKV and the strict full-model gate before considering integration.
+// Quantization is intentionally the SAME quantize_f32_q8_1 function.
+cudaError_t gemv_q8_1_nvfp4_dp4a_batched(
+    const Q8_1Block* x_q8, const uint8_t* gguf_nvfp4_w,
+    float* y_f32, int T, int N, int K, cudaStream_t stream = nullptr);
+
 // Convenience two-kernel enqueue; same scratch belongs to the same stream
 // until both kernels have completed. Uses no CUDA allocations or sync.
 cudaError_t project_f32_q8_1_nvfp4(
+    const float* x_f32, const uint8_t* gguf_nvfp4_w,
+    Q8_1Block* q8_scratch, float* y_f32, int T, int N, int K,
+    cudaStream_t stream = nullptr);
+
+// Explicit opt-in full two-stage enqueue. Does not change baseline routing.
+cudaError_t project_f32_q8_1_nvfp4_dp4a_batched(
     const float* x_f32, const uint8_t* gguf_nvfp4_w,
     Q8_1Block* q8_scratch, float* y_f32, int T, int N, int K,
     cudaStream_t stream = nullptr);
