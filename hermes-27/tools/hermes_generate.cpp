@@ -290,6 +290,16 @@ int main(int argc, char** argv) {
         pp2::free_all();
         return 1;
       }
+      const std::size_t expected = prompt.size() * (std::size_t)kVocab;
+      if(full.size() != expected) {
+        // Never form iterators into a truncated backend result: a nonempty
+        // vector can still be shorter than the requested T*VOC logits.
+        std::fprintf(stderr,
+          "ERROR: prompt %zu unexpected full-prefill logits count: got %zu expected %zu\n",
+          pi, full.size(), expected);
+        pp2::free_all();
+        return 1;
+      }
       const std::size_t offset = (prompt.size() - 1) * (std::size_t)kVocab;
       reference.assign(full.begin() + offset, full.begin() + offset + kVocab);
     }
