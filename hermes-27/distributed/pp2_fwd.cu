@@ -1256,6 +1256,56 @@ __global__ void sdpa_gqa_decode_k(const float* Q, const float* Kc, const float* 
   ATT[(size_t)hq*256+tid]=a;
 }
 
+// Opt-in bounded KV ring, called only AFTER the original linear cache has
+// filled (absolute_pos >= capacity). Each block sees the newest 8192 logical
+// positions in chronological order, including the NEW token in d_K1/d_vv.
+// It must finish BEFORE Kc/Vc at slot absolute_pos%capacity are overwritten:
+// that physical slot still contains the oldest previously committed token.
+// Keep the existing FP32 score reduction/softmax order; no dense T*context
+// matrix and no head/weight replication. All accesses are stream-ordered.
+__global__ void sdpa_gqa_ring_decode_k(
+    const float* Q, const float* Kc, const float* Vc,
+    const float* Knew, const float* Vnew, float* ATT,
+    int absolute_pos, int capacity){
+  int hq=(int)blockIdx.x, g=hq/6, tid=(int)threadIdx.x;
+  int count=(absolute_pos+1<capacity)?(absolute_pos+1):capacity;
+  int first_absolute=absolute_pos-count+1;
+  extern __shared__ float smem[];
+  float* scores=smem;
+  float* tmp=scores+count;
+  float qv=Q[(size_t)hq*256+tid];
+  for(int logical=0;logical<count;++logical){
+    int p=first_absolute+logical;
+    float kv=(p==absolute_pos)
+        ? Knew[(size_t)g*256+tid]
+        : Kc[(size_t)(p%capacity)*1024+g*256+tid];
+    tmp[tid]=qv*kv; __syncthreads();
+    for(int s=128;s>0;s>>=1){
+      if(tid<s)tmp[tid]+=tmp[tid+s];
+      __syncthreads();
+    }
+    if(tid==0)scores[logical]=tmp[0]*(1.f/16.f);
+    __syncthreads();
+  }
+  if(tid==0){
+    float mx=-1e30f;
+    for(int i=0;i<count;++i)if(scores[i]>mx)mx=scores[i];
+    float den=0;
+    for(int i=0;i<count;++i){scores[i]=expf(scores[i]-mx);den+=scores[i];}
+    for(int i=0;i<count;++i)scores[i]/=den;
+  }
+  __syncthreads();
+  float a=0;
+  for(int logical=0;logical<count;++logical){
+    int p=first_absolute+logical;
+    float value=(p==absolute_pos)
+        ? Vnew[(size_t)g*256+tid]
+        : Vc[(size_t)(p%capacity)*1024+g*256+tid];
+    a+=scores[logical]*value;
+  }
+  ATT[(size_t)hq*256+tid]=a;
+}
+
 static bool decode_skip_layer_sync(){
   // Strict opt-in. Kernel launches and GEMV use the ordered default stream.
   // decode_step keeps the blocking D2H/H2D boundary and final logits D2H.
@@ -1432,8 +1482,13 @@ static bool run_full_decode_layer(int li, float* d_x, DecodeState& ds, long pos,
   if(!wNorm||!wQ||!wK||!wV||!wQn||!wKn||!wO||!wPost||!wFg||!wFu||!wFd){ err="missing w full dec "+P; return false; }
   if(!ds.Kc[li]||!ds.Vc[li]){ err="decode state null full "+P; return false; }
   int L=ds.klen[li];
+  const bool sliding_wrap=ds.sliding_kv_enabled && pos>=ds.capacity;
   if(ds.capacity<1||ds.capacity>DecodeState::MAX_CONTEXT){ err="decode capacity OOB "+P; return false; }
-  if(L<0||L>=ds.capacity){ err="klen OOB "+P; return false; }
+  if(L<0 || (!sliding_wrap && L>=ds.capacity) ||
+     (sliding_wrap && (ds.capacity!=DecodeState::MAX_CONTEXT ||
+                       L>=SLIDING_KV_ABSOLUTE_POSITION_LIMIT))){
+    err="klen/window OOB "+P; return false;
+  }
   if((long)L!=pos){ err="klen/pos mismatch "+P+" klen="+std::to_string(L)+" pos="+std::to_string(pos); return false; }
   const int T=1; size_t nH=(size_t)T*HID;
   const int NQQ=12288, NKK=1024, NQHD=6144;
@@ -1467,16 +1522,51 @@ static bool run_full_decode_layer(int li, float* d_x, DecodeState& ds, long pos,
   q_norm_rope_pos_k<<<NQ,256,0,stream>>>(d_qq,(float*)wQn->d,d_Q,(int)pos);
   k_norm_rope_pos_k<<<NKV,256,0,stream>>>(d_kk,(float*)wKn->d,d_K1,(int)pos);
   extract_G_k<<<(int)((NQHD+255)/256),256,0,stream>>>(d_qq,d_G,NQHD);
-  // Keep the historical memcpy calls for legacy stream 0, but enqueue both
-  // KV updates into the request stream when running the async pipeline.
-  cudaError_t copy_error=(stream==0)
-    ? cudaMemcpy(ds.Kc[li]+(size_t)L*1024,d_K1,(size_t)NKK*4,cudaMemcpyDeviceToDevice)
-    : cudaMemcpyAsync(ds.Kc[li]+(size_t)L*1024,d_K1,(size_t)NKK*4,cudaMemcpyDeviceToDevice,stream);
-  if(copy_error==cudaSuccess) copy_error=(stream==0)
-    ? cudaMemcpy(ds.Vc[li]+(size_t)L*1024,d_vv,(size_t)NKK*4,cudaMemcpyDeviceToDevice)
-    : cudaMemcpyAsync(ds.Vc[li]+(size_t)L*1024,d_vv,(size_t)NKK*4,cudaMemcpyDeviceToDevice,stream);
-  if(copy_error!=cudaSuccess){ err="full decode KV copy "+P+": "+cudaGetErrorString(copy_error); return false; }
-  sdpa_gqa_decode_k<<<NQ,256,(size_t)(L+1+256)*sizeof(float),stream>>>(d_Q,ds.Kc[li],ds.Vc[li],d_att,L);
+  if(sliding_wrap){
+    // The physical slot still contains the OLDEST committed K/V. Read all
+    // required historical slots (1..8191 at first wrap) and staged K/V for
+    // absolute position L BEFORE modifying that slot.
+    const size_t shared_bytes=(size_t)(ds.capacity+256)*sizeof(float);
+    sdpa_gqa_ring_decode_k<<<NQ,256,shared_bytes,stream>>>(
+        d_Q,ds.Kc[li],ds.Vc[li],d_K1,d_vv,d_att,L,ds.capacity);
+    cudaError_t attention_error=cudaPeekAtLastError();
+    if(attention_error==cudaSuccess)
+      attention_error=cudaStreamSynchronize(stream);
+    if(attention_error!=cudaSuccess){
+      err="sliding KV attention BEFORE eviction "+P+": "+
+          cudaGetErrorString(attention_error);
+      return false;
+    }
+    // Stream-local barrier above confirms successful attention and safe
+    // release of the old logical token. Commit BOTH K and V to the same
+    // physical ring slot; a failed/partial commit poisons the entire state.
+    const size_t physical_slot=(size_t)(L%ds.capacity)*NKK;
+    cudaError_t commit_error=cudaMemcpyAsync(
+        ds.Kc[li]+physical_slot,d_K1,(size_t)NKK*sizeof(float),
+        cudaMemcpyDeviceToDevice,stream);
+    if(commit_error==cudaSuccess)
+      commit_error=cudaMemcpyAsync(
+          ds.Vc[li]+physical_slot,d_vv,(size_t)NKK*sizeof(float),
+          cudaMemcpyDeviceToDevice,stream);
+    if(commit_error==cudaSuccess)
+      commit_error=cudaStreamSynchronize(stream);
+    if(commit_error!=cudaSuccess){
+      err="sliding KV commit/eviction "+P+": "+
+          cudaGetErrorString(commit_error);
+      return false;
+    }
+  }else{
+    // Original linear 0..8191 code remains unchanged for the default and
+    // the pre-wrap portion of opt-in requests.
+    cudaError_t copy_error=(stream==0)
+      ? cudaMemcpy(ds.Kc[li]+(size_t)L*1024,d_K1,(size_t)NKK*4,cudaMemcpyDeviceToDevice)
+      : cudaMemcpyAsync(ds.Kc[li]+(size_t)L*1024,d_K1,(size_t)NKK*4,cudaMemcpyDeviceToDevice,stream);
+    if(copy_error==cudaSuccess) copy_error=(stream==0)
+      ? cudaMemcpy(ds.Vc[li]+(size_t)L*1024,d_vv,(size_t)NKK*4,cudaMemcpyDeviceToDevice)
+      : cudaMemcpyAsync(ds.Vc[li]+(size_t)L*1024,d_vv,(size_t)NKK*4,cudaMemcpyDeviceToDevice,stream);
+    if(copy_error!=cudaSuccess){ err="full decode KV copy "+P+": "+cudaGetErrorString(copy_error); return false; }
+    sdpa_gqa_decode_k<<<NQ,256,(size_t)(L+1+256)*sizeof(float),stream>>>(d_Q,ds.Kc[li],ds.Vc[li],d_att,L);
+  }
   gate_k<<<(int)(((size_t)NQHD+255)/256),256,0,stream>>>(d_att,d_G,d_G,(int)((size_t)NQHD));
   f32_to_bf16_k<<<(int)(((size_t)NQHD+255)/256),256,0,stream>>>(d_gb,d_G,(int)((size_t)NQHD));
   gemv_batch(d_gb,(uint8_t*)wO->d,d_core,NQHD,HID,T,stream);
@@ -1510,12 +1600,30 @@ bool decode_init(DecodeState& ds, std::string& err, int capacity){
   if(capacity<1||capacity>DecodeState::MAX_CONTEXT){
     err="decode capacity must be 1.."+std::to_string(DecodeState::MAX_CONTEXT); return false;
   }
+  const char* sliding_env=std::getenv("HERMES_PP2_SLIDING_KV");
+  const bool sliding_requested=sliding_env && std::strcmp(sliding_env,"1")==0;
+  if(sliding_requested){
+    if(capacity!=DecodeState::MAX_CONTEXT){
+      err="HERMES_PP2_SLIDING_KV=1 requires decode capacity exactly 8192";
+      return false;
+    }
+    const char* packed=std::getenv("HERMES_NVFP4_GEMV");
+    const char* bf16=std::getenv("HERMES_PP2_PREFILL_BF16");
+    if((packed && std::strcmp(packed,"packed4")==0) ||
+       (bf16 && std::strcmp(bf16,"1")==0) ||
+       std::getenv("HERMES_L26")){
+      err="sliding KV refuses packed4/BF16 prefill/L26 debug modes";
+      return false;
+    }
+  }
   if(!g_up){ err="not uploaded"; return false; }
   for(int i=0;i<64;++i){ ds.S[i]=nullptr; ds.CS[i]=nullptr; ds.Kc[i]=nullptr; ds.Vc[i]=nullptr; ds.klen[i]=0; }
   ds.ws0=nullptr; ds.ws1=nullptr; ds.idsbuf=nullptr; ds.x0buf=nullptr;
   ds.x1buf=nullptr; ds.xnbuf=nullptr; ds.logbuf=nullptr; ds.ws_bytes=0;
   ds.async_ctx=nullptr;
   ds.ever_advanced=false;
+  ds.sliding_kv_enabled=sliding_requested;
+  ds.sliding_kv_poisoned=false;
 
   const size_t kv_bytes=(size_t)capacity*1024*sizeof(float);
   size_t required[2]={0,0};
@@ -1583,7 +1691,11 @@ bool decode_init(DecodeState& ds, std::string& err, int capacity){
     if(used>limit){ err="VRAM>15GB after decode_init GPU"+std::to_string(dev)+" used="+std::to_string(used); return fail(); }
     used_after[dev]=used;
   }
-  if(async_requested()){
+  // Sliding is EXPLICIT opt-in and always uses the existing per-request
+  // nonblocking CUDA streams + step_mutex, even if the general async env
+  // was not set. Never permit two legacy threads to concurrently wrap the
+  // same physical KV ring slots. Default (flag absent) is unchanged.
+  if(async_requested() || sliding_requested){
     if(std::getenv("HERMES_L26")){
       err="HERMES_PP2_ASYNC_STREAMS cannot be combined with HERMES_L26 debug";
       return fail();
@@ -1622,6 +1734,8 @@ void decode_free(DecodeState& ds){
   ds.ws_bytes=0;
   ds.async_ctx=nullptr;
   ds.ever_advanced=false;
+  ds.sliding_kv_enabled=false;
+  ds.sliding_kv_poisoned=false;
   ds.capacity=DecodeState::MAXL;
   ds.inited=false;
 }
@@ -1899,6 +2013,38 @@ std::vector<float> prefill_chunks_into_decode_state(
   }
 }
 
+// Called under the async request mutex (or with caller-owned legacy state)
+// BEFORE the first GDN mutation. No reliance on a stale klen vs pos mirror:
+// each of the 16 full-attention layers must have committed the same absolute
+// prefix. Once GPU work starts, ANY failure poisons the entire state.
+static bool sliding_kv_step_preflight(int tok,const DecodeState& ds,
+                                      long pos,std::string& err){
+  if(!ds.sliding_kv_enabled)return true;
+  if(ds.sliding_kv_poisoned){
+    err="sliding KV request poisoned; decode_free and reinitialize";
+    return false;
+  }
+  if(ds.capacity!=DecodeState::MAX_CONTEXT || pos<0 ||
+     pos>=SLIDING_KV_ABSOLUTE_POSITION_LIMIT || tok<0 || tok>=VOC){
+    err="sliding KV invalid absolute position/token/capacity";
+    return false;
+  }
+  for(int li=0;li<NL;++li){
+    if(li%4==3){
+      if(!ds.Kc[li] || !ds.Vc[li] || (long)ds.klen[li]!=pos){
+        err="sliding KV nonmonotonic/partially committed state layer "+
+            std::to_string(li)+" expected pos "+std::to_string(pos)+
+            " got "+std::to_string(ds.klen[li]);
+        return false;
+      }
+    }else if(!ds.S[li] || !ds.CS[li]){
+      err="sliding KV recurrent S/CS unavailable layer "+std::to_string(li);
+      return false;
+    }
+  }
+  return true;
+}
+
 static std::vector<float> decode_step_async(int tok, DecodeState& ds, long pos,
                                              std::string& err){
   auto* ctx=static_cast<AsyncDecodeContext*>(ds.async_ctx);
@@ -1909,6 +2055,14 @@ static std::vector<float> decode_step_async(int tok, DecodeState& ds, long pos,
     return {};
   }
   if(ctx->poisoned){ err="async decode state poisoned: reinitialize request"; return {}; }
+  if(ds.sliding_kv_enabled){
+    if(!sliding_kv_step_preflight(tok,ds,pos,err)){
+      ds.sliding_kv_poisoned=true;
+      ctx->poisoned=true;
+      return {};
+    }
+    ds.sliding_kv_poisoned=true; // remains poisoned until FULL GPU1 completion
+  }
   ds.ever_advanced=true; // under request mutex, never a cross-thread data race
   g_async_gemv_error=cudaSuccess;
   auto fail=[&]()->std::vector<float>{ ctx->poisoned=true; return {}; };
@@ -1981,6 +2135,7 @@ static std::vector<float> decode_step_async(int tok, DecodeState& ds, long pos,
   for(float v:logits){
     if(!std::isfinite(v)){ err="async decode produced non-finite logits"; return fail(); }
   }
+  if(ds.sliding_kv_enabled)ds.sliding_kv_poisoned=false;
   return logits;
 }
 
@@ -1988,13 +2143,23 @@ std::vector<float> decode_step(int tok, DecodeState& ds, long pos, std::string& 
   if(!g_up){ err="not uploaded"; return {}; }
   if(!ds.inited){ err="decode not inited"; return {}; }
   if(ds.capacity<1||ds.capacity>DecodeState::MAX_CONTEXT){ err="decode capacity OOB"; return {}; }
-  if(pos<0||pos>=ds.capacity){ err="pos OOB"; return {}; }
+  if(pos<0 || (!ds.sliding_kv_enabled && pos>=ds.capacity) ||
+     (ds.sliding_kv_enabled && pos>=SLIDING_KV_ABSOLUTE_POSITION_LIMIT)){
+    err="pos OOB"; return {};
+  }
   const int T=1; size_t nH=(size_t)T*HID;
   // P6: zero malloc/free — buffer persistenti da decode_init.
   if(!ds.ws0||!ds.ws1||!ds.idsbuf||!ds.x0buf||!ds.x1buf||!ds.xnbuf||!ds.logbuf){
     err="decode ws not inited"; return {};
   }
   if(ds.async_ctx) return decode_step_async(tok,ds,pos,err);
+  if(ds.sliding_kv_enabled){
+    if(!sliding_kv_step_preflight(tok,ds,pos,err)){
+      ds.sliding_kv_poisoned=true;
+      return {};
+    }
+    ds.sliding_kv_poisoned=true; // invalidate on ANY subsequent CUDA error
+  }
   ds.ever_advanced=true;
   cudaSetDevice(0);
   int* d_ids = ds.idsbuf;
@@ -2052,6 +2217,15 @@ std::vector<float> decode_step(int tok, DecodeState& ds, long pos, std::string& 
     if(head_copy_err!=cudaSuccess){
       err="output head decode logits copy: "+std::string(cudaGetErrorString(head_copy_err));
       return {};
+    }
+    if(ds.sliding_kv_enabled){
+      for(float v:logits){
+        if(!std::isfinite(v)){
+          err="sliding KV decode produced non-finite logits";
+          return {}; // poisoned until caller frees
+        }
+      }
+      ds.sliding_kv_poisoned=false;
     }
     // P6: nessun free (persistenti).
     return logits;

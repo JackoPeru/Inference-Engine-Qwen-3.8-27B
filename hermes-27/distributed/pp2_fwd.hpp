@@ -75,7 +75,23 @@ struct DecodeState {
   // Reject seeded prefill after ANY decode step, including interrupted steps
   // which may have mutated GDN state before klen becomes nonzero.
   bool ever_advanced = false;
+  // Strict per-state opt-in HERMES_PP2_SLIDING_KV=1 at decode_init(capacity=8192).
+  // The first 8192 positions retain unchanged linear KV behavior. After
+  // that, klen[full_layer] tracks ABSOLUTE next position (not resident length)
+  // while physical KV slots are abs_pos % capacity. No implicit mode changes
+  // when the environment changes mid-request. A failed sliding decode must
+  // never be resumed: GPU0/GPU1 GDN/conv/KV mutations cannot be rolled back.
+  bool sliding_kv_enabled = false;
+  bool sliding_kv_poisoned = false;
 };
+
+// Experimental bounded 8192-token attention WINDOW (not unlimited history).
+// The absolute RoPE position is retained, but old full-attention K/V entries
+// are evicted when a new token is decoded at absolute position >=8192.
+// Only explicit HERMES_PP2_SLIDING_KV=1 on decode_init(capacity=8192).
+// Conservative guard keeps CUDA's current int/FP32 RoPE positional range
+// below 2^20; default decode remains limited to MAX_CONTEXT=8192.
+inline constexpr int SLIDING_KV_ABSOLUTE_POSITION_LIMIT = 1 << 20;
 
 // Experimental, explicitly invoked batched PP2 prefill which seeds a FRESH
 // decode_init() state directly: GDN recurrent S, convolution CS tails and
