@@ -2024,6 +2024,15 @@ static bool sliding_kv_step_preflight(int tok,const DecodeState& ds,
     err="sliding KV request poisoned; decode_free and reinitialize";
     return false;
   }
+  // The opt-in ring reuses physical KV slots. Running it on the fallback
+  // legacy/default stream has no per-request serialization guarantee.
+  // DecodeState is a public struct: reject malformed/tampered states even if
+  // a caller toggled sliding_kv_enabled after a NON-sliding decode_init().
+  // Genuine sliding decode_init always creates private streams+step_mutex.
+  if(!ds.async_ctx){
+    err="sliding KV requires initialized private request streams";
+    return false;
+  }
   if(ds.capacity!=DecodeState::MAX_CONTEXT || pos<0 ||
      pos>=SLIDING_KV_ABSOLUTE_POSITION_LIMIT || tok<0 || tok>=VOC){
     err="sliding KV invalid absolute position/token/capacity";
