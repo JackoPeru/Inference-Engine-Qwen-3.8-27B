@@ -350,6 +350,23 @@ if(Python3_Interpreter_FOUND)
       ${CMAKE_SOURCE_DIR}/tools/tests/test_generate_sliding_kv_args_cpu.py
       $<TARGET_FILE:test_generate_sliding_kv_host>)
   set_tests_properties(generate_sliding_kv_args_host_cpu PROPERTIES TIMEOUT 120)
+  # Reproducible host/source guards; none executes a CUDA kernel or grants a
+  # deployment lease. The external authority witness uses SYNTHETIC issuers.
+  add_test(NAME host_prefill_chunk_stream_barrier_cpu
+    COMMAND ${Python3_EXECUTABLE} -B
+      ${CMAKE_SOURCE_DIR}/distributed/tests/test_prefill_chunk_stream_barrier_cpu.py)
+  add_test(NAME host_async_stream_contract_cpu
+    COMMAND ${Python3_EXECUTABLE} -B
+      ${CMAKE_SOURCE_DIR}/distributed/test_async_stream_contract.py)
+  add_test(NAME host_external_authority_staging_cpu
+    COMMAND ${Python3_EXECUTABLE} -B -m unittest -v
+      ops.tests.test_external_monotonic_proof_staging)
+  set_tests_properties(
+    host_prefill_chunk_stream_barrier_cpu
+    host_async_stream_contract_cpu
+    host_external_authority_staging_cpu
+    PROPERTIES TIMEOUT 120 WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+      LABELS "cpu-only;source-contract;no-gpu")
   if(UNIX)
     add_test(NAME generate_logits_dump_atomic_host_cpu
       COMMAND test_generate_logits_dump_atomic_host)
