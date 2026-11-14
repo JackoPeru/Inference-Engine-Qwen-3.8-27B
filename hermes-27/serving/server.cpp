@@ -67,6 +67,7 @@ struct Config {
   int gpu1_start_limit_mib = 2500;
   bool continuous_scheduler = false; // Experimental opt-in; legacy is default.
   bool batched_prefill = false;       // Opt-in seeded PP2 prefill for prompts of <=64.
+  bool chunked_prefill = false;       // Experimental legacy-only T65..8192 RAW stateful seed.
   bool parallel_steps = false;        // Opt-in distinct-state concurrent scheduler waves.
 };
 
@@ -77,6 +78,7 @@ void usage(FILE* out) {
     "Optional: --tokenizer FILE --gguf-dump FILE --python FILE --model-id ID\n"
     "Experimental: --continuous-scheduler (single-owner PP2 scheduler, opt-in)\n"
     "Experimental: --batched-prefill (seed fresh PP2 state for prompts of 1..64 tokens)\n"
+    "Experimental: --chunked-prefill (legacy only, --active 1, HERMES_PP2_CHUNKED_PREFILL=1; RAW T65..8192, uses one-shot at T<=64)\n"
     "Experimental: --parallel-steps (continuous scheduler ONLY; requires HERMES_PP2_ASYNC_STREAMS=1; no seeded prefill)\n"
     "Greedy text-only PP2; context defaults to 128. Unsupported sampling/tools are rejected.\n");
 }
@@ -97,6 +99,11 @@ bool parse_args(int argc, char** argv, Config& cfg, bool& show_help) {
     if (arg == "--help" || arg == "-h") { usage(stdout); show_help = true; return false; }
     if (arg == "--continuous-scheduler") { cfg.continuous_scheduler = true; continue; }
     if (arg == "--batched-prefill") { cfg.batched_prefill = true; continue; }
+    if (arg == "--chunked-prefill") {
+      cfg.chunked_prefill = true;
+      cfg.batched_prefill = true; // same single state owner, no second scheduler
+      continue;
+    }
     if (arg == "--parallel-steps") { cfg.parallel_steps = true; continue; }
     if (i + 1 >= argc) { std::fprintf(stderr, "missing value for %s\n", arg.c_str()); return false; }
     const char* value = argv[++i];
@@ -404,7 +411,8 @@ class Scheduler {
  public:
   Scheduler(TokenizerBridge& tokenizer, int eos, const Config& cfg)
       : tokenizer_(tokenizer), eos_(eos), active_limit_(cfg.active), queue_limit_(cfg.queued),
-        queue_timeout_(cfg.queue_timeout_sec), batched_prefill_(cfg.batched_prefill) {
+        queue_timeout_(cfg.queue_timeout_sec), batched_prefill_(cfg.batched_prefill),
+        chunked_prefill_(cfg.chunked_prefill) {
     if (cfg.continuous_scheduler) {
       backend_ = std::make_unique<ServerContinuousBackend>();
       pp2batch::SchedulerConfig options;
@@ -893,20 +901,33 @@ class Scheduler {
   // T*VOC logits and invalidates/frees the state on failure; never retry the
   // old token-by-token loop on a partially seeded state.
   bool seed_legacy_prompt(const std::shared_ptr<Job>& job) {
-    if (!batched_prefill_ || job->prompt.size() > 64) return false;
+    if (!batched_prefill_ || (job->prompt.size() > 64 && !chunked_prefill_))
+      return false;
+    // Raw PP2 chunked prefill consumes an untouched DecodeState and returns
+    // exactly the LAST logits row. It cannot share this state with a replay
+    // scheduler, and a failed or cancelled chunk may have mutated GDN/KV.
+    const bool use_chunks = chunked_prefill_ && job->prompt.size() > 64;
     metrics_.prefill_attempts.fetch_add(1);
     pp2::Stats prefill_stats;
     std::string error;
     std::vector<float> logits;
     try {
-      logits = pp2::prefill_into_decode_state(
-          job->prompt, job->state, prefill_stats, error);
+      if (use_chunks) {
+        logits = pp2::prefill_chunks_into_decode_state(
+            job->prompt, job->state, prefill_stats, error, 64);
+      } else {
+        logits = pp2::prefill_into_decode_state(
+            job->prompt, job->state, prefill_stats, error);
+      }
     } catch (const std::exception& e) {
       error = e.what();
     } catch (...) {
       error = "unknown seeded prefill exception";
     }
-    if (logits.size() != job->prompt.size() * static_cast<std::size_t>(kVocab)) {
+    const std::size_t expected_logits = use_chunks
+        ? static_cast<std::size_t>(kVocab)
+        : job->prompt.size() * static_cast<std::size_t>(kVocab);
+    if (logits.size() != expected_logits) {
       metrics_.prefill_failed.fetch_add(1);
       // The PP2 helper normally frees/invalidates state on a failure;
       // rare early guard errors can leave it initialized. Never leak or
@@ -922,8 +943,8 @@ class Scheduler {
       complete(job, 200, {}, "cancelled");
       return true;
     }
-    const float* last = logits.data() +
-        (job->prompt.size() - 1) * static_cast<std::size_t>(kVocab);
+    const float* last = use_chunks ? logits.data() :
+        logits.data() + (job->prompt.size() - 1) * static_cast<std::size_t>(kVocab);
     int token = -1;
     float best = -std::numeric_limits<float>::infinity();
     for (int t = 0; t < kVocab; ++t) {
@@ -1089,6 +1110,7 @@ class Scheduler {
   int eos_;
   int active_limit_, queue_limit_, queue_timeout_;
   bool batched_prefill_ = false;
+  bool chunked_prefill_ = false;
   mutable std::mutex mutex_;
   std::condition_variable cv_;
   std::deque<std::shared_ptr<Job>> queue_;
@@ -1332,6 +1354,22 @@ int main(int argc, char** argv) {
       std::fprintf(stderr,
           "--parallel-steps requires --continuous-scheduler, "
           "HERMES_PP2_ASYNC_STREAMS=1, and forbids --batched-prefill (fail-closed)\n");
+      return 2;
+    }
+  }
+  if (cfg.chunked_prefill) {
+    const char* enable = std::getenv("HERMES_PP2_CHUNKED_PREFILL");
+    const char* gemv = std::getenv("HERMES_NVFP4_GEMV");
+    const char* async = std::getenv("HERMES_PP2_ASYNC_STREAMS");
+    if (cfg.continuous_scheduler || cfg.active != 1 ||
+        !enable || std::strcmp(enable, "1") != 0 ||
+        (gemv && std::strcmp(gemv, "packed4") == 0) ||
+        std::getenv("HERMES_L26") ||
+        (async && std::strcmp(async, "0") != 0)) {
+      std::fprintf(stderr,
+          "--chunked-prefill requires legacy scheduler, --active 1, "
+          "HERMES_PP2_CHUNKED_PREFILL=1, no async/multiuser/GEMV packed4/L26 "
+          "(strict fail-closed; experimental only)\n");
       return 2;
     }
   }

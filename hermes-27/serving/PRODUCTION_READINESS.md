@@ -212,3 +212,36 @@ run authorized exclusive-GPU N1/N2/N4 throughput and correctness
 tests with the same integrated source snapshot, including VRAM return
 to baseline and cancellation under real kernel load. Until that
 happens keep both experimental flags off in production.
+
+## Experimental legacy-only T65..8192 RAW chunked stateful HTTP prefill
+
+The new --chunked-prefill flag is a separate **non-default** diagnostic
+HTTP route. It implies --batched-prefill: T1..T64 uses the prior
+one-shot RAW stateful API, while T65..T8192 calls the existing
+PP2 prefill_chunks_into_decode_state once on the **same untouched
+DecodeState**, using at most 64 input tokens per chunk. It returns
+one final-token 248320-logit row. The legacy scheduler samples the
+first completion token from that row and continues at absolute T.
+It never replays seeded prompt positions or allocates a second state.
+
+Startup fails with exit code 2 before model upload unless all conditions
+are satisfied: legacy scheduler only, --active 1, exact
+HERMES_PP2_CHUNKED_PREFILL=1, async streams disabled, neither packed4
+GEMV nor HERMES_L26 debug enabled, and BF16 prefill disabled. This
+deliberately prevents unverified cross-request default-stream overlap.
+It does not improve multiuser concurrency. Normal --batched-prefill
+without this new flag retains the prior T65+ stepwise fallback;
+neither flag set retains the full legacy default.
+
+Partial chunk failure and nonfinite last logits terminate the request:
+the potentially poisoned state is never replayed or reused.
+At T8192 and max_new_tokens=1 the first completion can be sampled
+from the last prompt row without decoding position 8192. Continuation
+past 8192 is unavailable until separately proven KV eviction.
+
+See reports/HTTP_CHUNKED_PREFILL_CPU_GATE_2026-11-14.md for CPU/mock
+test evidence and native CUDA compilation. Prior standalone T129/T1024
+same-engine state/logit parity is not an HTTP GPU integration test.
+No throughput, independent llama fidelity or production readiness
+is established by CPU mocks. A GPU-exclusive quality gate and
+trusted ingress drain are still mandatory. Production remains NO-GO.

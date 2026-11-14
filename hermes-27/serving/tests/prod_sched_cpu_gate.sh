@@ -18,6 +18,7 @@ cp "$ROOT/distributed/pp2_batch.cu" "$SCRATCH/pp2_batch.cu"
 cp "$HERE/prod_sched_mock_pp2.cpp" "$SCRATCH/serving/tests/"
 cp "$HERE/prod_sched_launcher.py" "$HERE/prod_sched_state_test.py" \
    "$HERE/prod_sched_prefill_test.py" "$HERE/prod_sched_parallel_test.py" \
+   "$HERE/prod_sched_chunked_test.py" \
    "$HERE/test_production_http.py" "$HERE/test_stream_mock_http.py" \
    "$HERE/test_bytelevel_stream.py" "$SCRATCH/serving/tests/"
 cp "$HERE/mock_gguf_dump.py" "$SCRATCH/gguf_dump_fake.py"
@@ -49,6 +50,10 @@ echo "Continuous PP2 state ownership and cancellation (expected 7/7)"
 
 echo "Raw seeded opt-in prefill: legacy + continuous, T1/11/64/65 (expected 11/11)"
 "$PYTHON" "$SCRATCH/serving/tests/prod_sched_prefill_test.py" \
+    --server "$SCRATCH/build/hermes_server" "${COMMON[@]}"
+
+echo "Experimental legacy chunked seed: T64/65/129/8192, SSE, fallback + fail-closed (expected 7/7)"
+"$PYTHON" "$SCRATCH/serving/tests/prod_sched_chunked_test.py" \
     --server "$SCRATCH/build/hermes_server" "${COMMON[@]}"
 
 echo "Strict parallel-step admission + HTTP ownership (expected 2/2)"

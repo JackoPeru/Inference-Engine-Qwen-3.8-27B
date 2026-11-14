@@ -142,6 +142,45 @@ std::vector<float> prefill_into_decode_state(
   return logits;
 }
 
+// Real PP2's chunked API seeds one untouched state with 65..8192 tokens
+// and returns ONLY the final 248320-logit row, not T*VOC.
+std::vector<float> prefill_chunks_into_decode_state(
+    const std::vector<int>& ids, DecodeState& state, Stats& stats,
+    std::string& error, int chunk_tokens, std::vector<float>* h_last_out) {
+  const char* enabled = std::getenv("HERMES_PP2_CHUNKED_PREFILL");
+  if (!state.inited || state.ever_advanced || ids.size() < 65 ||
+      ids.size() > static_cast<std::size_t>(DecodeState::MAX_CONTEXT) ||
+      ids.size() > static_cast<std::size_t>(state.capacity) ||
+      chunk_tokens < 1 || chunk_tokens > 64 ||
+      !enabled || std::string(enabled) != "1") {
+    error = "mock chunked prefill requires explicit opt-in, fresh state and 65..8192";
+    if (state.inited) decode_free(state);
+    return {};
+  }
+  trace("chunked", static_cast<long>(ids.size()));
+  if (std::getenv("FAKE_CHUNKED_FAIL")) {
+    error = "forced mock partial chunk failure";
+    decode_free(state);
+    return {};
+  }
+  if (h_last_out) h_last_out->clear();
+  constexpr std::size_t VOC = 248320;
+  auto ids_script = fake_ids();
+  int next = ids_script[std::min(ids.size()-1, ids_script.size()-1)];
+  if (next < 0 || next >= static_cast<int>(VOC)) {
+    error = "invalid mock chunked token";
+    decode_free(state);
+    return {};
+  }
+  std::vector<float> logits(VOC, -100.0f);
+  logits[static_cast<std::size_t>(next)] = 100.0f;
+  if (std::getenv("FAKE_CHUNKED_NONFINITE"))
+    logits[0] = std::numeric_limits<float>::quiet_NaN();
+  stats.prefill_ms = 0.5;
+  state.ever_advanced = true;
+  return logits;
+}
+
 void decode_free(DecodeState& state) {
   if (!state.inited) return;
   state.inited = false;
