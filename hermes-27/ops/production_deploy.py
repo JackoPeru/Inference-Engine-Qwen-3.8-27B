@@ -316,8 +316,15 @@ def validate_lease(status: dict, state: dict) -> dict:
 def lease_guard(cfg: dict, state: dict) -> dict:
     if not service_active("hermes-gpu-manager.service"):
         raise DeploymentError("GPU Manager is no longer active while Hermes holds GPUs")
+    # During Hermes allocation Tabby must remain stopped even if GPU Manager
+    # has *already* switched back to LLM_READY. The previous dynamic expected
+    # state check accepted this mutually-consistent but unsafe restart and
+    # deferred rejection until a separate, later supervise() poll.
+    tabby_active = service_active("hermes-tabby.service")
+    if state.get("phase") in ("hermes-start", "hermes-watch") and tabby_active:
+        raise DeploymentError("Tabby restarted during Hermes GPU ownership")
     status = manager_status(cfg)
-    expected_state = ("LLM_READY" if service_active("hermes-tabby.service")
+    expected_state = ("LLM_READY" if tabby_active
                       else "HERMES_MAINTENANCE")
     if status.get("current_state") != expected_state:
         raise DeploymentError("GPU Manager has not acknowledged the leased maintenance state")
