@@ -646,7 +646,13 @@ static bool run_gdn_layer(int li, float* d_x, int T, std::string& err,
   f32_to_bf16_k<<<(int)(((size_t)T*FFN+255)/256),256>>>(d_hidb,d_hid,(int)((size_t)T*FFN));
   gemv_batch(d_hidb,(uint8_t*)wFd->d,d_down,FFN,HID,T);
   add_k<<<(int)((nH+255)/256),256>>>(d_x,d_down,(int)nH);
-  cudaError_t layer_result=cudaDeviceSynchronize();
+  // The chunked request owns these scratch buffers and launches all layer
+  // work on this host thread's default stream (including GEMV/GDN). Drain
+  // only that stream before the next layer reuses a slot; unrelated async
+  // decode streams own distinct request states and cudaStreamNonBlocking.
+  // Keep the original device-wide barrier for every non-pooled caller.
+  cudaError_t layer_result=pool ? cudaStreamSynchronize(0)
+                                : cudaDeviceSynchronize();
   if(layer_result!=cudaSuccess){
     err="GDN prefill layer "+std::to_string(li)+": "+cudaGetErrorString(layer_result);
     return false;
@@ -745,7 +751,12 @@ static bool run_full_layer(int li, float* d_x, int T, std::string& err,
   f32_to_bf16_k<<<(int)(((size_t)T*FFN+255)/256),256>>>(d_hidb,d_hid,(int)((size_t)T*FFN));
   gemv_batch(d_hidb,(uint8_t*)wFd->d,d_down,FFN,HID,T);
   add_k<<<(int)((nH+255)/256),256>>>(d_x,d_down,(int)nH);
-  cudaError_t layer_result=cudaDeviceSynchronize();
+  // The pooled chunk path uses only this device's default stream for Q/K/V
+  // projections, KV copies, causal attention, FFN and residual updates.
+  // Synchronize it before committing klen and reusing the scratch. Normal
+  // prefill and other non-pooled callers retain their old device barrier.
+  cudaError_t layer_result=pool ? cudaStreamSynchronize(0)
+                                : cudaDeviceSynchronize();
   if(layer_result!=cudaSuccess){
     err="full prefill layer "+std::to_string(li)+": "+cudaGetErrorString(layer_result);
     return false;

@@ -83,11 +83,16 @@ def main() -> int:
     assert "Nvfp4WarpExperiment::PackedU32x4,stream" in gemv_wrapper
     assert "Nvfp4GemvVariant::Warp4,stream" in gemv_wrapper
     assert "gdn_step_k<<<H,128,shm,stream>>>" in GDN
+    # The opt-in ring adds a second, mutually exclusive full-attention
+    # launch. Keep it stream-bound and guarded by the sliding_wrap branch.
+    full = section("static bool run_full_decode_layer(", "bool decode_init(")
+    assert "if(sliding_wrap){" in full
+    assert "sdpa_gqa_ring_decode_k<<<NQ,256,shared_bytes,stream>>>" in full
 
     kernels = sum(c[0] for c in counts)
     gemvs = sum(c[1] for c in counts)
     gdns = sum(c[2] for c in counts)
-    assert kernels == 29, f"expected 29 decode-layer launches, found {kernels}; review updates"
+    assert kernels == 30, f"expected 30 decode-layer launches, found {kernels}; review updates"
     assert gemvs == 14, f"expected 14 decode-layer GEMVs, found {gemvs}; review updates"
     assert gdns == 1, f"expected 1 decode-layer GDN step call, found {gdns}; review updates"
     assert launch_count == 3, (
