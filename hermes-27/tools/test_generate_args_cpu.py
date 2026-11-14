@@ -5,6 +5,9 @@ from __future__ import annotations
 
 import subprocess
 import sys
+import os
+import tempfile
+from pathlib import Path
 import unittest
 
 
@@ -60,6 +63,36 @@ class GenerateArgsCPU(unittest.TestCase):
         result = self.invoke("--batched-prefill", "--prompt-ids", "1")
         self.assertEqual(result.returncode, 2)
         self.assertIn("--model and at least one --prompt-ids", result.stderr)
+
+    def test_dump_rejects_world_readable_directory_before_model_load(self):
+        if os.name != "posix":
+            self.skipTest("POSIX owner-only permission contract")
+        with tempfile.TemporaryDirectory(prefix="h27-logits-dir-mode-") as d:
+            os.chmod(d, 0o755)
+            result = self.invoke(
+                "--model", "/definitely/not/a/model.gguf",
+                "--prompt-ids", "1", "--dump-logits-dir", d,
+            )
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("owner-only (0700)", result.stderr)
+            self.assertNotIn("upload failed", result.stderr)
+
+    def test_dump_rejects_symlink_directory_before_model_load(self):
+        with tempfile.TemporaryDirectory(prefix="h27-logits-dir-alias-") as d:
+            owner_dir = Path(d) / "owner-only"
+            owner_dir.mkdir(mode=0o700)
+            alias = Path(d) / "alias"
+            try:
+                alias.symlink_to(owner_dir, target_is_directory=True)
+            except (OSError, NotImplementedError):
+                self.skipTest("symlink creation unavailable")
+            result = self.invoke(
+                "--model", "/definitely/not/a/model.gguf",
+                "--prompt-ids", "1", "--dump-logits-dir", str(alias),
+            )
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("canonical existing directory", result.stderr)
+            self.assertNotIn("upload failed", result.stderr)
 
 
 if __name__ == "__main__":

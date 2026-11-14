@@ -1,16 +1,19 @@
 #include "pp2_fwd.hpp"
 
 #include <algorithm>
+#include <cerrno>
 #include <charconv>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
+#include <fcntl.h>
 #include <limits>
 #include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
+#include <sys/stat.h>
 
 #ifdef _WIN32
 #include <io.h>
@@ -65,9 +68,25 @@ bool dump_logits(const std::string& dir, std::size_t prompt_index, int step,
       dir + "/prompt_" + std::to_string(prompt_index) +
       "_step_" + std::to_string(step) + ".f32";
   const std::string partial = final_path + ".partial";
-  FILE* out = std::fopen(partial.c_str(), "wb");
+  // Exclusive private creation: a pre-existing partial/symlink must never
+  // be truncated. These optional dumps may contain private model activations.
+#ifdef _WIN32
+  const int fd = _open(partial.c_str(), _O_BINARY | _O_WRONLY | _O_CREAT |
+                      _O_EXCL, _S_IREAD | _S_IWRITE);
+#else
+  const int fd = ::open(partial.c_str(),
+                        O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+                        S_IRUSR | S_IWUSR);
+#endif
+  if(fd < 0) {
+    err = "logits dump: partial exists or cannot be exclusively created";
+    return false;
+  }
+  FILE* out = fdopen(fd, "wb");
   if(!out) {
-    err = "logits dump: cannot open " + partial;
+    close(fd);
+    std::remove(partial.c_str());
+    err = "logits dump: cannot open private partial";
     return false;
   }
   const std::size_t written = std::fwrite(logits.data(), sizeof(float), logits.size(), out);
@@ -77,9 +96,20 @@ bool dump_logits(const std::string& dir, std::size_t prompt_index, int step,
     err = "logits dump: short write or close error at " + partial;
     return false;
   }
-  if(std::rename(partial.c_str(), final_path.c_str()) != 0) {
+  // A hard-link within the SAME directory atomically creates the final name
+  // only when it does not exist. rename(2) would overwrite existing evidence
+  // on Linux, including a previously validated capture or final symlink.
+  std::error_code publish_error;
+  std::filesystem::create_hard_link(partial, final_path, publish_error);
+  if(publish_error) {
     std::remove(partial.c_str());
-    err = "logits dump: failed to finalize " + final_path;
+    err = "logits dump: target exists or atomic no-replace publish failed";
+    return false;
+  }
+  std::error_code cleanup_error;
+  std::filesystem::remove(partial, cleanup_error);
+  if(cleanup_error) {
+    err = "logits dump: private partial cleanup failed after publish";
     return false;
   }
   return true;
@@ -150,10 +180,22 @@ bool parse_options(int argc, char** argv, Options& opts) {
   }
   if(!opts.logits_dump_dir.empty()) {
     std::error_code ec;
-    if(!std::filesystem::is_directory(opts.logits_dump_dir, ec) || ec) {
-      std::fprintf(stderr, "ERROR: --dump-logits-dir requires an existing directory\n");
+    const auto root = std::filesystem::path(opts.logits_dump_dir);
+    const auto canonical_root = std::filesystem::canonical(root, ec);
+    if(ec || canonical_root != root.lexically_normal() ||
+       !std::filesystem::is_directory(root, ec) || ec) {
+      std::fprintf(stderr, "ERROR: --dump-logits-dir requires a canonical existing directory (no symlink aliases)\n");
       return false;
     }
+#ifndef _WIN32
+    struct stat st{};
+    if(::stat(opts.logits_dump_dir.c_str(), &st) != 0 ||
+       !S_ISDIR(st.st_mode) || st.st_uid != geteuid() ||
+       (st.st_mode & (S_IRWXG | S_IRWXO)) != 0) {
+      std::fprintf(stderr, "ERROR: --dump-logits-dir must be owner-only (0700)\n");
+      return false;
+    }
+#endif
   }
   for(std::size_t i = 0; i < opts.prompts.size(); ++i) {
     const auto size = opts.prompts[i].size();
