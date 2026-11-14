@@ -32,7 +32,7 @@ class Case:
 CASES = (
     Case("it-11", (6205, 161421, 303, 220, 17, 1374, 9911, 1147, 27053, 6059, 13)),
     Case("en-13", (8917, 5437, 537, 279, 10814, 314, 279, 8323, 21440, 303, 2250, 22157, 13)),
-    Case("chat-20", (248045, 846, 198, 49, 158648, 13138, 384, 1147, 183687, 272, 21817, 13,
+    Case("chat-21", (248045, 846, 198, 49, 158648, 13138, 384, 1147, 183687, 272, 21817, 13,
                       248046, 198, 248045, 74455, 198, 248068, 271, 248069, 271)),
     Case("short-4", (6205, 161421, 303, 220)),
 )
@@ -178,8 +178,11 @@ def main() -> int:
     args = p.parse_args()
     if args.tokens < 1 or args.tokens > 32 or args.timeout < 1:
         p.error("--tokens must be 1..32 and --timeout >= 1")
-    gguf = args.gguf.resolve(strict=True)
-    engine = args.engine.resolve(strict=True)
+    try:
+        gguf = args.gguf.resolve(strict=True)
+        engine = args.engine.resolve(strict=True)
+    except OSError as exc:
+        raise GateError(f"required GGUF or executable is missing: {exc}") from exc
     if not gguf.is_file() or not engine.is_file():
         p.error("--gguf and --engine must both name existing files")
     llama_url = args.llama_url.rstrip("/")
