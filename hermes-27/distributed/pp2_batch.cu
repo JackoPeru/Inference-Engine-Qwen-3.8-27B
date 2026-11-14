@@ -578,6 +578,10 @@ void ContinuousScheduler::emit_event(const std::shared_ptr<Job>& job,
   try {
     std::lock_guard<std::mutex> guard(mutex_);
     event.kind = kind;
+#ifdef HERMES_ADMISSION_CPU_ONLY
+    if (kind == EventKind::terminal && config_.terminal_before_event_id_copy)
+      config_.terminal_before_event_id_copy();
+#endif
     event.id = job->request.id;
     event.token_id = token_id;
     event.status = job->status;
@@ -593,6 +597,15 @@ void ContinuousScheduler::emit_event(const std::shared_ptr<Job>& job,
   } catch (...) {
     record_failure();
     if (kind == EventKind::terminal) {
+      // If copying the ID itself exhausted memory, a minimal event has no
+      // trustworthy recipient. Prefer the borrowed-ID emergency notifier
+      // over another allocation. Preserve the historical best-effort event
+      // retry when a caller has NOT installed that emergency notifier.
+      // This avoids regressing standalone consumers after a transient OOM.
+      if (event.id.empty() && config_.on_terminal_delivery_failure) {
+        wake_failure();
+        return;
+      }
       try {
         event.kind = EventKind::terminal;
         if (event.id.empty()) event.id = job->request.id;

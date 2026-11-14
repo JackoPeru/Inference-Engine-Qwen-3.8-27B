@@ -158,6 +158,9 @@ struct SchedulerConfig {
   // These are deliberately called while the metadata lock is held.
   std::function<void()> terminal_before_error_copy;
   std::function<void()> terminal_before_history_append;
+  // Simulates allocation failure before the event ID is copied. Unlike the
+  // payload hook below, this leaves no safe recipient for a minimal event.
+  std::function<void()> terminal_before_event_id_copy;
   // Called after the terminal ID is prepared but before copying its vector.
   std::function<void()> terminal_before_snapshot_copy;
   // CPU-only monotonic, thread-safe, nonblocking clock for deterministic
