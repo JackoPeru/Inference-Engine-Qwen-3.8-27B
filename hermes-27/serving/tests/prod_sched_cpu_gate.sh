@@ -19,6 +19,7 @@ cp "$HERE/prod_sched_mock_pp2.cpp" "$SCRATCH/serving/tests/"
 cp "$HERE/prod_sched_launcher.py" "$HERE/prod_sched_state_test.py" \
    "$HERE/prod_sched_prefill_test.py" "$HERE/prod_sched_parallel_test.py" \
    "$HERE/prod_sched_chunked_test.py" "$HERE/prod_sched_ready_test.py" \
+   "$HERE/prod_sched_ready_callback_test.py" \
    "$HERE/prod_sched_sliding_test.py" \
    "$HERE/test_production_http.py" "$HERE/test_stream_mock_http.py" \
    "$HERE/test_bytelevel_stream.py" "$SCRATCH/serving/tests/"
@@ -63,6 +64,10 @@ echo "Strict parallel-step admission + HTTP ownership (expected 2/2)"
 
 echo "Strict ready-completion startup, SSE/nonstream, and terminal fault recovery (expected 6/6)"
 "$PYTHON" "$SCRATCH/serving/tests/prod_sched_ready_test.py" \
+    --server "$SCRATCH/build/hermes_server" "${COMMON[@]}"
+
+echo "Strict ready callback delivery CPU HTTP, Unicode SSE and fault isolation (expected 5/5)"
+"$PYTHON" "$SCRATCH/serving/tests/prod_sched_ready_callback_test.py" \
     --server "$SCRATCH/build/hermes_server" "${COMMON[@]}"
 
 echo "Strict sliding-KV HTTP wrap, ownership, and startup guard (expected 5/5)"

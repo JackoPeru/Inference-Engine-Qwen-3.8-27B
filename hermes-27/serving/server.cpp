@@ -79,6 +79,7 @@ struct Config {
   bool chunked_prefill = false;       // Experimental legacy-only T65..8192 RAW stateful seed.
   bool parallel_steps = false;        // Opt-in distinct-state concurrent scheduler waves.
   bool ready_completion = false;      // Opt-in ready-per-request commit (no wave join HOL).
+  bool ready_callback_delivery = false; // Experimental opt-in: bounded per-job FIFO callback workers.
   bool sliding_kv = false;            // Strict opt-in legacy-only 8192-token rolling KV window.
 };
 
@@ -92,6 +93,7 @@ void usage(FILE* out) {
     "Experimental: --chunked-prefill (legacy only, --active 1, HERMES_PP2_CHUNKED_PREFILL=1; RAW T65..8192, uses one-shot at T<=64)\n"
     "Experimental: --parallel-steps (continuous scheduler ONLY; requires HERMES_PP2_ASYNC_STREAMS=1; no seeded prefill)\n"
     "Experimental: --ready-completion (requires --parallel-steps; commit ready states independently, default OFF)\n"
+    "Experimental: --ready-callback-delivery (requires ready, parallel, continuous, async, --active >=2; strict opt-in)\n"
     "Experimental: --sliding-kv (requires --chunked-prefill, --context 8192, --active 1, HERMES_PP2_SLIDING_KV=1; NOT full-history parity)\n"
     "Greedy text-only PP2; context defaults to 128. Unsupported sampling/tools are rejected.\n");
 }
@@ -119,6 +121,7 @@ bool parse_args(int argc, char** argv, Config& cfg, bool& show_help) {
     }
     if (arg == "--parallel-steps") { cfg.parallel_steps = true; continue; }
     if (arg == "--ready-completion") { cfg.ready_completion = true; continue; }
+    if (arg == "--ready-callback-delivery") { cfg.ready_callback_delivery = true; continue; }
     if (arg == "--sliding-kv") { cfg.sliding_kv = true; continue; }
     if (i + 1 >= argc) { std::fprintf(stderr, "missing value for %s\n", arg.c_str()); return false; }
     const char* value = argv[++i];
@@ -451,6 +454,7 @@ class Scheduler {
       options.enable_batched_prefill = cfg.batched_prefill;
       options.enable_parallel_steps = cfg.parallel_steps;
       options.enable_ready_completion_dispatch = cfg.ready_completion;
+      options.enable_ready_callback_delivery = cfg.ready_callback_delivery;
       options.on_event = [this](const pp2batch::SchedulerEvent& event) {
         continuous_event(event);
       };
@@ -1490,6 +1494,17 @@ int main(int argc, char** argv) {
         "and the asynchronous PP2 backend (strict opt-in)\n");
     return 2;
   }
+  if (cfg.ready_callback_delivery &&
+      (!cfg.ready_completion || !cfg.parallel_steps ||
+       !cfg.continuous_scheduler || cfg.active < 2 ||
+       std::getenv("HERMES_L26"))) {
+    std::fprintf(stderr,
+        "--ready-callback-delivery requires --continuous-scheduler "
+        "--parallel-steps --ready-completion, --active >=2 and "
+        "HERMES_PP2_ASYNC_STREAMS=1, and forbids HERMES_L26 "
+        "(strict opt-in)\n");
+    return 2;
+  }
   if (cfg.parallel_steps) {
     const char* async_flag = std::getenv("HERMES_PP2_ASYNC_STREAMS");
     if (!cfg.continuous_scheduler || cfg.batched_prefill ||
@@ -1524,6 +1539,7 @@ int main(int argc, char** argv) {
     // and a capacity other than the exact physical 8192-token ring.
     if (!cfg.sliding_kv || !sliding_env_enabled || !cfg.chunked_prefill ||
         cfg.continuous_scheduler || cfg.parallel_steps || cfg.ready_completion ||
+        cfg.ready_callback_delivery ||
         cfg.active != 1 || cfg.context != pp2::DecodeState::MAX_CONTEXT) {
       std::fprintf(stderr,
           "--sliding-kv requires explicit HERMES_PP2_SLIDING_KV=1, "

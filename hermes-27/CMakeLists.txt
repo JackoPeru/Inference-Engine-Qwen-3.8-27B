@@ -321,7 +321,8 @@ set(HERMES_HOST_SCHED_TESTS
   test_ready_completion_fault_hardening
   test_ready_observability_optin_scheduler
   test_ready_terminal_exception_id_copy
-  test_ready_fairness_credits_cpu)
+  test_ready_fairness_credits_cpu
+  test_ready_callback_delivery_hol_cpu)
 foreach(host_scheduler_test IN LISTS HERMES_HOST_SCHED_TESTS)
   add_executable(host_${host_scheduler_test}
     distributed/tests/pp2_batch_cpu_only.cpp
