@@ -24,6 +24,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <set>
 #include <string>
 #include <thread>
@@ -48,6 +49,12 @@ constexpr int kVocab = 248320; // Fixed vocabulary of the Qwen3.8-27B target mod
 constexpr std::size_t kMaxBody = 1024 * 1024;
 constexpr std::size_t kMaxBufferedStreamBytes = 1024 * 1024;
 constexpr std::size_t kMaxBufferedStreamChunks = 256;
+// Emergency SSE termination must be writable even when host allocations
+// fail while constructing the ordinary terminal JSON/usage frames.
+constexpr char kTerminalTransportFailureSse[] =
+    "data: {\"error\":{\"message\":\"request finalization failed\","
+    "\"type\":\"server_error\"}}\n\n"
+    "data: [DONE]\n\n";
 
 struct Config {
   std::string model = "/home/matteo/hermes-27/models/Qwen3.8-27B-Uncensored-NVFP4-MTP.gguf";
@@ -348,6 +355,9 @@ struct Job {
   bool state_ready = false;
   bool admitted = false; // Guarded by mutex: streaming HTTP headers wait for GPU admission.
   bool stream_started = false;
+  // Guarded by mutex. The HTTP SSE sender uses a static, allocation-free
+  // error+[DONE] payload when terminal JSON/queue construction has failed.
+  bool terminal_transport_failed = false;
   std::mutex mutex;
   std::condition_variable cv;
   std::deque<std::string> stream_chunks;
@@ -591,17 +601,18 @@ class Scheduler {
       std::lock_guard<std::mutex> lock(job->mutex);
       if (job->done.load()) return;
       job->http_status = 500;
+      // An already buffered success/finish chunk must not escape after
+      // terminalization failed partway through building the usage/SSE tail.
+      // Previously an exception could leave a success finish_reason in the
+      // queue, followed only by a best-effort [DONE].
       job->error.clear();
-      if (job->stream) {
-        // Best effort only: exhaustion may prevent an SSE delimiter, but
-        // cannot prevent done/notify and strand the requesting client.
-        try {
-          job->stream_chunks.emplace_back("data: [DONE]\n\n");
-          job->stream_buffered_bytes += job->stream_chunks.back().size();
-        } catch (...) {}
-      }
+      job->stream_chunks.clear();
+      job->stream_buffered_bytes = 0;
+      job->terminal_transport_failed = true;
       job->done.store(true);
     } catch (...) {
+      // The catch is an allocation-free last resort: even a failure to
+      // acquire/reset metadata may not leave non-stream HTTP asleep.
       job->done.store(true);
     }
     job->cv.notify_all();
@@ -871,30 +882,57 @@ class Scheduler {
       };
     }
 
+    // Construct the COMPLETE terminal SSE sequence before publishing any
+    // finish_reason/usage/[DONE]. If one allocation fails, the noexcept
+    // wrapper publishes the dedicated terminal-transport error instead of a
+    // partially successful response. Normal frames retain exact order.
+    std::string terminal_sse;
+    if (job->stream) {
+      if (status == 200) {
+        const char* reason = was_cancelled ? "cancelled"
+            : (job->stop_matched ? "stop" : finish_reason.c_str());
+        terminal_sse = "data: " + chunk(*job, json::object(), reason).dump() + "\n\n";
+#ifdef HERMES_ADMISSION_CPU_ONLY
+        // Inject after the normal success frame has been locally built but
+        // before usage/[DONE]. It must never become externally visible.
+        if (std::getenv("HERMES_TEST_FAIL_TERMINAL_USAGE_ONCE")) {
+          static std::atomic<unsigned> terminal_usage_failures{0};
+          if (terminal_usage_failures.fetch_add(1) == 0)
+            throw std::bad_alloc();
+        }
+#endif
+        if (job->include_usage) {
+          terminal_sse += "data: " + json({
+            {"id", job->id}, {"object", "chat.completion.chunk"}, {"created", job->created},
+            {"model", job->model}, {"choices", json::array()},
+            {"usage", {{"prompt_tokens", job->prompt.size()},
+                       {"completion_tokens", job->output.size()},
+                       {"total_tokens", job->prompt.size() + job->output.size()}}}
+          }).dump() + "\n\n";
+        }
+      } else {
+        terminal_sse = "data: " + json({
+          {"error", {{"message", error}, {"type", "server_error"}}}
+        }).dump() + "\n\n";
+      }
+      terminal_sse += "data: [DONE]\n\n";
+    }
     {
       std::lock_guard<std::mutex> lock(job->mutex);
       job->http_status = status;
       job->error = std::move(error);
       if (job->stream) {
-        if (status == 200) {
-          const char* reason = was_cancelled ? "cancelled" : (job->stop_matched ? "stop" : finish_reason.c_str());
-          push_stream_locked(*job, chunk(*job, json::object(), reason), true);
-          if (job->include_usage) {
-            const std::string usage_chunk = "data: " + json({
-              {"id", job->id}, {"object", "chat.completion.chunk"}, {"created", job->created},
-              {"model", job->model}, {"choices", json::array()},
-              {"usage", {{"prompt_tokens", job->prompt.size()},
-                         {"completion_tokens", job->output.size()},
-                         {"total_tokens", job->prompt.size() + job->output.size()}}}
-            }).dump() + "\n\n";
-            job->stream_buffered_bytes += usage_chunk.size();
-            job->stream_chunks.push_back(usage_chunk);
-          }
+        // A single deque insertion is the terminal commit point, rather
+        // than several separately visible success/usage/done pushes.
+#ifdef HERMES_ADMISSION_CPU_ONLY
+        if (std::getenv("HERMES_TEST_FAIL_TERMINAL_QUEUE_ONCE")) {
+          static std::atomic<unsigned> terminal_queue_failures{0};
+          if (terminal_queue_failures.fetch_add(1) == 0)
+            throw std::bad_alloc();
         }
-        else push_stream_locked(*job, {{"error", {{"message", job->error}, {"type", "server_error"}}}}, true);
-        static constexpr char done[] = "data: [DONE]\n\n";
-        job->stream_buffered_bytes += sizeof(done) - 1;
-        job->stream_chunks.emplace_back(done);
+#endif
+        job->stream_chunks.push_back(std::move(terminal_sse));
+        job->stream_buffered_bytes += job->stream_chunks.back().size();
       }
       job->done.store(true);
       job->cv.notify_all();
@@ -1637,7 +1675,8 @@ int main(int argc, char** argv) {
           job->cv.wait(lock, [&] { return job->admitted || job->done.load(); });
           if (!job->admitted && job->http_status != 200) {
             const int status = job->http_status;
-            const std::string error = job->error;
+            const std::string error = (status == 500 && job->error.empty())
+                ? "request finalization failed" : job->error;
             lock.unlock();
             scheduler.retire(job->id);
             if (status == 429 || status == 503) res.set_header("Retry-After", "1");
@@ -1656,6 +1695,21 @@ int main(int argc, char** argv) {
               {
                 std::unique_lock<std::mutex> lock(job->mutex);
                 job->cv.wait_for(lock, std::chrono::milliseconds(250), [&] { return !job->stream_chunks.empty() || job->done.load(); });
+                if (job->terminal_transport_failed) {
+                  // The callback already closed the PP2 state but could not
+                  // build its SSE terminal frames. Emit one static error and
+                  // [DONE], without heap allocations in the fallback path.
+                  job->stream_chunks.clear();
+                  job->stream_buffered_bytes = 0;
+                  lock.unlock();
+                  if (!sink.write(kTerminalTransportFailureSse,
+                                  sizeof(kTerminalTransportFailureSse) - 1)) {
+                    scheduler.cancel(job->id);
+                    return false;
+                  }
+                  sink.done();
+                  return true;
+                }
                 if (!job->stream_chunks.empty()) {
                   chunk_text = std::move(job->stream_chunks.front());
                   job->stream_buffered_bytes -= chunk_text.size();
@@ -1674,7 +1728,8 @@ int main(int argc, char** argv) {
       job->cv.wait(lock, [&] { return job->done.load(); });
       const int status = job->http_status;
       const json response = job->response;
-      const std::string error = job->error;
+      const std::string error = (status == 500 && job->error.empty())
+          ? "request finalization failed" : job->error;
       lock.unlock();
       scheduler.retire(job->id);
       if (status != 200) { res.set_header("Retry-After", "1"); set_error(res, status, error, status == 429 ? "rate_limit_error" : "server_error", "", status == 429 ? "overloaded" : "inference_error"); return; }
