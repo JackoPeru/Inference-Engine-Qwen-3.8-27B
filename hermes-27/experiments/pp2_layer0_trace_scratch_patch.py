@@ -25,9 +25,10 @@ POINT = (
     '  if(getenv("HERMES_L26") && li==26){'
 )
 DECODE_POINT = (
-    '  if(ds.async_ctx) return decode_step_async(tok,ds,pos,err);\n'
-    '  ds.ever_advanced=true;'
+    '  ds.ever_advanced=true;\n'
+    '  cudaSetDevice(0);'
 )
+ASYNC_POINT = '  if(ds.async_ctx) return decode_step_async(tok,ds,pos,err);'
 TAG = "HERMES_SCRATCH_LAYER0_TRACE_DIR"
 
 HELPER = r'''
@@ -61,6 +62,16 @@ static bool l0_trace_scratch(
   if (!root || std::strncmp(root, "/tmp/h27-", 9) != 0 ||
       std::strstr(root, "..") || std::strlen(root) > 180) {
     err = "scratch layer0 path must be an existing /tmp/h27-* directory";
+    return false;
+  }
+  // Refuse path aliases/symlinked scratch folders. No production path may be
+  // reached by swapping a simple /tmp/h27-* prefix into another directory.
+  // The caller must create a fresh canonical scratch directory beforehand.
+  const std::filesystem::path root_path(root);
+  std::error_code path_error;
+  const auto canonical_root = std::filesystem::canonical(root_path, path_error);
+  if (path_error || canonical_root != root_path.lexically_normal()) {
+    err = "scratch layer0 directory is missing, noncanonical or symlinked";
     return false;
   }
   if (sequence > 1) {
@@ -168,8 +179,9 @@ static bool l0_trace_scratch(
 CAPTURE = r'''  // Optional, strictly scratch-only, single-request two-token probe.
   // Must run through serial decode_step with prompt [6205,161421].
   if (li == 0 && std::getenv("HERMES_SCRATCH_LAYER0_TRACE_DIR")) {
-    if (std::getenv("HERMES_PP2_ASYNC_STREAMS")) {
-      err = "scratch layer0 capture refuses async/multiuser mode";
+    if (std::getenv("HERMES_PP2_ASYNC_STREAMS") ||
+        ds.async_ctx || ds.sliding_kv_enabled) {
+      err = "scratch layer0 capture refuses async/multiuser/sliding mode";
       return false;
     }
     const unsigned trace_sequence =
@@ -200,17 +212,31 @@ def patched_source(source: str) -> str:
     if TAG in source:
         raise Blocked("source already contains scratch trace; refuse double patch")
     if (source.count(INCLUDE) != 1 or source.count(BEGIN) != 1 or
-            source.count(POINT) != 1 or source.count(DECODE_POINT) != 1):
+            source.count(POINT) != 1 or source.count(ASYNC_POINT) != 1 or
+            source.count(DECODE_POINT) != 1):
         raise Blocked("PP2 source layout changed: exact anchors not verified")
-    result = source.replace(INCLUDE, INCLUDE + "#include <atomic>\n", 1)
+    result = source.replace(INCLUDE,
+                            INCLUDE + "#include <atomic>\n#include <filesystem>\n", 1)
     result = result.replace(BEGIN, HELPER + "\n" + BEGIN, 1)
     result = result.replace(POINT, POINT.split("\n")[0] + "\n" + CAPTURE +
                             "  if(getenv(\"HERMES_L26\") && li==26){", 1)
+    # Fail at the public dispatch boundary. In particular, sliding KV
+    # automatically creates an async context even without ASYNC_STREAMS=1:
+    # otherwise a scratch request silently skips layer0 instrumentation.
+    result = result.replace(ASYNC_POINT,
+                            '  if(std::getenv("HERMES_SCRATCH_LAYER0_TRACE_DIR") &&\n'
+                            '     (ds.async_ctx || ds.sliding_kv_enabled ||\n'
+                            '      std::getenv("HERMES_PP2_ASYNC_STREAMS"))){\n'
+                            '    err="scratch layer0 trace refuses asynchronous/sliding dispatch";\n'
+                            '    return {};\n'
+                            '  }\n' + ASYNC_POINT, 1)
+    # Sliding KV introduced a preflight block between the async dispatch
+    # and ever_advanced assignment. Bind only after that block, inside the
+    # original serial decode_step, never inside the async entrypoint.
     result = result.replace(DECODE_POINT,
-                            DECODE_POINT.split("\n")[0] + "\n"
                             "  L0TraceScope actual_decode_token(tok,pos,&ds);\n"
-                            "  ds.ever_advanced=true;", 1)
-    if result.count(TAG) != 2:
+                            + DECODE_POINT, 1)
+    if result.count(TAG) != 3:
         raise Blocked("scratch trace insertion incomplete")
     return result
 

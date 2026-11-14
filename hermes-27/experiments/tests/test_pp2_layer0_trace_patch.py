@@ -28,15 +28,26 @@ class ScratchLayer0Test(unittest.TestCase):
 
     def test_real_source_exact_one_anchor_and_no_side_effect(self):
         patched = p.patched_source(self.original)
-        self.assertEqual(patched.count(p.TAG), 2)
+        self.assertEqual(patched.count(p.TAG), 3)
         self.assertEqual(patched.count("static bool run_gdn_decode_layer"), 1)
         self.assertEqual(patched.count("l0_trace_scratch("), 2)
         self.assertIn("cudaStreamSynchronize(stream)", patched)
         self.assertIn('std::fopen(filename, "wbx")', patched)
         self.assertIn('L0TraceScope actual_decode_token(tok,pos,&ds);', patched)
+        self.assertIn('const auto canonical_root = std::filesystem::canonical(', patched)
+        self.assertIn('canonical_root != root_path.lexically_normal()', patched)
+        self.assertIn('ds.async_ctx || ds.sliding_kv_enabled', patched)
+        self.assertIn('scratch layer0 trace refuses asynchronous/sliding dispatch', patched)
+        self.assertLess(patched.index('scratch layer0 trace refuses asynchronous/sliding dispatch'),
+                        patched.index(p.ASYNC_POINT))
         self.assertIn('"%s/p%u_context.txt"', patched)
         self.assertIn('invocation.token != expected_tokens[sequence]', patched)
         self.assertIn('g_l0_trace_state.compare_exchange_strong', patched)
+        # The scratch hook must be attached to serial decode after the
+        # original async/sliding validation, not to the async codepath.
+        self.assertIn(
+            '  L0TraceScope actual_decode_token(tok,pos,&ds);\n'
+            '  ds.ever_advanced=true;\n  cudaSetDevice(0);', patched)
         self.assertEqual(self.original, SOURCE.read_text(encoding="utf-8"))
 
     def test_all_required_shapes_and_names(self):
@@ -64,6 +75,9 @@ class ScratchLayer0Test(unittest.TestCase):
         with self.assertRaisesRegex(p.Blocked, "exact anchors"):
             p.patched_source(self.original.replace(
                 p.DECODE_POINT, '  ds.ever_advanced=true;', 1))
+        with self.assertRaisesRegex(p.Blocked, "exact anchors"):
+            p.patched_source(self.original.replace(
+                p.ASYNC_POINT, '  if(false) return {};', 1))
 
     def test_repatch_and_preexisting_output_rejected(self):
         patched = p.patched_source(self.original)
@@ -105,7 +119,7 @@ class ScratchLayer0Test(unittest.TestCase):
     def test_no_implict_trace_output_without_opt_in(self):
         patched = p.patched_source(self.original)
         self.assertIn('li == 0 && std::getenv("HERMES_SCRATCH_LAYER0_TRACE_DIR")', patched)
-        self.assertIn("capture refuses async/multiuser mode", patched)
+        self.assertIn("capture refuses async/multiuser/sliding mode", patched)
         self.assertIn("scratch layer0 trace limited to exactly two decode tokens", patched)
         self.assertIn("cudaMemcpyDeviceToHost", patched)
         self.assertNotIn("cudaDeviceReset(", patched)
