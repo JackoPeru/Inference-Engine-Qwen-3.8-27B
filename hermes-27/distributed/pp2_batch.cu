@@ -209,6 +209,12 @@ bool admit_mixed(const std::vector<int>& capacities, std::string& detail) {
 struct ContinuousScheduler::Job {
   ScheduledRequest request;
   SchedulerClock::time_point queued_at;
+  // Anonymous per-state timing scratch. The pump owns admission/commit;
+  // exactly one backend worker writes step start/end for a state at a time.
+  // Relaxed atomics are safe because the pump joins before reading them.
+  std::int64_t observed_queued_ns = 0;
+  std::atomic<std::int64_t> observed_step_begin_ns{0};
+  std::atomic<std::int64_t> observed_step_end_ns{0};
   int capacity = 0;
   JobStatus status = JobStatus::queued;
   bool cancel_requested = false;
@@ -220,6 +226,131 @@ struct ContinuousScheduler::Job {
   std::string error;
   void* state = nullptr; // exclusively owned by the scheduler pump
 };
+
+namespace {
+void saturating_observation(std::uint64_t& count, std::uint64_t& total,
+                            std::uint64_t& maximum, std::int64_t begin,
+                            std::int64_t end) noexcept {
+  if (begin <= 0 || end < begin) return;
+  const auto elapsed = static_cast<std::uint64_t>(end - begin);
+  if (count != UINT64_MAX) ++count;
+  total = elapsed > UINT64_MAX - total ? UINT64_MAX : total + elapsed;
+  maximum = std::max(maximum, elapsed);
+}
+}  // namespace
+
+std::int64_t ContinuousScheduler::observation_now_ns() const noexcept {
+  if (!config_.enable_observability) return 0;
+  try {
+#ifdef HERMES_ADMISSION_CPU_ONLY
+    const auto now = config_.observability_now
+                         ? config_.observability_now() : SchedulerClock::now();
+#else
+    const auto now = SchedulerClock::now();
+#endif
+    const auto nanos =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            now.time_since_epoch()).count();
+    return nanos > 0 ? nanos : 0;
+  } catch (...) {
+    // Host observation is never allowed to make the inference loop fail.
+    return 0;
+  }
+}
+
+void ContinuousScheduler::observe_step_begin(Job& job) noexcept {
+  job.observed_step_end_ns.store(0, std::memory_order_relaxed);
+  job.observed_step_begin_ns.store(observation_now_ns(),
+                                   std::memory_order_relaxed);
+}
+
+void ContinuousScheduler::observe_step_end(Job& job) noexcept {
+  job.observed_step_end_ns.store(observation_now_ns(),
+                                 std::memory_order_relaxed);
+}
+
+void ContinuousScheduler::observe_step_joined_locked(const Job& job) noexcept {
+  if (!config_.enable_observability) return;
+  saturating_observation(
+      counters_.observed_backend_steps,
+      counters_.backend_step_ns_total, counters_.backend_step_ns_max,
+      job.observed_step_begin_ns.load(std::memory_order_relaxed),
+      job.observed_step_end_ns.load(std::memory_order_relaxed));
+}
+
+void ContinuousScheduler::observe_queue_admission(
+    const std::shared_ptr<Job>& job) noexcept {
+  if (!config_.enable_observability) return;
+  const auto end = observation_now_ns();
+  try {
+    std::lock_guard<std::mutex> guard(mutex_);
+    saturating_observation(counters_.observed_queue_admissions,
+                           counters_.queue_wait_ns_total,
+                           counters_.queue_wait_ns_max,
+                           job->observed_queued_ns, end);
+  } catch (...) {}
+}
+
+void ContinuousScheduler::observe_token_commit(
+    const std::shared_ptr<Job>& job) noexcept {
+  if (!config_.enable_observability) return;
+  const auto end = observation_now_ns();
+  try {
+    std::lock_guard<std::mutex> guard(mutex_);
+    saturating_observation(
+        counters_.observed_token_commits,
+        counters_.backend_ready_to_token_commit_ns_total,
+        counters_.backend_ready_to_token_commit_ns_max,
+        job->observed_step_end_ns.load(std::memory_order_relaxed), end);
+  } catch (...) {}
+}
+
+void ContinuousScheduler::observe_terminal_locked(
+    const Job& job, JobStatus status, std::int64_t end) noexcept {
+  if (!config_.enable_observability || status != JobStatus::completed)
+    return;
+  const auto begin = job.observed_step_end_ns.load(std::memory_order_relaxed);
+  if (config_.enable_ready_completion_dispatch)
+    saturating_observation(counters_.observed_ready_terminals,
+                           counters_.ready_terminal_ns_total,
+                           counters_.ready_terminal_ns_max, begin, end);
+  else if (config_.enable_parallel_steps)
+    saturating_observation(counters_.observed_wave_terminals,
+                           counters_.wave_terminal_ns_total,
+                           counters_.wave_terminal_ns_max, begin, end);
+  else
+    saturating_observation(counters_.observed_serial_terminals,
+                           counters_.serial_terminal_ns_total,
+                           counters_.serial_terminal_ns_max, begin, end);
+}
+
+void ContinuousScheduler::observe_callback(
+    EventKind kind, std::int64_t began_ns) noexcept {
+  if (!config_.enable_observability) return;
+  const auto end = observation_now_ns();
+  try {
+    std::lock_guard<std::mutex> guard(mutex_);
+    saturating_observation(counters_.observed_callbacks,
+                           counters_.callback_ns_total,
+                           counters_.callback_ns_max, began_ns, end);
+    if (kind == EventKind::terminal)
+      saturating_observation(counters_.observed_terminal_callbacks,
+                             counters_.terminal_callback_ns_total,
+                             counters_.terminal_callback_ns_max,
+                             began_ns, end);
+  } catch (...) {}
+}
+
+void ContinuousScheduler::observe_outstanding(
+    std::size_t outstanding) noexcept {
+  if (!config_.enable_observability) return;
+  try {
+    std::lock_guard<std::mutex> guard(mutex_);
+    counters_.outstanding_step_high_water =
+        std::max(counters_.outstanding_step_high_water,
+                 static_cast<std::uint64_t>(outstanding));
+  } catch (...) {}
+}
 
 ContinuousScheduler::ContinuousScheduler(SchedulerConfig config, StepBackend& backend)
     : config_(config), backend_(backend) {
@@ -245,6 +376,7 @@ ContinuousScheduler::ContinuousScheduler(SchedulerConfig config, StepBackend& ba
     throw std::invalid_argument(
         "ready completion requires parallel async backend and forbids seeded prefill");
   }
+  counters_.observability_enabled = config_.enable_observability;
 }
 
 ContinuousScheduler::~ContinuousScheduler() { shutdown(); }
@@ -319,6 +451,8 @@ SubmitResult ContinuousScheduler::enqueue(ScheduledRequest request,
     return {SubmitCode::memory_limit, std::move(estimate)};
   }
 
+  const auto queued_observation = config_.enable_observability
+                                      ? observation_now_ns() : 0;
   std::lock_guard<std::mutex> guard(mutex_);
   if (stopping_) { ++counters_.rejected_total; return {SubmitCode::stopped, "scheduler stopped"}; }
   if (jobs_.count(request.id)) {
@@ -333,9 +467,14 @@ SubmitResult ContinuousScheduler::enqueue(ScheduledRequest request,
   job->capacity = capacity;
   job->queued_at = now;
   job->request = std::move(request);
+  job->observed_queued_ns = queued_observation;
   jobs_[job->request.id] = job;
   waiting_.push_back(std::move(job));
   ++counters_.accepted_total;
+  if (config_.enable_observability)
+    counters_.queued_high_water =
+        std::max(counters_.queued_high_water,
+                 static_cast<std::uint64_t>(waiting_.size()));
   return {SubmitCode::accepted, {}};
 }
 
@@ -422,6 +561,20 @@ void ContinuousScheduler::emit_event(const std::shared_ptr<Job>& job,
       record_failure();
     }
   };
+  // Timing wraps only the actual sink invocation, never holds mutex_ during
+  // user code and samples even if the sink throws.
+  const auto deliver = [&](const SchedulerEvent& snapshot) noexcept {
+    const auto began = config_.enable_observability ? observation_now_ns() : 0;
+    bool success = true;
+    try {
+      config_.on_event(snapshot);
+    } catch (...) {
+      success = false;
+      record_failure();
+    }
+    if (config_.enable_observability) observe_callback(kind, began);
+    return success;
+  };
   try {
     std::lock_guard<std::mutex> guard(mutex_);
     event.kind = kind;
@@ -446,11 +599,8 @@ void ContinuousScheduler::emit_event(const std::shared_ptr<Job>& job,
         event.status = JobStatus::failed;
         event.generated.clear();
         event.error.clear();
-        config_.on_event(event);
-        return;
-      } catch (...) {
-        record_failure();
-      }
+        if (deliver(event)) return;
+      } catch (...) { record_failure(); }
       wake_failure();
     }
     return;
@@ -458,16 +608,13 @@ void ContinuousScheduler::emit_event(const std::shared_ptr<Job>& job,
   // Callbacks can signal the HTTP request's condition variable or invoke
   // cancel/inspect/retire safely. A throwing consumer cannot tear down the
   // GPU scheduling loop; callback_errors_total exposes this failure.
-  try {
-    config_.on_event(event);
-  } catch (...) {
-    record_failure();
-    wake_failure();
-  }
+  if (!deliver(event)) wake_failure();
 }
 
 void ContinuousScheduler::finish(const std::shared_ptr<Job>& job, JobStatus status,
                                   const std::string& error) {
+  const auto terminal_observation =
+      config_.enable_observability ? observation_now_ns() : 0;
   void* state = nullptr;
   bool retained = true;
   {
@@ -490,6 +637,8 @@ void ContinuousScheduler::finish(const std::shared_ptr<Job>& job, JobStatus stat
     state = job->state;
     job->state = nullptr;
     job->status = status;
+    if (config_.enable_observability)
+      observe_terminal_locked(*job, status, terminal_observation);
     if (status == JobStatus::completed) ++counters_.completed_total;
     else if (status == JobStatus::cancelled) ++counters_.cancelled_total;
     else if (status == JobStatus::expired) ++counters_.expired_total;
@@ -567,12 +716,17 @@ void ContinuousScheduler::promote(std::size_t& remaining_admissions,
       if (!cancelled) {
         job->status = JobStatus::active;
         running_.push_back(job);
+        if (config_.enable_observability)
+          counters_.active_high_water =
+              std::max(counters_.active_high_water,
+                       static_cast<std::uint64_t>(running_.size()));
       }
     }
     if (cancelled) {
       finish(job, JobStatus::cancelled);
       continue;
     }
+    if (config_.enable_observability) observe_queue_admission(job);
 
     // Explicit opt-in: seed the SAME freshly opened state in a single
     // T-token PP2 pass, before HTTP sees 'admitted'. An attempted prefill
@@ -727,6 +881,10 @@ std::size_t ContinuousScheduler::tick(SchedulerClock::time_point now) {
     std::vector<float> logits;
     std::string error;
     bool ok = false;
+    if (config_.enable_observability) {
+      observe_outstanding(1);
+      observe_step_begin(*job);
+    }
     try {
       ok = backend_.step(job->state, token, position, logits, error);
     } catch (const std::exception& e) {
@@ -734,10 +892,12 @@ std::size_t ContinuousScheduler::tick(SchedulerClock::time_point now) {
     } catch (...) {
       error = "backend step threw an unknown exception";
     }
+    if (config_.enable_observability) observe_step_end(*job);
     ++decoded;
     {
       std::lock_guard<std::mutex> guard(mutex_);
       ++counters_.decode_steps_total;
+      if (config_.enable_observability) observe_step_joined_locked(*job);
       cancelled = job->cancel_requested;
     }
     if (cancelled) { finish(job, JobStatus::cancelled); continue; }
@@ -773,7 +933,10 @@ std::size_t ContinuousScheduler::tick(SchedulerClock::time_point now) {
              (job->generated.back() == config_.eos_token_id ||
               job->generated.size() >= static_cast<size_t>(job->request.max_new_tokens));
     }
-    if (produced_token) emit_event(job, EventKind::token, best_id);
+    if (produced_token) {
+      if (config_.enable_observability) observe_token_commit(job);
+      emit_event(job, EventKind::token, best_id);
+    }
     if (done) {
       bool cancelled_now;
       {
@@ -857,6 +1020,8 @@ std::size_t ContinuousScheduler::tick_ready(
         if (!tasks[i].accounted) {
           ++counters_.decode_steps_total;
           ++counters_.parallel_dispatched_steps_total;
+          if (config_.enable_observability)
+            observe_step_joined_locked(*tasks[i].job);
           tasks[i].accounted = true;
         }
       }
@@ -980,6 +1145,7 @@ std::size_t ContinuousScheduler::tick_ready(
         work.worker = std::thread([this, &tasks, &ready_mutex, &ready_cv,
                                    &ready_indices, &ready_published, index] {
           auto& own = tasks[index];
+          if (config_.enable_observability) observe_step_begin(*own.job);
           try {
             own.ok = backend_.step(own.job->state, own.token, own.position,
                                    own.logits, own.error);
@@ -992,6 +1158,7 @@ std::size_t ContinuousScheduler::tick_ready(
             try { own.error = "backend ready step threw unknown exception"; }
             catch (...) { own.error.clear(); }
           }
+          if (config_.enable_observability) observe_step_end(*own.job);
           // The queue is bounded by steps_per_tick <= 16. A worker only
           // publishes its index after writing the result. The CV mutex
           // and a subsequent join establish happens-before for the pump.
@@ -1028,6 +1195,8 @@ std::size_t ContinuousScheduler::tick_ready(
       }
       ++launched;
       ++outstanding;
+      if (config_.enable_observability)
+        observe_outstanding(outstanding);
       pending_launch.reset();
     }
 
@@ -1066,6 +1235,8 @@ std::size_t ContinuousScheduler::tick_ready(
       work.job->ready_step_in_flight = false;
       ++counters_.decode_steps_total;
       ++counters_.parallel_dispatched_steps_total;
+      if (config_.enable_observability)
+        observe_step_joined_locked(*work.job);
       work.accounted = true;
       cancelled = stopping_ || work.job->cancel_requested;
     }
@@ -1116,7 +1287,10 @@ std::size_t ContinuousScheduler::tick_ready(
               work.job->generated.size() >=
                   static_cast<std::size_t>(work.job->request.max_new_tokens));
     }
-    if (produced_token) emit_event(work.job, EventKind::token, best_id);
+    if (produced_token) {
+      if (config_.enable_observability) observe_token_commit(work.job);
+      emit_event(work.job, EventKind::token, best_id);
+    }
     bool cancelled_after_event;
     {
       std::lock_guard<std::mutex> guard(mutex_);
@@ -1222,6 +1396,7 @@ std::size_t ContinuousScheduler::tick_parallel(
         if (cancelled) continue;
         workers.emplace_back([this, &wave, i]() {
           auto& work = wave[i];
+          if (config_.enable_observability) observe_step_begin(*work.job);
           try {
             work.ok = backend_.step(work.job->state, work.token, work.position,
                                     work.logits, work.error);
@@ -1230,6 +1405,7 @@ std::size_t ContinuousScheduler::tick_parallel(
           } catch (...) {
             work.error = "backend parallel step threw an unknown exception";
           }
+          if (config_.enable_observability) observe_step_end(*work.job);
         });
         wave[i].launched = true;
       }
@@ -1248,6 +1424,13 @@ std::size_t ContinuousScheduler::tick_parallel(
       if (!workers.empty()) ++counters_.parallel_waves_total;
       counters_.parallel_dispatched_steps_total += workers.size();
       counters_.decode_steps_total += workers.size();
+      if (config_.enable_observability) {
+        counters_.outstanding_step_high_water =
+            std::max(counters_.outstanding_step_high_water,
+                     static_cast<std::uint64_t>(workers.size()));
+        for (const auto& work : wave)
+          if (work.launched) observe_step_joined_locked(*work.job);
+      }
     }
     decoded += workers.size();
     for (auto& work : wave) {
@@ -1310,7 +1493,10 @@ std::size_t ContinuousScheduler::tick_parallel(
                 work.job->generated.size() >=
                     static_cast<std::size_t>(work.job->request.max_new_tokens));
       }
-      if (produced_token) emit_event(work.job, EventKind::token, best_id);
+      if (produced_token) {
+        if (config_.enable_observability) observe_token_commit(work.job);
+        emit_event(work.job, EventKind::token, best_id);
+      }
       // Token callbacks may request cancellation for a full SSE queue.
       // Do not issue another decode step for that request; promptly reap it.
       bool cancelled_after_event;

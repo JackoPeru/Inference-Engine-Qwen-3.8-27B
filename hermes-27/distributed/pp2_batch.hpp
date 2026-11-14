@@ -5,8 +5,10 @@
 // (S/CS/KV per request; KV attualmente FP32, 64KiB/tok/req/GPU,
 // piu` ~75MiB/req/GPU per stati GDN/conv e workspace).
 #include "pp2_fwd.hpp"
+#include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <deque>
 #include <functional>
 #include <memory>
@@ -139,6 +141,11 @@ struct SchedulerConfig {
   // advertises this under HERMES_PP2_ASYNC_STREAMS=1. Seeded prefill is
   // incompatible with this path. Default false keeps old wave-join behavior.
   bool enable_ready_completion_dispatch = false;
+  // Opt-in anonymous, aggregate host-side scheduler timing. Never records
+  // prompt text, token IDs, request IDs, or any per-request history; default
+  // false costs only a few predictable branches along the scheduling path.
+  // No GPU synchronization is performed to collect these CPU wall times.
+  bool enable_observability = false;
 #ifdef HERMES_ADMISSION_CPU_ONLY
   // CPU-ONLY deterministic std::thread-construction failure injection.
   // Not included in production/CUDA SchedulerConfig builds.
@@ -153,6 +160,10 @@ struct SchedulerConfig {
   std::function<void()> terminal_before_history_append;
   // Called after the terminal ID is prepared but before copying its vector.
   std::function<void()> terminal_before_snapshot_copy;
+  // CPU-only monotonic, thread-safe, nonblocking clock for deterministic
+  // tests. Must not call back into the scheduler or take application locks.
+  // Used only with enable_observability=true; production uses steady_clock.
+  std::function<SchedulerClock::time_point()> observability_now;
 #endif
   // Synchronous, optional event sink: no callbacks under metadata lock.
   // Must be thread-safe: queued cancellation calls it from the canceller,
@@ -190,6 +201,32 @@ struct SchedulerMetrics {
   std::size_t callback_errors_total = 0;
   std::size_t terminal_delivery_failures_total = 0;
   std::size_t terminal_history_failures_total = 0;
+  // Enabled only by SchedulerConfig::enable_observability. Values are
+  // saturating uint64 nanosecond sums/maxima with bounded constant-size
+  // storage. A count == 0 means the duration was never sampled.
+  bool observability_enabled = false;
+  std::uint64_t observed_queue_admissions = 0;
+  std::uint64_t queue_wait_ns_total = 0, queue_wait_ns_max = 0;
+  std::uint64_t observed_backend_steps = 0;
+  std::uint64_t backend_step_ns_total = 0, backend_step_ns_max = 0;
+  std::uint64_t observed_token_commits = 0;
+  std::uint64_t backend_ready_to_token_commit_ns_total = 0;
+  std::uint64_t backend_ready_to_token_commit_ns_max = 0;
+  // Terminal latency is measured only for successful completed jobs after a
+  // backend step, not for queue cancellation, expiration or backend failure.
+  std::uint64_t observed_ready_terminals = 0;
+  std::uint64_t ready_terminal_ns_total = 0, ready_terminal_ns_max = 0;
+  std::uint64_t observed_wave_terminals = 0;
+  std::uint64_t wave_terminal_ns_total = 0, wave_terminal_ns_max = 0;
+  std::uint64_t observed_serial_terminals = 0;
+  std::uint64_t serial_terminal_ns_total = 0, serial_terminal_ns_max = 0;
+  std::uint64_t observed_callbacks = 0;
+  std::uint64_t callback_ns_total = 0, callback_ns_max = 0;
+  std::uint64_t observed_terminal_callbacks = 0;
+  std::uint64_t terminal_callback_ns_total = 0, terminal_callback_ns_max = 0;
+  std::uint64_t queued_high_water = 0;
+  std::uint64_t active_high_water = 0;
+  std::uint64_t outstanding_step_high_water = 0;
 };
 
 enum class PrefillResult { unsupported, success, failed, seeded = success };
@@ -257,6 +294,17 @@ class ContinuousScheduler {
   void trim_finished_locked();
   bool retain_finished_locked(const std::shared_ptr<Job>& job) noexcept;
   void forget_unretained(const std::shared_ptr<Job>& job) noexcept;
+  std::int64_t observation_now_ns() const noexcept;
+  void observe_step_begin(Job& job) noexcept;
+  void observe_step_end(Job& job) noexcept;
+  // Must be called with mutex_ held, exactly once for each joined step.
+  void observe_step_joined_locked(const Job& job) noexcept;
+  void observe_queue_admission(const std::shared_ptr<Job>& job) noexcept;
+  void observe_token_commit(const std::shared_ptr<Job>& job) noexcept;
+  void observe_terminal_locked(const Job& job, JobStatus status,
+                               std::int64_t at_ns) noexcept;
+  void observe_callback(EventKind kind, std::int64_t began_ns) noexcept;
+  void observe_outstanding(std::size_t outstanding) noexcept;
   // Called with pump_mutex_ held. Never holds mutex_ across backend calls;
   // callbacks and frees are pump-owned and occur only after wave joins.
   std::size_t tick_parallel(SchedulerClock::time_point now,
