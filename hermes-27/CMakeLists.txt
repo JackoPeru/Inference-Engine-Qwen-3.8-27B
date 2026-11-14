@@ -364,6 +364,9 @@ if(Python3_Interpreter_FOUND)
   add_test(NAME host_ingress_attestation_staging_cpu
     COMMAND ${Python3_EXECUTABLE} -B -m unittest -v
       ops.tests.test_physical_ingress_attestation_contract_20261114)
+  add_test(NAME host_authority_ingress_composition_cpu
+    COMMAND ${Python3_EXECUTABLE} -B -m unittest -v
+      ops.tests.test_authority_ingress_composition_cpu)
   add_test(NAME host_postffn_scratch_source_cpu
     COMMAND ${Python3_EXECUTABLE} -B -m unittest -v
       experiments.tests.test_layer0_postffn_scratch_capture_source_cpu)
@@ -372,6 +375,7 @@ if(Python3_Interpreter_FOUND)
     host_async_stream_contract_cpu
     host_external_authority_staging_cpu
     host_ingress_attestation_staging_cpu
+    host_authority_ingress_composition_cpu
     host_postffn_scratch_source_cpu
     PROPERTIES TIMEOUT 120 WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
       LABELS "cpu-only;source-contract;no-gpu")
