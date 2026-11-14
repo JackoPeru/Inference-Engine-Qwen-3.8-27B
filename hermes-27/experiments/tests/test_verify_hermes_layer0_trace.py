@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CPU negative tests for scratch capture verifier; no physical GGUF loads."""
+"""CPU negative tests for scratch capture verifier; fake fixture is never oracle."""
 from __future__ import annotations
 
 from array import array
@@ -28,12 +28,23 @@ class VerifyLayer0Test(unittest.TestCase):
         self.capture.mkdir()
         self.model = root / "model.gguf"
         self.model.write_bytes(b"test-mock-gguf")
-        self.src = root / "pp2_fwd.cu"
-        self.src.write_bytes(b"untouched source")
-        self.patched = root / "patched_pp2_fwd.cu"
-        self.patched.write_bytes(
-            b'HERMES_SCRATCH_LAYER0_TRACE_DIR\n'
-            b'HERMES_SCRATCH_LAYER0_TRACE_DIR\n')
+        (root / "original").mkdir()
+        (root / "scratch").mkdir()
+        self.src = root / "original" / "pp2_fwd.cu"
+        # Minimal source containing the FOUR exact published patch anchors.
+        # This is synthetic source, not a claim that a model was compiled.
+        import importlib.util
+        patch_spec = importlib.util.spec_from_file_location(
+            "h27_fixture_patch_constants", MOD.with_name("pp2_layer0_trace_scratch_patch.py"))
+        assert patch_spec and patch_spec.loader
+        patch_mod = importlib.util.module_from_spec(patch_spec)
+        patch_spec.loader.exec_module(patch_mod)
+        self.src.write_text("\n".join((patch_mod.INCLUDE, patch_mod.BEGIN,
+                                        patch_mod.POINT, patch_mod.ASYNC_POINT,
+                                        patch_mod.DECODE_POINT)),
+                            encoding="utf-8", newline="\n")
+        self.patched = root / "scratch" / "pp2_fwd.cu"
+        self.patched.write_bytes(v.reconstructed_patch(self.src.read_bytes()))
         self.binary = root / "hermes_generate"
         self.binary.write_bytes(b"test-mock-executable")
         self.arguments = {
@@ -42,6 +53,7 @@ class VerifyLayer0Test(unittest.TestCase):
             "binary": self.binary,
             "expected_sha": hashlib.sha256(self.model.read_bytes()).hexdigest(),
             "expected_bytes": self.model.stat().st_size,
+            "test_fixture": True,
         }
         for position in (0, 1):
             (self.capture / f"p{position}_context.txt").write_text(
@@ -57,11 +69,18 @@ class VerifyLayer0Test(unittest.TestCase):
         report = v.verify(**self.arguments)
         self.assertEqual(len(report["tensors"]), 22)
         self.assertTrue(report["not_release_gate"])
-        self.assertEqual("RUNTIME_DECODE_ARGUMENTS_RECORDED_NOT_LLAMA_COMPARED",
+        self.assertEqual(v.SYNTHETIC_SCHEMA, report["schema"])
+        self.assertEqual("hermes-27-synthetic-fixture", report["backend"])
+        self.assertEqual("SYNTHETIC_CPU_FIXTURE_NOT_PHYSICAL_RUNTIME",
                          report["status"])
         self.assertEqual([6205, 161421], report["prompt_ids_runtime_reported"])
         self.assertEqual([0, 1], report["absolute_positions_runtime_reported"])
         self.assertEqual(len(report["runtime_decode_contexts"]), 2)
+        self.assertFalse(report["independent_llama_tensor_identity_verified"])
+        self.assertEqual("BLOCKED_NO_INDEPENDENT_LLAMA_CALLBACK",
+                         report["cross_engine_comparison_status"])
+        self.assertEqual("BLOCKED_UNVERIFIED_HEAD_REPETITION_AND_Q_SCALING",
+                         report["qk_cross_engine_mapping"]["status"])
 
     def test_runtime_context_wrong_token_position_missing_and_symlink(self):
         context = self.capture / "p1_context.txt"
@@ -78,10 +97,10 @@ class VerifyLayer0Test(unittest.TestCase):
                 with self.assertRaisesRegex(v.Blocked, "runtime decode token/position"):
                     v.verify(**self.arguments)
         context.unlink()
-        with self.assertRaisesRegex(v.Blocked, "runtime token-position contexts"):
+        with self.assertRaisesRegex(v.Blocked, "runtime context/tensor files"):
             v.verify(**self.arguments)
         context.symlink_to(self.capture / "p0_context.txt")
-        with self.assertRaisesRegex(v.Blocked, "runtime context symlink"):
+        with self.assertRaisesRegex(v.Blocked, "symlink or nonregular file"):
             v.verify(**self.arguments)
 
     def test_bad_model_bytes_or_hash_blocks(self):
@@ -119,6 +138,52 @@ class VerifyLayer0Test(unittest.TestCase):
             v.verify(**self.arguments)
         self.src.write_bytes(b"HERMES_SCRATCH_LAYER0_TRACE_DIR")
         with self.assertRaises(v.Blocked):
+            v.verify(**self.arguments)
+
+    def test_fake_model_digest_cannot_create_genuine_v2(self):
+        real = {**self.arguments, "test_fixture": False}
+        with self.assertRaisesRegex(v.Blocked, "fixed GGUF SHA/size"):
+            v.verify(**real)
+        # Fixture mode cannot be enabled from the public CLI.
+        self.assertNotIn("--test-fixture", MOD.read_text())
+
+    def test_exact_directory_only_no_hidden_files_or_subdirectories(self):
+        extra = self.capture / ".leftover"
+        extra.write_text("not a tensor", encoding="ascii")
+        with self.assertRaisesRegex(v.Blocked, "missing/unexpected"):
+            v.verify(**self.arguments)
+        extra.unlink()
+        extra = self.capture / "nested"
+        extra.mkdir()
+        with self.assertRaisesRegex(v.Blocked, "nonregular file"):
+            v.verify(**self.arguments)
+
+    def test_missing_sidecar_and_swapped_file_names_rejected(self):
+        p0 = self.capture / "p0_context.txt"
+        p1 = self.capture / "p1_context.txt"
+        p0bytes, p1bytes = p0.read_bytes(), p1.read_bytes()
+        p0.write_bytes(p1bytes)
+        p1.write_bytes(p0bytes)
+        with self.assertRaisesRegex(v.Blocked, "runtime decode token/position"):
+            v.verify(**self.arguments)
+        p0.write_bytes(p0bytes)
+        p1.write_bytes(p1bytes)
+        p1.unlink()
+        with self.assertRaisesRegex(v.Blocked, "runtime context/tensor files"):
+            v.verify(**self.arguments)
+
+    def test_three_markers_but_wrong_cuda_semantics_rejected(self):
+        valid = self.patched.read_bytes()
+        self.assertEqual(valid.count(b"HERMES_SCRATCH_LAYER0_TRACE_DIR"), 3)
+        self.assertIn(b"cudaMemcpyDeviceToHost", valid)
+        self.patched.write_bytes(valid.replace(b"cudaMemcpyDeviceToHost",
+                                               b"cudaMemcpyHostToDevice"))
+        with self.assertRaisesRegex(v.Blocked, "differs from exact frozen"):
+            v.verify(**self.arguments)
+
+    def test_gguf_hash_is_full_bytes_not_heading(self):
+        self.model.write_bytes(self.model.read_bytes() + b"tampered suffix")
+        with self.assertRaisesRegex(v.Blocked, "physical GGUF size/hash"):
             v.verify(**self.arguments)
 
 
