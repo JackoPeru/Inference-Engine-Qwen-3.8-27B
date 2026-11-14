@@ -20,6 +20,7 @@ cp "$HERE/prod_sched_launcher.py" "$HERE/prod_sched_state_test.py" \
    "$HERE/prod_sched_prefill_test.py" "$HERE/prod_sched_parallel_test.py" \
    "$HERE/prod_sched_chunked_test.py" "$HERE/prod_sched_ready_test.py" \
    "$HERE/prod_sched_ready_callback_test.py" \
+   "$HERE/test_scheduler_poison_readiness_cpu.py" \
    "$HERE/prod_sched_sliding_test.py" \
    "$HERE/test_production_http.py" "$HERE/test_stream_mock_http.py" \
    "$HERE/test_bytelevel_stream.py" "$SCRATCH/serving/tests/"
@@ -66,8 +67,12 @@ echo "Strict ready-completion startup, SSE/nonstream, and terminal fault recover
 "$PYTHON" "$SCRATCH/serving/tests/prod_sched_ready_test.py" \
     --server "$SCRATCH/build/hermes_server" "${COMMON[@]}"
 
-echo "Strict ready callback delivery CPU HTTP, Unicode SSE and fault isolation (expected 5/5)"
+echo "Strict ready callback delivery CPU HTTP, Unicode SSE, stop/cancel and fault isolation (expected 7/7)"
 "$PYTHON" "$SCRATCH/serving/tests/prod_sched_ready_callback_test.py" \
+    --server "$SCRATCH/build/hermes_server" "${COMMON[@]}"
+
+echo "Fatal ready-pump poisoned /health, metrics and 503 admission (expected 1/1)"
+"$PYTHON" "$SCRATCH/serving/tests/test_scheduler_poison_readiness_cpu.py" \
     --server "$SCRATCH/build/hermes_server" "${COMMON[@]}"
 
 echo "Strict sliding-KV HTTP wrap, ownership, and startup guard (expected 5/5)"

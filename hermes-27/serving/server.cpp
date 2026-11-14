@@ -455,6 +455,16 @@ class Scheduler {
       options.enable_parallel_steps = cfg.parallel_steps;
       options.enable_ready_completion_dispatch = cfg.ready_completion;
       options.enable_ready_callback_delivery = cfg.ready_callback_delivery;
+#ifdef HERMES_ADMISSION_CPU_ONLY
+      // CPU fake-backend only: throw once after a joined ready step, forcing
+      // the real scheduler's terminal fail-closed path (no CUDA execution).
+      if (std::getenv("HERMES_TEST_READY_PUMP_POISON_ONCE")) {
+        options.ready_before_commit = [](std::size_t) {
+          static std::atomic<bool> fired{false};
+          if (!fired.exchange(true)) throw std::bad_alloc();
+        };
+      }
+#endif
       options.on_event = [this](const pp2batch::SchedulerEvent& event) {
         continuous_event(event);
       };
@@ -472,11 +482,19 @@ class Scheduler {
   bool enqueue(const std::shared_ptr<Job>& job) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (continuous_) {
-      if (stopping_) return false;
+      if (stopping_) {
+        job->http_status = 503;
+        return false;
+      }
       jobs_[job->id] = job;
       auto result = continuous_->enqueue({job->id, job->prompt, job->max_new_tokens});
       if (result.code != pp2batch::SubmitCode::accepted) {
         jobs_.erase(job->id);
+        // A poisoned ready pump is NOT transient queue backpressure.
+        // A terminal internal exception latches the batch scheduler stopped;
+        // refuse all future jobs with 503 until an explicit safe restart.
+        if (result.code == pp2batch::SubmitCode::stopped)
+          job->http_status = 503;
         return false;
       }
       job->queued_at = Clock::now();
@@ -486,7 +504,11 @@ class Scheduler {
       cv_.notify_all();
       return true;
     }
-    if (stopping_ || static_cast<int>(queue_.size()) >= queue_limit_) return false;
+    if (stopping_) {
+      job->http_status = 503;
+      return false;
+    }
+    if (static_cast<int>(queue_.size()) >= queue_limit_) return false;
     job->queued_at = Clock::now();
     jobs_[job->id] = job;
     if (job->stream) push_stream_locked(*job, chunk(*job, {{"role", "assistant"}}, nullptr));
@@ -523,6 +545,14 @@ class Scheduler {
   void rejected() { metrics_.rejected.fetch_add(1); }
   void request() { metrics_.requests.fetch_add(1); }
 
+  bool ready() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (stopping_) return false;
+    // The scheduler latches its own poison under its metadata mutex. Do not
+    // pretend the HTTP owner is healthy when the internal pump stopped.
+    return !continuous_ || !continuous_->metrics().stopping;
+  }
+
   std::string metrics_text(const std::string& model) {
     std::size_t queued = 0, active = 0;
     std::uint64_t prefill_attempts = metrics_.prefill_attempts.load();
@@ -530,12 +560,15 @@ class Scheduler {
     std::uint64_t prefill_failed = metrics_.prefill_failed.load();
     std::uint64_t prefill_tokens = metrics_.prefill_prompt_tokens.load();
     std::size_t parallel_waves = 0, parallel_dispatched_steps = 0;
+    bool scheduler_stopped = false;
     {
       std::lock_guard<std::mutex> lock(mutex_);
+      scheduler_stopped = stopping_;
       if (!continuous_) { queued = queue_.size(); active = active_.size(); }
     }
     if (continuous_) {
       const auto current = continuous_->metrics();
+      scheduler_stopped = scheduler_stopped || current.stopping;
       queued = current.queued;
       active = current.active;
       prefill_attempts = current.prefill_attempts_total;
@@ -549,7 +582,8 @@ class Scheduler {
     pp2batch::vram_used(used0, used1);
     const auto& m = metrics_;
     std::string out;
-    out += "# HELP hermes_server_ready Server readiness.\n# TYPE hermes_server_ready gauge\nhermes_server_ready 1\n";
+    out += "# HELP hermes_server_ready Server readiness.\n# TYPE hermes_server_ready gauge\nhermes_server_ready ";
+    out += scheduler_stopped ? "0\n" : "1\n";
     out += "# TYPE hermes_requests_total counter\nhermes_requests_total " + std::to_string(m.requests.load()) + "\n";
     out += "# TYPE hermes_requests_accepted_total counter\nhermes_requests_accepted_total " + std::to_string(m.accepted.load()) + "\n";
     out += "# TYPE hermes_requests_completed_total counter\nhermes_requests_completed_total " + std::to_string(m.completed.load()) + "\n";
@@ -742,6 +776,7 @@ class Scheduler {
       // state. Never enter the legacy queue_/active_ decode loop here.
       continuous_->tick();
       const auto occupancy = continuous_->metrics();
+      if (occupancy.stopping) break; // poisoned internal pump: fail-stop
       if (occupancy.queued == 0 && occupancy.active == 0) {
         std::unique_lock<std::mutex> lock(mutex_);
         if (stopping_) break;
@@ -1619,6 +1654,11 @@ int main(int argc, char** argv) {
 
     server.Get("/health", [&](const httplib::Request& req, httplib::Response& res) {
       if (!authorize(req, cfg, res)) return;
+      if (!scheduler.ready()) {
+        res.status = 503;
+        res.set_content(R"({"status":"unavailable","ready":false})", "application/json");
+        return;
+      }
       res.set_content(R"({"status":"ok","ready":true})", "application/json");
     });
     server.Get("/metrics", [&](const httplib::Request& req, httplib::Response& res) {
@@ -1689,8 +1729,15 @@ int main(int argc, char** argv) {
       job->created = std::time(nullptr);
       if (!scheduler.enqueue(job)) {
         scheduler.rejected();
-        res.set_header("Retry-After", "1");
-        set_error(res, 429, "serving queue is full", "rate_limit_error", "queue", "queue_full");
+        if (job->http_status == 503) {
+          // Retrying a terminally poisoned pump as if queue-full would hide
+          // the fail-stop condition from the operator and load balancer.
+          set_error(res, 503, "scheduler stopped; restart required",
+                    "server_error", "", "scheduler_stopped");
+        } else {
+          res.set_header("Retry-After", "1");
+          set_error(res, 429, "serving queue is full", "rate_limit_error", "queue", "queue_full");
+        }
         return;
       }
       if (stream) {

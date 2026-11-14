@@ -12,6 +12,7 @@ import os
 import subprocess
 import sys
 import unittest
+import urllib.request
 
 from prod_sched_state_test import (
     ARGS, assert_single_owner, events, payload, post, running_server,
@@ -129,6 +130,55 @@ class ReadyCallbackServingCPU(unittest.TestCase):
             self.assertEqual(done, 1)
             self.assertEqual(usages, [response["usage"]])
             assert_single_owner(self, trace_lines(trace), requests=2)
+
+    def test_stop_crosses_tokens_and_terminal_sse_is_unique(self):
+        tokens = self.tokenizer.encode(
+            "hello good night world", add_special_tokens=False,
+        ).ids
+        expected = self.tokenizer.decode(tokens, skip_special_tokens=True)
+        stop = "good night"
+        self.assertIn(stop, expected)
+        with running_server(
+            ids=tokens, continuous=True, flags=FLAGS, env_extra=ASYNC_ENV,
+        ) as (url, _, trace):
+            status, raw = post(url, payload(
+                len(tokens), stream=True, stops=stop, include_usage=True))
+            self.assertEqual(status, 200, raw)
+            visible, reasons, usages, done = events(raw)
+            self.assertEqual(visible, expected.split(stop, 1)[0])
+            self.assertEqual(reasons, ["stop"])
+            self.assertEqual(done, 1)
+            self.assertEqual(len(usages), 1)
+            generated = usages[0]["completion_tokens"]
+            self.assertGreater(generated, 0)
+            self.assertLessEqual(generated, len(tokens))
+            assert_single_owner(self, trace_lines(trace), requests=1)
+
+    def test_explicit_cancel_during_sse_has_one_terminal_and_one_state(self):
+        with running_server(
+            ids=[self.token], continuous=True, flags=FLAGS,
+            env_extra={**ASYNC_ENV, "FAKE_STEP_MS": "20"},
+        ) as (url, _, trace):
+            req = urllib.request.Request(
+                url + "/v1/chat/completions",
+                data=json.dumps(payload(
+                    200, stream=True, include_usage=True)).encode(),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=30) as response:
+                first = response.readline()
+                self.assertTrue(first.startswith(b"data: "), first)
+                ident = json.loads(first[6:])["id"]
+                status, raw = post(
+                    url, {"id": ident}, endpoint="/v1/cancel")
+                self.assertEqual(status, 202, raw)
+                visible, reasons, usages, done = events(
+                    first + response.read())
+                self.assertEqual(reasons, ["cancelled"])
+                self.assertEqual(done, 1)
+                self.assertEqual(len(usages), 1)
+                assert_single_owner(self, trace_lines(trace), requests=1)
 
     def test_callback_exception_is_fail_closed_then_next_request_survives(self):
         with running_server(
