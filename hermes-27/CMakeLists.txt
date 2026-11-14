@@ -302,6 +302,12 @@ add_executable(test_generate_prefill_shape_host
   tools/hermes_generate.cpp
   tools/tests/mock_generate_prefill_shape_cpu.cpp)
 target_include_directories(test_generate_prefill_shape_host PRIVATE distributed)
+# Compile the real CLI with a CPU-only PP2 mock: no CUDA backend is linked or
+# executed by this target. Real CUDA targets remain independently compiled.
+add_executable(test_generate_sliding_kv_host
+  tools/hermes_generate.cpp
+  tools/tests/mock_generate_sliding_backend_cpu.cpp)
+target_include_directories(test_generate_sliding_kv_host PRIVATE distributed)
 if(UNIX)
   add_executable(test_generate_logits_dump_atomic_host
     tools/tests/test_generate_logits_dump_atomic_cpu.cpp
@@ -338,6 +344,11 @@ if(Python3_Interpreter_FOUND)
       ${CMAKE_SOURCE_DIR}/tools/tests/test_generate_prefill_shape_cpu.py
       $<TARGET_FILE:test_generate_prefill_shape_host>)
   set_tests_properties(generate_prefill_shape_host_cpu PROPERTIES TIMEOUT 60)
+  add_test(NAME generate_sliding_kv_args_host_cpu
+    COMMAND ${Python3_EXECUTABLE} -B
+      ${CMAKE_SOURCE_DIR}/tools/tests/test_generate_sliding_kv_args_cpu.py
+      $<TARGET_FILE:test_generate_sliding_kv_host>)
+  set_tests_properties(generate_sliding_kv_args_host_cpu PROPERTIES TIMEOUT 120)
   if(UNIX)
     add_test(NAME generate_logits_dump_atomic_host_cpu
       COMMAND test_generate_logits_dump_atomic_host)
