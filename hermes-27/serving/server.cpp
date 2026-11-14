@@ -36,6 +36,7 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <fcntl.h>
 #include <poll.h>
 #include <unistd.h>
 #else
@@ -145,6 +146,11 @@ bool parse_args(int argc, char** argv, Config& cfg, bool& show_help) {
   return true;
 }
 
+class TokenizerTransportFailure : public std::runtime_error {
+ public:
+  using std::runtime_error::runtime_error;
+};
+
 class TokenizerBridge {
  public:
   TokenizerBridge(const Config& cfg, const std::string& helper)
@@ -245,6 +251,12 @@ class TokenizerBridge {
     close(to_child[0]); close(from_child[1]);
     input_ = to_child[1]; output_ = from_child[0];
     try {
+      // Only the parent's writer becomes nonblocking. A Python tokenizer
+      // that stops consuming stdin must never trap all HTTP/callback workers
+      // indefinitely under the shared tokenizer mutex.
+      const int flags = fcntl(input_, F_GETFL);
+      if (flags < 0 || fcntl(input_, F_SETFL, flags | O_NONBLOCK) < 0)
+        throw std::runtime_error("tokenizer input nonblocking setup failed");
       json ready = json::parse(read_line());
       if (!ready.value("ready", false))
         throw std::runtime_error("tokenizer startup: " + ready.value("error", "no ready response"));
@@ -256,17 +268,51 @@ class TokenizerBridge {
     }
   }
 
+  static int write_deadline_ms() noexcept {
+#ifdef HERMES_ADMISSION_CPU_ONLY
+    // Shortening is available only to the isolated host fake backend;
+    // production CUDA always enforces its fixed 15-second total deadline.
+    const char* test = std::getenv("HERMES_TEST_TOKENIZER_WRITE_TIMEOUT_MS");
+    if (test && *test) {
+      char* end = nullptr;
+      errno = 0;
+      long value = std::strtol(test, &end, 10);
+      if (errno == 0 && end && *end == '\0' && value >= 25 && value <= 1000)
+        return static_cast<int>(value);
+    }
+#endif
+    return 15000;
+  }
+
   static bool write_all(int fd, const char* data, std::size_t size) {
+    const auto deadline = Clock::now() +
+        std::chrono::milliseconds(write_deadline_ms());
     while (size) {
-      ssize_t n = write(fd, data, size);
-      if (n < 0 && errno == EINTR) continue;
+      const auto now = Clock::now();
+      if (now >= deadline) return false;
+      const auto remaining = std::chrono::duration_cast<
+          std::chrono::milliseconds>(deadline - now).count();
+      if (remaining <= 0) return false;
+      pollfd watch{fd, POLLOUT, 0};
+      const int ready = poll(&watch, 1, static_cast<int>(remaining));
+      if (ready < 0 && errno == EINTR) continue;
+      if (ready <= 0 || (watch.revents & (POLLERR | POLLHUP | POLLNVAL)))
+        return false;
+      if (!(watch.revents & POLLOUT)) continue;
+      const ssize_t n = write(fd, data, size);
+      if (n < 0 && (errno == EINTR || errno == EAGAIN ||
+                    errno == EWOULDBLOCK)) continue;
       if (n <= 0) return false;
-      data += n; size -= static_cast<std::size_t>(n);
+      data += n;
+      size -= static_cast<std::size_t>(n);
     }
     return true;
   }
 
   std::string read_line() {
+    // A child may trickle one byte every 14 seconds. Bound the entire
+    // response transaction instead of resetting the timeout after fragments.
+    const auto deadline = Clock::now() + std::chrono::seconds(15);
     for (;;) {
       const std::size_t newline = pending_.find('\n');
       if (newline != std::string::npos) {
@@ -276,10 +322,17 @@ class TokenizerBridge {
       }
       // Avoid wedging all clients on a stuck Python/Jinja subprocess.
       pollfd watch{output_, POLLIN, 0};
-      const int ready = poll(&watch, 1, 15000);
+      const auto now = Clock::now();
+      if (now >= deadline) throw std::runtime_error("tokenizer bridge timed out");
+      const auto remaining = std::chrono::duration_cast<
+          std::chrono::milliseconds>(deadline - now).count();
+      if (remaining <= 0) throw std::runtime_error("tokenizer bridge timed out");
+      const int ready = poll(&watch, 1, static_cast<int>(remaining));
       if (ready < 0 && errno == EINTR) continue;
       if (ready < 0) throw std::runtime_error("tokenizer bridge poll failed");
       if (ready == 0) throw std::runtime_error("tokenizer bridge timed out");
+      if (watch.revents & (POLLERR | POLLNVAL))
+        throw std::runtime_error("tokenizer bridge pipe failed");
       char buffer[4096];
       ssize_t n = read(output_, buffer, sizeof(buffer));
       if (n < 0 && errno == EINTR) continue;
@@ -309,10 +362,23 @@ class TokenizerBridge {
       stop_child();
       try { launch_child(); }
       catch (const std::exception& restart) {
-        throw std::runtime_error("tokenizer unavailable: " + std::string(restart.what()));
+        throw TokenizerTransportFailure(
+            "tokenizer unavailable: " + std::string(restart.what()));
       }
-      if (!retry) throw std::runtime_error("tokenizer state lost after restart: " + failure);
-      response = transact();
+      if (!retry)
+        throw TokenizerTransportFailure(
+            "tokenizer state lost after restart: " + failure);
+      try {
+        response = transact();
+      } catch (const std::exception& second_failure) {
+        // Once both bounded attempts fail, close the child before returning
+        // the infrastructure failure. Never leave an unresponsive writer
+        // behind to consume the next client's callback.
+        stop_child();
+        throw TokenizerTransportFailure(
+            "tokenizer unavailable after retry: " +
+            std::string(second_failure.what()));
+      }
     }
     if (response.contains("error")) throw std::runtime_error(response.value("error", "tokenizer error"));
     return response;
@@ -1702,6 +1768,12 @@ int main(int argc, char** argv) {
 
       std::vector<int> prompt;
       try { prompt = tokenizer.encode(messages, thinking); }
+      catch (const TokenizerTransportFailure&) {
+        scheduler.rejected();
+        set_error(res, 503, "tokenizer bridge unavailable; retry later",
+                  "server_error", "", "tokenizer_unavailable");
+        return;
+      }
       catch (const std::exception& e) { scheduler.rejected(); set_error(res, 400, std::string("tokenization/template failed: ") + e.what(), "invalid_request_error", "messages", "invalid_value"); return; }
       if (prompt.empty()) { scheduler.rejected(); set_error(res, 400, "chat template produced empty prompt", "invalid_request_error", "messages", "invalid_value"); return; }
       if (std::any_of(prompt.begin(), prompt.end(), [](int id) { return id < 0 || id >= kVocab; })) {

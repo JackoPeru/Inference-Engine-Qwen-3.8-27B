@@ -21,6 +21,7 @@ cp "$HERE/prod_sched_launcher.py" "$HERE/prod_sched_state_test.py" \
    "$HERE/prod_sched_chunked_test.py" "$HERE/prod_sched_ready_test.py" \
    "$HERE/prod_sched_ready_callback_test.py" \
    "$HERE/test_scheduler_poison_readiness_cpu.py" \
+   "$HERE/test_tokenizer_write_deadline_cpu.py" \
    "$HERE/prod_sched_sliding_test.py" \
    "$HERE/test_production_http.py" "$HERE/test_stream_mock_http.py" \
    "$HERE/test_bytelevel_stream.py" "$SCRATCH/serving/tests/"
@@ -87,5 +88,9 @@ HERMES_TEST_SERVER_BIN="$SCRATCH/build/hermes_server" \
 echo "Real tokenizer parity (expected 5/5)"
 HERMES_TEST_TOKENIZER="$TOKENIZER" \
     "$PYTHON" "$SCRATCH/serving/tests/test_bytelevel_stream.py" -v
+
+echo "Tokenizer nonblocking write timeout and bounded shutdown (2 mandatory PASS, 1 optional baseline SKIP)"
+"$PYTHON" "$SCRATCH/serving/tests/test_tokenizer_write_deadline_cpu.py" \
+    --server "$SCRATCH/build/hermes_server"
 
 echo "All CPU-only gates passed. No GPUs or live services used."
