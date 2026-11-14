@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """Fail-closed CPU-only comparison of physical HERMES scratch v2 and llama callbacks.
 
-This tool never initializes CUDA/llama, launches a model, or imports PP2 code.
+This tool never initializes CUDA/llama, launches a model, or imports PP2 runtime.
 It cannot assert parity for stages without independently captured llama data.
 """
 from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import math
 from pathlib import Path
@@ -21,6 +22,7 @@ LLAMA_LIB_SHA = "fd9e3e0810c6eca2e37b57abf443bcf15963671cbd0ee8489a37461a521094d
 SCHEMA_LLAMA_SINGLE = "h27.reliability-layer-cb.v1"
 SCHEMA_LLAMA_BATCH = "h27.reliability-layer0-downstream-cb.v1"
 SCHEMA_HERMES_V2 = "h27.hermes-scratch-layer0-capture.v2"
+SCRATCH_PATCHER_SHA = "80c0be0c1e29faf5db837da306af59ee729d4207c9bc21022163cfdef049c886"
 HERMES_STATUS = "RUNTIME_DECODE_ARGUMENTS_RECORDED_NOT_LLAMA_COMPARED"
 LLAMA_STATUS = "CAPTURED_NOT_INDEPENDENTLY_COMPARED"
 HEX = re.compile(r"[0-9a-f]{64}\Z")
@@ -101,6 +103,36 @@ def sha256_file(path: Path) -> str:
         for part in iter(lambda: file.read(4 * 1024 * 1024), b""):
             h.update(part)
     return h.hexdigest()
+
+
+def expected_scratch_source(original: bytes) -> bytes:
+    """Check the frozen scratch transform, independently of HERMES tensor data.
+
+    Importing the SHA-pinned source-only patcher here is a provenance check;
+    numeric differences are still computed solely from separate physical
+    HERMES and llama tensors, never from the runtime's own verifier.
+    """
+    patcher = Path(__file__).resolve().parents[1] / (
+        "experiments/pp2_layer0_trace_scratch_patch.py")
+    need(patcher.is_file() and not patcher.is_symlink() and
+         sha256_file(patcher) == SCRATCH_PATCHER_SHA,
+         "missing or modified frozen scratch patcher")
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "h27_independent_compare_scratch_transform", patcher)
+        need(spec is not None and spec.loader is not None,
+             "frozen scratch patcher cannot be loaded")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        result = module.patched_source(original.decode("utf-8")).encode("utf-8")
+    except Exception as exc:
+        if isinstance(exc, Blocked):
+            raise
+        raise Blocked("INVALID_PROVENANCE",
+                      "original PP2 does not support frozen scratch transform") from exc
+    need(sha256_file(patcher) == SCRATCH_PATCHER_SHA,
+         "frozen scratch patcher changed during verification")
+    return result
 
 
 def sha_field(value: object, name: str) -> str:
@@ -387,11 +419,14 @@ def hermes(manifest_path: Path, capture_dir: Path, model: Path, *,
     need(hashlib.sha256(original).hexdigest() == m["source_sha256"] and
          hashlib.sha256(patched).hexdigest() == m["patched_source_sha256"],
          "PP2 source changed between hash/read", "HASH_MISMATCH")
-    need(original != patched and
-         b"HERMES_SCRATCH_LAYER0_TRACE_DIR" not in original and
-         patched.count(
-             b"HERMES_SCRATCH_LAYER0_TRACE_DIR") == 2,
-         "scratch PP2 source did not preserve unmodified production source")
+    need(source.name == patched_source.name == "pp2_fwd.cu" and
+         source.resolve() != patched_source.resolve() and
+         original != patched and
+         b"HERMES_SCRATCH_LAYER0_TRACE_DIR" not in original,
+         "scratch PP2 original/patched source identity invalid")
+    need(patched.count(b"HERMES_SCRATCH_LAYER0_TRACE_DIR") == 3 and
+         patched == expected_scratch_source(original),
+         "scratch PP2 source differs from exact frozen three-marker patch")
     contexts = m.get("runtime_decode_contexts")
     need(isinstance(contexts, list) and len(contexts) == 2,
          "missing recorded runtime decode context")
@@ -434,7 +469,10 @@ def hermes(manifest_path: Path, capture_dir: Path, model: Path, *,
          "HERMES stage×position coverage incomplete")
     # The verifier's older metadata contract has hashes and shape but no
     # separately recorded file name; insist on exact expected filenames.
-    actual_files = {p.name for p in capture_dir.iterdir() if p.is_file()}
+    contents = list(capture_dir.iterdir())
+    need(all(p.is_file() and not p.is_symlink() for p in contents),
+         "unaccounted or nonregular HERMES scratch files")
+    actual_files = {p.name for p in contents}
     expected_files = {f"p{p}_{s}.f32" for p in (0, 1)
                       for s in HERMES_WIDTHS} | {
                       "p0_context.txt", "p1_context.txt"}

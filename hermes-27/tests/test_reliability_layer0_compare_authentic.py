@@ -42,8 +42,12 @@ class Fixture:
     def __init__(self, folder: Path, salt: bytes = b"first"):
         self.folder = folder
         self.model = folder / "model.gguf"
-        self.source = folder / "pp2_fwd_original.cu"
-        self.patched = folder / "pp2_fwd_scratch.cu"
+        original_dir = folder / "original"
+        scratch_dir = folder / "scratch"
+        original_dir.mkdir()
+        scratch_dir.mkdir()
+        self.source = original_dir / "pp2_fwd.cu"
+        self.patched = scratch_dir / "pp2_fwd.cu"
         self.binary = folder / "hermes_generate"
         self.lib = folder / "libllama.so.0.5.0"
         self.ggml = folder / "libggml-base.so.0.25.3"
@@ -55,9 +59,12 @@ class Fixture:
         for d in (self.llama_v1_dir, self.llama_batch_dir, self.hermes_dir):
             d.mkdir()
         write(self.model, b"GGUF OFFLINE FIXTURE " + salt)
-        write(self.source, b"unmodified scratch hook-free source\n" + salt)
-        write(self.patched, b"patch" +
-              b"HERMES_SCRATCH_LAYER0_TRACE_DIR " * 2 + salt)
+        # Synthetic numerical data, but REAL frozen PP2 source-transform
+        # contract: a made-up two-marker C++ file must never pass provenance.
+        pp2 = (Path(__file__).resolve().parents[1] /
+               "distributed/pp2_fwd.cu").read_bytes()
+        write(self.source, pp2)
+        write(self.patched, auth.expected_scratch_source(pp2))
         write(self.binary, b"binary made from scratch" + salt)
         write(self.lib, b"fake llama library " + salt)
         write(self.ggml, b"fake GGML library " + salt)
@@ -227,6 +234,38 @@ class TestAuthenticCompare(unittest.TestCase):
             expected_sha=self.other.expected_sha,
             expected_bytes=self.other.model_bytes,
             lib_sha=digest(self.f.lib)), "model")
+
+    def test_current_three_marker_source_is_accepted(self):
+        self.assertEqual(self.f.patched.read_bytes().count(
+            b"HERMES_SCRATCH_LAYER0_TRACE_DIR"), 3)
+        self.assertEqual(
+            self.f.patched.read_bytes(),
+            auth.expected_scratch_source(self.f.source.read_bytes()))
+        self.assertEqual(self.f.hermes()["runtime_token_ids"], list(auth.TOKENS))
+
+    def test_three_marker_tamper_rehashed_still_blocked(self):
+        raw = self.f.patched.read_bytes()
+        self.assertIn(b"SCRATCH-ONLY diagnostic", raw)
+        self.f.patched.write_bytes(raw.replace(
+            b"SCRATCH-ONLY diagnostic", b"SCRATCH-TAMPER diagnostic", 1))
+        self.assertEqual(self.f.patched.read_bytes().count(
+            b"HERMES_SCRATCH_LAYER0_TRACE_DIR"), 3)
+        m = json.loads(self.f.hermes_manifest.read_text(encoding="utf-8"))
+        m["patched_source_sha256"] = digest(self.f.patched)
+        self.f.hermes_manifest.write_text(json.dumps(m), encoding="utf-8")
+        self.assertBlocked(self.f.hermes, "exact frozen three-marker patch")
+
+    def test_rehashed_changed_original_does_not_match_patch(self):
+        self.f.source.write_bytes(self.f.source.read_bytes() +
+                                  b"\n// untrusted source tail\n")
+        m = json.loads(self.f.hermes_manifest.read_text(encoding="utf-8"))
+        m["source_sha256"] = digest(self.f.source)
+        self.f.hermes_manifest.write_text(json.dumps(m), encoding="utf-8")
+        self.assertBlocked(self.f.hermes, "exact frozen three-marker patch")
+
+    def test_unknown_subdirectory_cannot_be_ignored(self):
+        (self.f.hermes_dir / "unknown").mkdir()
+        self.assertBlocked(self.f.hermes, "nonregular HERMES scratch files")
 
     def test_batch_head_axis_both_positions_match(self):
         l, h = self.f.llama(True), self.f.hermes()
