@@ -13,6 +13,7 @@
 #include "hermes/gdn_step.hpp"
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
+#include <array>
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
@@ -436,9 +437,80 @@ static bool use_head_bf16_warp(){
 // Retain the exact original buffer layouts, but validate every CUDA
 // allocation and drain/free all partially allocated scratch on failure.
 // A DecodeState's recurrent S/KV remains externally owned.
+// Chunked prefill can borrow a distinct slot array on each GPU, owned by
+// ONE request and ONE host thread. run_*_layer still synchronizes the device
+// before returning success, so neither the next layer nor the next chunk
+// may overwrite any in-flight data. No global cache or shared CUDA stream.
+struct PrefillChunkScratchPool {
+  struct Slot { void* ptr=nullptr; size_t bytes=0; };
+  // Seeded GDN uses 22 buffers; unseeded GDN uses 23; full uses 18.
+  std::array<Slot,23> slots{};
+  const int device;
+  bool poisoned=false;
+
+  explicit PrefillChunkScratchPool(int dev) : device(dev) {}
+  PrefillChunkScratchPool(const PrefillChunkScratchPool&)=delete;
+  PrefillChunkScratchPool& operator=(const PrefillChunkScratchPool&)=delete;
+
+  template<class P> bool alloc(size_t index,P*& p,size_t bytes,std::string& err){
+    if(poisoned || index>=slots.size() || bytes==0){
+      err="prefill pooled scratch poisoned or invalid slot/size";
+      poisoned=true;
+      return false;
+    }
+    int active=-1;
+    cudaError_t rc=cudaGetDevice(&active);
+    if(rc!=cudaSuccess || active!=device){
+      err="prefill pooled scratch device mismatch GPU"+std::to_string(device);
+      poisoned=true;
+      return false;
+    }
+    Slot& slot=slots[index];
+    if(slot.bytes<bytes){
+      // Allocate the replacement first: an OOM leaves the old slot owned
+      // for fail-closed teardown. Never grow an in-flight layer's slot.
+      void* next=nullptr;
+      rc=cudaMalloc(&next,bytes);
+      if(rc!=cudaSuccess){
+        err="prefill pooled scratch allocation GPU"+std::to_string(device)+
+            " bytes="+std::to_string(bytes)+": "+cudaGetErrorString(rc);
+        poisoned=true;
+        return false;
+      }
+      if(slot.ptr){
+        rc=cudaFree(slot.ptr);
+        if(rc!=cudaSuccess){
+          (void)cudaFree(next);
+          err="prefill pooled scratch replacement free GPU"+
+              std::to_string(device)+": "+cudaGetErrorString(rc);
+          poisoned=true;
+          return false;
+        }
+      }
+      slot={next,bytes};
+    }
+    p=static_cast<P*>(slot.ptr);
+    return true;
+  }
+  ~PrefillChunkScratchPool(){
+    // A pool is destroyed only after the enclosing chunk request completes
+    // or aborts. Successful layers have already drained, and cudaFree
+    // synchronizes pending uses on error paths before freeing each buffer.
+    if(cudaSetDevice(device)!=cudaSuccess)return;
+    for(auto& slot:slots){
+      if(slot.ptr)(void)cudaFree(slot.ptr);
+    }
+  }
+};
+
 struct PrefillLayerScratch {
   std::vector<void*> buffers;
+  PrefillChunkScratchPool* pool=nullptr;
+  size_t next_slot=0;
+  explicit PrefillLayerScratch(PrefillChunkScratchPool* borrowed=nullptr)
+      :pool(borrowed){}
   template<class P> bool alloc(P*& p, size_t bytes, std::string& err){
+    if(pool)return pool->alloc(next_slot++,p,bytes,err);
     cudaError_t rc=cudaMalloc((void**)&p,bytes);
     if(rc!=cudaSuccess){
       err="prefill CUDA allocation "+std::to_string(bytes)+": "+cudaGetErrorString(rc);
@@ -449,7 +521,7 @@ struct PrefillLayerScratch {
   }
   ~PrefillLayerScratch(){
     // cudaFree synchronizes work using scratch before releasing memory.
-    for(void* p:buffers) (void)cudaFree(p);
+    if(!pool)for(void* p:buffers) (void)cudaFree(p);
   }
 };
 
@@ -483,7 +555,8 @@ __global__ void append_conv_tail_k(float* CS,const float* qkv,int T,int C){
 }
 
 static bool run_gdn_layer(int li, float* d_x, int T, std::string& err,
-                          DecodeState* seed=nullptr,int pos0=0){
+                          DecodeState* seed=nullptr,int pos0=0,
+                          PrefillChunkScratchPool* pool=nullptr){
   char Pb[16]; snprintf(Pb,16,"blk.%d.",li); std::string P=Pb;
   WEntry *wNorm=find_w(P+"attn_norm.weight"), *wQkv=find_w(P+"attn_qkv.weight"),
          *wGate=find_w(P+"attn_gate.weight"), *wBeta=find_w(P+"ssm_beta.weight"),
@@ -498,7 +571,7 @@ static bool run_gdn_layer(int li, float* d_x, int T, std::string& err,
         *d_be=nullptr, *d_gl=nullptr, *d_q=nullptr, *d_k=nullptr, *d_v=nullptr, *d_o=nullptr,
         *d_S=nullptr, *d_g=nullptr, *d_core=nullptr, *d_gg=nullptr, *d_uu=nullptr, *d_hid=nullptr, *d_down=nullptr;
   uint16_t *d_hb=nullptr, *d_h2b=nullptr, *d_gb=nullptr, *d_hidb=nullptr;
-  PrefillLayerScratch scratch;
+  PrefillLayerScratch scratch(pool);
 #define P_ALLOCF(ptr,bytes) do{ if(!scratch.alloc(ptr,(bytes),err)) return false; }while(0)
   P_ALLOCF(d_h,nH*4); P_ALLOCF(d_hb,nH*2);
   P_ALLOCF(d_qkv,(size_t)T*CC*4); P_ALLOCF(d_cv,(size_t)T*CC*4);
@@ -582,7 +655,8 @@ static bool run_gdn_layer(int li, float* d_x, int T, std::string& err,
 }
 
 static bool run_full_layer(int li, float* d_x, int T, std::string& err,
-                           DecodeState* seed=nullptr,int pos0=0){
+                           DecodeState* seed=nullptr,int pos0=0,
+                           PrefillChunkScratchPool* pool=nullptr){
   char Pb[16]; snprintf(Pb,16,"blk.%d.",li); std::string P=Pb;
   WEntry *wNorm=find_w(P+"attn_norm.weight"),
          *wQ=find_w(P+"attn_q.weight"), *wK=find_w(P+"attn_k.weight"), *wV=find_w(P+"attn_v.weight"),
@@ -596,7 +670,7 @@ static bool run_full_layer(int li, float* d_x, int T, std::string& err,
   float *d_h=nullptr,*d_qq=nullptr,*d_kk=nullptr,*d_vv=nullptr,*d_Q=nullptr,*d_K=nullptr,*d_V=nullptr,
         *d_att=nullptr,*d_G=nullptr,*d_core=nullptr,*d_gg=nullptr,*d_uu=nullptr,*d_hid=nullptr,*d_down=nullptr;
   uint16_t *d_hb=nullptr,*d_h2b=nullptr,*d_hidb=nullptr,*d_gb=nullptr;
-  PrefillLayerScratch scratch;
+  PrefillLayerScratch scratch(pool);
 #define P_ALLOCF(ptr,bytes) do{ if(!scratch.alloc(ptr,(bytes),err)) return false; }while(0)
   P_ALLOCF(d_h,nH*4); P_ALLOCF(d_hb,nH*2);
   P_ALLOCF(d_qq,(size_t)T*NQQ*4); P_ALLOCF(d_kk,(size_t)T*NKK*4); P_ALLOCF(d_vv,(size_t)T*NKK*4);
@@ -818,7 +892,9 @@ struct PrefillPinned {
 static std::vector<float> prefill_impl(const std::vector<int>& ids, Stats& st,
                                       std::string& err, std::vector<float>* h_last_out,
                                       DecodeState* seed, bool private_staging,
-                                      int pos0=0, bool last_only=false){
+                                      int pos0=0, bool last_only=false,
+                                      PrefillChunkScratchPool* pool0=nullptr,
+                                      PrefillChunkScratchPool* pool1=nullptr){
   if(!g_up){ err="not uploaded"; return {}; }
   int T=(int)ids.size();
   if(T<=0||T>(int)PIN_TMAX){ err="bad T"; return {}; }
@@ -850,7 +926,7 @@ static std::vector<float> prefill_impl(const std::vector<int>& ids, Stats& st,
   }
   for(int li=0;li<=SPLIT_LAST0;++li){
     bool is_full=(li%4==3);
-    bool ok = is_full? run_full_layer(li,d_x0,T,err,seed,pos0) : run_gdn_layer(li,d_x0,T,err,seed,pos0);
+    bool ok = is_full? run_full_layer(li,d_x0,T,err,seed,pos0,pool0) : run_gdn_layer(li,d_x0,T,err,seed,pos0,pool0);
     if(!ok) return {};
     if(li%8==0||li==SPLIT_LAST0){
       std::vector<float> hx(nH); cudaMemcpy(hx.data(),d_x0,nH*4,cudaMemcpyDeviceToHost);
@@ -881,7 +957,7 @@ static std::vector<float> prefill_impl(const std::vector<int>& ids, Stats& st,
   // GPU1
   for(int li=SPLIT_LAST0+1;li<NL;++li){
     bool is_full=(li%4==3);
-    bool ok = is_full? run_full_layer(li,d_x1,T,err,seed,pos0) : run_gdn_layer(li,d_x1,T,err,seed,pos0);
+    bool ok = is_full? run_full_layer(li,d_x1,T,err,seed,pos0,pool1) : run_gdn_layer(li,d_x1,T,err,seed,pos0,pool1);
     if(!ok) return {};
     if(li%8==0||li==NL-1){
       std::vector<float> hx(nH); cudaMemcpy(hx.data(),d_x1,nH*4,cudaMemcpyDeviceToHost);
@@ -1973,40 +2049,56 @@ std::vector<float> prefill_chunks_into_decode_state(
   st.xfer_ms=0;
   std::vector<float> logits;
   try{
-    for(size_t offset=0;offset<T;offset+=(size_t)chunk_tokens){
-      const size_t count=std::min((size_t)chunk_tokens,T-offset);
-      // Bounded host token staging (at most 64 ints) per chunk.
-      std::vector<int> chunk(ids.begin()+offset,ids.begin()+offset+count);
-      Stats chunk_stats{};
-      std::vector<float>* last_hidden=(offset+count==T)?h_last_out:nullptr;
-      logits=prefill_impl(chunk,chunk_stats,err,last_hidden,&ds,true,
-                          (int)offset,true);
-      if(logits.size()!=(size_t)VOC){
-        if(err.empty())err="chunked prefill logits incomplete at offset="+
-                         std::to_string(offset);
-        return fail();
-      }
-      for(float value:logits){
-        if(!std::isfinite(value)){
-          err="chunked prefill nonfinite logits at offset="+
-              std::to_string(offset);
-          return fail();
+    {
+      // Keep both pools alive under the state lock. In particular, an error
+      // must first destroy/drain the GPU scratch BEFORE fail() unlocks and
+      // decode_free() releases GDN/KV/async context state. C++ exception
+      // unwinding also destroys both pools before entering catch below.
+      PrefillChunkScratchPool gpu0_pool(0),gpu1_pool(1);
+      bool complete=true;
+      for(size_t offset=0;offset<T;offset+=(size_t)chunk_tokens){
+        const size_t count=std::min((size_t)chunk_tokens,T-offset);
+        // Bounded host token staging (at most 64 ints) per chunk.
+        std::vector<int> chunk(ids.begin()+offset,ids.begin()+offset+count);
+        Stats chunk_stats{};
+        std::vector<float>* last_hidden=(offset+count==T)?h_last_out:nullptr;
+        logits=prefill_impl(chunk,chunk_stats,err,last_hidden,&ds,true,
+                            (int)offset,true,&gpu0_pool,&gpu1_pool);
+        if(logits.size()!=(size_t)VOC){
+          if(err.empty())err="chunked prefill logits incomplete at offset="+
+                           std::to_string(offset);
+          complete=false;
+          break;
         }
-      }
-      const int expected=(int)(offset+count);
-      for(int li=3;li<NL;li+=4){
-        if(ds.klen[li]!=expected){
-          err="chunked prefill KV length mismatch li="+std::to_string(li)+
-              " got="+std::to_string(ds.klen[li])+
-              " expected="+std::to_string(expected);
-          return fail();
+        for(float value:logits){
+          if(!std::isfinite(value)){
+            err="chunked prefill nonfinite logits at offset="+
+                std::to_string(offset);
+            complete=false;
+            break;
+          }
         }
+        if(!complete)break;
+        const int expected=(int)(offset+count);
+        for(int li=3;li<NL;li+=4){
+          if(ds.klen[li]!=expected){
+            err="chunked prefill KV length mismatch li="+std::to_string(li)+
+                " got="+std::to_string(ds.klen[li])+
+                " expected="+std::to_string(expected);
+            complete=false;
+            break;
+          }
+        }
+        if(!complete)break;
+        st.prefill_ms+=chunk_stats.prefill_ms;
+        st.xfer_ms+=chunk_stats.xfer_ms;
       }
-      st.prefill_ms+=chunk_stats.prefill_ms;
-      st.xfer_ms+=chunk_stats.xfer_ms;
+      if(complete){
+        ds.ever_advanced=true;
+        return logits;
+      }
     }
-    ds.ever_advanced=true;
-    return logits;
+    return fail(); // Both pool destructors ran while state_lock was held.
   }catch(const std::exception& e){
     err="chunked prefill exception: "+std::string(e.what());
     return fail();

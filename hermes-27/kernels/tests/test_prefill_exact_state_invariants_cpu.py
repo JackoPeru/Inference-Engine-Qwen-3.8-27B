@@ -179,7 +179,10 @@ def test_source_contract() -> int:
         "FFN down all positions": "gemv_batch(d_hidb,(uint8_t*)wFd->d,d_down,FFN,HID,T)",
         "last-head-only after all layers": "const int output_T=last_only?1:T",
         "last-head token pointer": "d_x1+(size_t)(T-1)*HID",
-        "T65+ chunk offsets": "(int)offset,true);",
+        # T65+ now borrows request-local GPU0/GPU1 scratch pools. Require
+        # the exact stateful call, not a stale source string from the old
+        # allocate/free-on-every-layer implementation.
+        "T65+ chunk offsets": "(int)offset,true,&gpu0_pool,&gpu1_pool);",
         "large chunk BF16 fail closed": "chunked prefill BF16 disabled: full-model numeric gate failed",
     }
     for name, source in statements.items():
