@@ -64,6 +64,16 @@ if(Python3_Interpreter_FOUND)
   add_test(NAME pp2_layer0_scratch_manifest_cpu
     COMMAND ${Python3_EXECUTABLE} -B -m unittest
       experiments.tests.test_verify_hermes_layer0_trace)
+  # Synthetic-only provenance guards; no real llama/HERMES model or GPUs.
+  add_test(NAME layer0_crossengine_mapping_contract_cpu
+    COMMAND ${Python3_EXECUTABLE} -B -m unittest
+      experiments.tests.test_layer0_crossengine_mapping_contract)
+  add_test(NAME independent_layer0_comparator_source_cpu
+    COMMAND ${Python3_EXECUTABLE} -B -m unittest discover
+      -s ${CMAKE_SOURCE_DIR}/tests -p test_reliability_layer0_compare_authentic.py)
+  add_test(NAME stateful_prefill_source_invariants_cpu
+    COMMAND ${Python3_EXECUTABLE} -B
+      ${CMAKE_SOURCE_DIR}/kernels/tests/test_prefill_exact_state_invariants_cpu.py)
   set_tests_properties(logit_comparator_cpu release_harness_cpu async_stream_contract_cpu prefill_integration_contract_cpu
     PROPERTIES TIMEOUT 60)
   set_tests_properties(layer0_downstream_capture_manifest_cpu PROPERTIES TIMEOUT 60)
@@ -72,6 +82,10 @@ if(Python3_Interpreter_FOUND)
     TIMEOUT 60 WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
   set_tests_properties(pp2_layer0_scratch_patch_cpu
     pp2_layer0_scratch_manifest_cpu PROPERTIES
+    TIMEOUT 60 WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+  set_tests_properties(layer0_crossengine_mapping_contract_cpu
+    independent_layer0_comparator_source_cpu
+    stateful_prefill_source_invariants_cpu PROPERTIES
     TIMEOUT 60 WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 endif()
 add_executable(test_gguf_synth model/tests/test_gguf_synth.cpp)
@@ -281,11 +295,54 @@ endif()
 add_executable(hermes_generate tools/hermes_generate.cpp)
 target_link_libraries(hermes_generate PRIVATE hermes_pp2)
 add_dependencies(hermes_generate gguf_dump)
+# These mock-only executables link no PP2/CUDA backend, never load a real GGUF,
+# and cannot become production inference targets. Keep CUDA sources compiled
+# independently by their original, unchanged NVCC targets.
+add_executable(test_generate_prefill_shape_host
+  tools/hermes_generate.cpp
+  tools/tests/mock_generate_prefill_shape_cpu.cpp)
+target_include_directories(test_generate_prefill_shape_host PRIVATE distributed)
+if(UNIX)
+  add_executable(test_generate_logits_dump_atomic_host
+    tools/tests/test_generate_logits_dump_atomic_cpu.cpp
+    tools/tests/mock_generate_prefill_shape_cpu.cpp)
+  target_include_directories(test_generate_logits_dump_atomic_host PRIVATE distributed)
+endif()
+# Build the actual host scheduler with a dedicated CPU-only C++ inclusion
+# rather than changing pp2_batch.cu's CUDA compilation language globally.
+set(HERMES_HOST_SCHED_TESTS
+  test_ready_completion_optin_scheduler
+  test_ready_completion_fault_hardening
+  test_ready_observability_optin_scheduler
+  test_ready_terminal_exception_id_copy
+  test_ready_fairness_credits_cpu)
+foreach(host_scheduler_test IN LISTS HERMES_HOST_SCHED_TESTS)
+  add_executable(host_${host_scheduler_test}
+    distributed/tests/pp2_batch_cpu_only.cpp
+    distributed/tests/${host_scheduler_test}.cpp)
+  target_compile_definitions(host_${host_scheduler_test}
+    PRIVATE HERMES_ADMISSION_CPU_ONLY=1)
+  target_include_directories(host_${host_scheduler_test} PRIVATE distributed)
+  target_link_libraries(host_${host_scheduler_test} PRIVATE Threads::Threads)
+  add_test(NAME host_${host_scheduler_test}
+    COMMAND host_${host_scheduler_test})
+  set_tests_properties(host_${host_scheduler_test} PROPERTIES TIMEOUT 60)
+endforeach()
 if(Python3_Interpreter_FOUND)
   add_test(NAME generate_batched_args_cpu COMMAND
     ${Python3_EXECUTABLE} -B ${CMAKE_SOURCE_DIR}/tools/test_generate_args_cpu.py
     $<TARGET_FILE:hermes_generate>)
   set_tests_properties(generate_batched_args_cpu PROPERTIES TIMEOUT 60)
+  add_test(NAME generate_prefill_shape_host_cpu
+    COMMAND ${Python3_EXECUTABLE} -B
+      ${CMAKE_SOURCE_DIR}/tools/tests/test_generate_prefill_shape_cpu.py
+      $<TARGET_FILE:test_generate_prefill_shape_host>)
+  set_tests_properties(generate_prefill_shape_host_cpu PROPERTIES TIMEOUT 60)
+  if(UNIX)
+    add_test(NAME generate_logits_dump_atomic_host_cpu
+      COMMAND test_generate_logits_dump_atomic_host)
+    set_tests_properties(generate_logits_dump_atomic_host_cpu PROPERTIES TIMEOUT 60)
+  endif()
   # Offline streaming benchmark/comparator contracts: synthetic HTTP,
   # no server, no CUDA, no model load and no external requests.
   add_test(NAME http_sse_latency_contract_cpu COMMAND
