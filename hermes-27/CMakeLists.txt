@@ -58,11 +58,20 @@ if(Python3_Interpreter_FOUND)
   add_test(NAME gpu_owner_attestor_staging_cpu
     COMMAND ${Python3_EXECUTABLE} -B -m unittest
       ops.tests.test_gpu_owner_attestor_staging)
+  add_test(NAME pp2_layer0_scratch_patch_cpu
+    COMMAND ${Python3_EXECUTABLE} -B -m unittest
+      experiments.tests.test_pp2_layer0_trace_patch)
+  add_test(NAME pp2_layer0_scratch_manifest_cpu
+    COMMAND ${Python3_EXECUTABLE} -B -m unittest
+      experiments.tests.test_verify_hermes_layer0_trace)
   set_tests_properties(logit_comparator_cpu release_harness_cpu async_stream_contract_cpu prefill_integration_contract_cpu
     PROPERTIES TIMEOUT 60)
   set_tests_properties(layer0_downstream_capture_manifest_cpu PROPERTIES TIMEOUT 60)
   set_tests_properties(http_soak_harness_cpu ingress_drain_staging_cpu
     gpu_owner_attestor_staging_cpu PROPERTIES
+    TIMEOUT 60 WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+  set_tests_properties(pp2_layer0_scratch_patch_cpu
+    pp2_layer0_scratch_manifest_cpu PROPERTIES
     TIMEOUT 60 WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 endif()
 add_executable(test_gguf_synth model/tests/test_gguf_synth.cpp)

@@ -1,0 +1,87 @@
+# HERMES-27: bounded scratch-only layer0 decode tensor tracer
+
+**Status: CPU contract 10/10 PASS; CUDA 12.8 compile/link PASS.
+Real two-token GPU stage capture NOT EXECUTED. Production source unchanged.**
+This is a diagnostic preparation for an independent llama.cpp stage
+comparison, not evidence of full-model correctness or throughput.
+
+## Implementation
+
+- experiments/pp2_layer0_trace_scratch_patch.py creates a NEW scratch
+  distributed/pp2_fwd.cu from source with exact known anchors. It rejects
+  double patching, changed anchors, output overwrites, project-tree
+  writes and symlinks.
+- Only block0 of run_gdn_decode_layer, only when environment variable
+  HERMES_SCRATCH_LAYER0_TRACE_DIR is set, and only in a preexisting
+  /tmp/h27-* directory may emit two sequential token traces. It rejects
+  async/multiuser mode, verifies finite F32 data, synchronizes the
+  current stream and writes bounded files exclusively (no overwrite).
+- The eleven stages per token are:
+
+| Stage | F32 values | Meaning |
+| --- | ---: | --- |
+| attn_norm | 5120 | first layer RMS input to QKV |
+| linear_attn_qkv_mixed | 10240 | raw NVFP4 QKV before convolution |
+| conv_output_silu | 10240 | causal four-tap conv + SiLU |
+| beta_sigmoid, gate | 48 each | recurrent GDN inputs |
+| q_norm_scaled, k_norm | 6144 each | normalized repeated Q/K |
+| attn_output | 6144 | GDN output |
+| final_output | 6144 | gated normalized GDN output |
+| linear_attn_out | 5120 | SSM projection |
+| attn_residual | 5120 | first residual before FFN |
+
+No GGUF weights or credentials are copied. Each stage has no more
+than 10240 F32 elements. The debugger adds stream synchronization
+only to the disposable instrumented binary.
+
+- experiments/verify_hermes_layer0_trace.py streams the **entire**
+  19,694,360,544-byte GGUF and verifies SHA256
+  db17acbca53da5a7b0e861175b198cc6fd467865e99d1ad53d9dca584257a1a1,
+  all 22 tensor names, shapes, byte sizes, finite values and hashes.
+  It independently hashes the original PP2 source, scratch source and
+  binary before writing a separate manifest. Positions 0 and 1 are
+  **assumed from a controlled serial CLI invocation**, not independently
+  authenticated by an internal PP2 token/position callback.
+  The manifest explicitly says NOT_RELEASE_GATE.
+
+## Offline verification
+
+Isolated source: /tmp/h27-l0-trace-dev/src.
+Isolated patched CUDA candidate: /tmp/h27-l0-trace-dev/candidate.
+
+- Actual source patcher tests: **6/6 PASS**. Missing source anchors,
+  repatching, output overwrites and wrong source are rejected.
+- Mock manifest verifier tests: **4/4 PASS**. Wrong model size/hash,
+  missing/extra stage, invalid length, NaN and source tampering are
+  rejected.
+- Unmodified PP2 source SHA256:
+  0d11b9a15974e56d6ef3003384127759b36a678b8c9fc79e3dcf277781fd145c.
+- Disposable patched PP2 source SHA256:
+  48dd75091ab69f6e416aa6e20cdf05a0b4a0038fc298183a1cb4b4b76a9c651f.
+- CUDA 12.8 SM120a CMake configuration, hermes_generate build and
+  CUDA device-link: **PASS**, without running GPU kernels or touching
+  installed services.
+
+## Bounded real-GPU follow-up (NOT executed)
+
+Only after independent exclusive-GPU authorization and trustworthy
+ingress/process-owner checks, run one scratch serial CLI request:
+prompt IDs **6205,161421**, max-new-tokens **1**, without any batched
+prefill or async flags. Create a new empty /tmp/h27-layer0-* folder,
+set HERMES_SCRATCH_LAYER0_TRACE_DIR to that folder and invoke the
+scratch hermes_generate executable. After it exits, run the new
+verify_hermes_layer0_trace.py with --capture-dir, --model, --source,
+--patched-source, --binary, --out to produce a hashed manifest.
+Never reuse any partial trace after an error.
+
+The authenticated independent llama.cpp pos0 QKV and convolution
+samples already exist. An extended **two-token downstream** llama
+capture is also prepared but has not run. Direct tensor comparisons
+require matching token/position provenance and explicit head-layout
+verification: Q/K head order and Q8_1-versus-BF16 GEMV input
+quantization are not interchangeable.
+
+GPU Manager watchdog, direct Tabby/UniNote/Laya ingress and systemd
+restart paths are not yet fully fenced by a live lease. A scratch
+compile is not permission to interrupt any request. Independent
+full-vocabulary logits still fail. Deployment **NO-GO**.
