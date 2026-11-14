@@ -4,7 +4,9 @@
 // xfer pinned reso thread-safe da mutex in pp2_fwd.cu).
 #include "pp2_batch.hpp"
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstdio>
 #include <limits>
@@ -210,6 +212,9 @@ struct ContinuousScheduler::Job {
   int capacity = 0;
   JobStatus status = JobStatus::queued;
   bool cancel_requested = false;
+  // Only used by opt-in ready completion; exclusively set/cleared under
+  // metadata mutex by the one scheduler pump. Prevents same-state overlap.
+  bool ready_step_in_flight = false;
   std::size_t prompt_consumed = 0;
   std::vector<int> generated;
   std::string error;
@@ -234,6 +239,12 @@ ContinuousScheduler::ContinuousScheduler(SchedulerConfig config, StepBackend& ba
     throw std::invalid_argument(
         "parallel PP2 steps require explicit thread-safe async backend capability");
   }
+  if (config_.enable_ready_completion_dispatch &&
+      (!config_.enable_parallel_steps || config_.enable_batched_prefill ||
+       !backend_.supports_parallel_steps())) {
+    throw std::invalid_argument(
+        "ready completion requires parallel async backend and forbids seeded prefill");
+  }
 }
 
 ContinuousScheduler::~ContinuousScheduler() { shutdown(); }
@@ -248,6 +259,38 @@ void ContinuousScheduler::trim_finished_locked() {
     auto id = std::move(finished_order_.front());
     finished_order_.pop_front();
     jobs_.erase(id);
+  }
+}
+
+// With mutex_ held, terminal retention is best effort. A failed allocation
+// must never skip the DecodeState close or the terminal notification.
+bool ContinuousScheduler::retain_finished_locked(
+    const std::shared_ptr<Job>& job) noexcept {
+  try {
+#ifdef HERMES_ADMISSION_CPU_ONLY
+    if (config_.terminal_before_history_append)
+      config_.terminal_before_history_append();
+#endif
+    finished_order_.push_back(job->request.id);
+    trim_finished_locked();
+    return true;
+  } catch (...) {
+    ++counters_.terminal_history_failures_total;
+    return false;
+  }
+}
+
+// A terminal record without a history entry cannot be retained indefinitely.
+// Deliver its event first, then remove the exact job if still present; a
+// reentrant callback may already have retired it.
+void ContinuousScheduler::forget_unretained(
+    const std::shared_ptr<Job>& job) noexcept {
+  try {
+    std::lock_guard<std::mutex> guard(mutex_);
+    const auto it = jobs_.find(job->request.id);
+    if (it != jobs_.end() && it->second == job) jobs_.erase(it);
+  } catch (...) {
+    // Emergency cleanup cannot make another allocation or throw.
   }
 }
 
@@ -298,6 +341,7 @@ SubmitResult ContinuousScheduler::enqueue(ScheduledRequest request,
 
 bool ContinuousScheduler::cancel(const std::string& id) {
   std::shared_ptr<Job> immediate;
+  bool retained = true;
   {
     std::lock_guard<std::mutex> guard(mutex_);
     auto it = jobs_.find(id);
@@ -312,13 +356,15 @@ bool ContinuousScheduler::cancel(const std::string& id) {
       waiting_.erase(queued);
       job->status = JobStatus::cancelled;
       ++counters_.cancelled_total;
-      finished_order_.push_back(job->request.id);
-      trim_finished_locked();
+      retained = retain_finished_locked(job);
       immediate = job;
     }
   }
   // An opening or active request is reaped by the pump after the backend call.
-  if (immediate) emit_event(immediate, EventKind::terminal);
+  if (immediate) {
+    emit_event(immediate, EventKind::terminal);
+    if (!retained) forget_unretained(immediate);
+  }
   return true;
 }
 
@@ -352,10 +398,31 @@ SchedulerMetrics ContinuousScheduler::metrics() const {
 }
 
 void ContinuousScheduler::emit_event(const std::shared_ptr<Job>& job,
-                                      EventKind kind, int token_id) {
+                                      EventKind kind, int token_id) noexcept {
   if (!config_.on_event) return;
   SchedulerEvent event;
-  {
+  // A terminal callback can be the only wakeup for an HTTP/SSE waiter.
+  // Both the event snapshot and the consumer can allocate/throw. A failed
+  // snapshot gets a minimal *failed* terminal event; if delivery also fails,
+  // the consumer's borrowed-ID emergency notifier must wake its waiters.
+  const auto record_failure = [&]() noexcept {
+    try {
+      std::lock_guard<std::mutex> guard(mutex_);
+      ++counters_.callback_errors_total;
+      if (kind == EventKind::terminal)
+        ++counters_.terminal_delivery_failures_total;
+    } catch (...) {}
+  };
+  const auto wake_failure = [&]() noexcept {
+    if (kind != EventKind::terminal || !config_.on_terminal_delivery_failure)
+      return;
+    try {
+      config_.on_terminal_delivery_failure(job->request.id, job->status);
+    } catch (...) {
+      record_failure();
+    }
+  };
+  try {
     std::lock_guard<std::mutex> guard(mutex_);
     event.kind = kind;
     event.id = job->request.id;
@@ -363,9 +430,30 @@ void ContinuousScheduler::emit_event(const std::shared_ptr<Job>& job,
     event.status = job->status;
     event.prompt_consumed = job->prompt_consumed;
     if (kind == EventKind::terminal) {
+#ifdef HERMES_ADMISSION_CPU_ONLY
+      if (config_.terminal_before_snapshot_copy)
+        config_.terminal_before_snapshot_copy();
+#endif
       event.generated = job->generated;
       event.error = job->error;
     }
+  } catch (...) {
+    record_failure();
+    if (kind == EventKind::terminal) {
+      try {
+        event.kind = EventKind::terminal;
+        if (event.id.empty()) event.id = job->request.id;
+        event.status = JobStatus::failed;
+        event.generated.clear();
+        event.error.clear();
+        config_.on_event(event);
+        return;
+      } catch (...) {
+        record_failure();
+      }
+      wake_failure();
+    }
+    return;
   }
   // Callbacks can signal the HTTP request's condition variable or invoke
   // cancel/inspect/retire safely. A throwing consumer cannot tear down the
@@ -373,32 +461,43 @@ void ContinuousScheduler::emit_event(const std::shared_ptr<Job>& job,
   try {
     config_.on_event(event);
   } catch (...) {
-    std::lock_guard<std::mutex> guard(mutex_);
-    ++counters_.callback_errors_total;
+    record_failure();
+    wake_failure();
   }
 }
 
 void ContinuousScheduler::finish(const std::shared_ptr<Job>& job, JobStatus status,
                                   const std::string& error) {
   void* state = nullptr;
+  bool retained = true;
   {
     std::lock_guard<std::mutex> guard(mutex_);
     if (closed(job->status)) return;
     waiting_.erase(std::remove(waiting_.begin(), waiting_.end(), job), waiting_.end());
     running_.erase(std::remove(running_.begin(), running_.end(), job), running_.end());
+    // All fallible metadata work precedes raw-state ownership transfer.
+    // Failed error text can be dropped; terminal status must remain visible.
+    try {
+#ifdef HERMES_ADMISSION_CPU_ONLY
+      if (config_.terminal_before_error_copy)
+        config_.terminal_before_error_copy();
+#endif
+      job->error = error;
+    } catch (...) {
+      job->error.clear();
+    }
+    retained = retain_finished_locked(job);
     state = job->state;
     job->state = nullptr;
     job->status = status;
-    job->error = error;
     if (status == JobStatus::completed) ++counters_.completed_total;
     else if (status == JobStatus::cancelled) ++counters_.cancelled_total;
     else if (status == JobStatus::expired) ++counters_.expired_total;
     else if (status == JobStatus::failed) ++counters_.failed_total;
-    finished_order_.push_back(job->request.id);
-    trim_finished_locked();
   }
   if (state) backend_.close(state);
   emit_event(job, EventKind::terminal);
+  if (!retained) forget_unretained(job);
 }
 
 void ContinuousScheduler::expire_waiting(SchedulerClock::time_point now) {
@@ -573,6 +672,7 @@ void ContinuousScheduler::promote(std::size_t& remaining_admissions,
 std::size_t ContinuousScheduler::tick(SchedulerClock::time_point now) {
   std::lock_guard<std::mutex> pump(pump_mutex_);
   const auto entered_at = SchedulerClock::now();
+  if (config_.enable_ready_completion_dispatch) return tick_ready(now, entered_at);
   if (config_.enable_parallel_steps) return tick_parallel(now, entered_at);
   // Advance even an injected deterministic clock by actual time spent in
   // backend calls. A long decode must not make a queued request appear
@@ -684,6 +784,354 @@ std::size_t ContinuousScheduler::tick(SchedulerClock::time_point now) {
     }
   }
   return decoded;
+}
+
+std::size_t ContinuousScheduler::tick_ready(
+    SchedulerClock::time_point now, SchedulerClock::time_point entered_at) {
+  // The caller owns the SINGLE pump_mutex_ until ALL started workers have
+  // joined. No second scheduler, no detached threads, no callback from a
+  // backend worker. Work is limited to 16 total steps and max_active states.
+  struct Work {
+    std::shared_ptr<Job> job;
+    int token = -1;
+    long position = -1;
+    std::vector<float> logits;
+    std::string error;
+    bool ok = false;
+    bool accounted = false;
+    std::thread worker;
+  };
+  constexpr std::size_t kMaxSteps = 16;
+  std::array<Work, kMaxSteps> tasks;
+  std::array<std::size_t, kMaxSteps> ready_indices{};
+  std::mutex ready_mutex;
+  std::condition_variable ready_cv;
+  std::size_t ready_published = 0;
+  std::size_t ready_consumed = 0;
+  std::size_t launched = 0;
+  std::size_t reaped = 0;
+  std::size_t outstanding = 0;
+  std::size_t remaining_admissions = 16;
+  bool dispatch_failed = false;
+  // Construct before any thread launch. The unexpected-error recovery is
+  // noexcept and must not allocate another error string under memory stress.
+  const std::string internal_error =
+      "ready completion pump internal exception: scheduler stopped";
+  // Captures a job selected under mutex_ but not yet added to tasks[] if
+  // some unexpected pump-side allocation/callback operation throws.
+  std::shared_ptr<Job> pending_launch;
+  const auto effective_now = [&] {
+    return now + (SchedulerClock::now() - entered_at);
+  };
+
+  // A never-throwing safety net for an unexpected exception in the pump
+  // (e.g. allocation during an SSE callback). All CUDA worker threads must
+  // be joined BEFORE pump_mutex_ can be released and shutdown can free
+  // their DecodeStates. Normal completion joins each worker individually
+  // as its ready record is removed, before ANY commit/close/relaunch.
+  struct JoinRemaining {
+    std::array<Work, kMaxSteps>& tasks;
+    std::size_t& launched;
+    ~JoinRemaining() {
+      for (std::size_t i = 0; i < launched; ++i)
+        if (tasks[i].worker.joinable()) tasks[i].worker.join();
+    }
+  } join_remaining{tasks, launched};
+
+  // Unexpected pump exceptions must NEVER strand an in-flight marker (which
+  // would make all future ticks skip that state), nor release GPU state
+  // before every host worker has returned. Treat the scheduler as poisoned,
+  // join EVERYTHING first, then fail/close ALL remaining jobs. This does not
+  // catch a genuine fatal process OOM in backend/CUDA, but no unsafe retry
+  // or continuation is ever attempted after this host-side failure.
+  auto fail_closed_after_exception = [&]() noexcept {
+    for (std::size_t i = 0; i < launched; ++i)
+      if (tasks[i].worker.joinable()) tasks[i].worker.join();
+    constexpr std::size_t kMaxJobs = 16 + 32 + 2;
+    std::array<std::shared_ptr<Job>, kMaxJobs> affected;
+    std::size_t count = 0;
+    try {
+      std::lock_guard<std::mutex> guard(mutex_);
+      stopping_ = true;
+      for (std::size_t i = 0; i < launched; ++i) {
+        if (!tasks[i].accounted) {
+          ++counters_.decode_steps_total;
+          ++counters_.parallel_dispatched_steps_total;
+          tasks[i].accounted = true;
+        }
+      }
+      for (const auto& item : jobs_) {
+        const auto& job = item.second;
+        if (closed(job->status)) continue;
+        job->ready_step_in_flight = false;
+        // Admission is bounded to max_active <=16 + queue<=32; one
+        // opening request may additionally be temporarily outside queues.
+        if (count < affected.size()) affected[count++] = job;
+      }
+      if (pending_launch && !closed(pending_launch->status)) {
+        const bool found = std::any_of(affected.begin(), affected.begin()+count,
+            [&](const std::shared_ptr<Job>& j) { return j == pending_launch; });
+        if (!found && count < affected.size()) {
+          pending_launch->ready_step_in_flight = false;
+          affected[count++] = pending_launch;
+        }
+      }
+    } catch (...) {
+      // An unrecoverable metadata lock/allocation failure still cannot free
+      // a running worker early, because all workers have already joined.
+      return;
+    }
+    for (std::size_t i = 0; i < count; ++i) {
+      try { finish(affected[i], JobStatus::failed, internal_error); }
+      catch (...) {
+        // Do not retry corrupted state or reopen ingress after OOM.
+        // stopping_ remains latched; higher-level shutdown is required.
+      }
+    }
+  };
+
+  try {
+  while (true) {
+    bool stopping;
+    {
+      std::lock_guard<std::mutex> guard(mutex_);
+      stopping = stopping_;
+    }
+    if (!stopping) {
+      expire_waiting(effective_now());
+      // Existing PP2 decode_init and RAW seed allocations can synchronize
+      // default streams. Admit only when NO backend step is in flight.
+      // This conservative boundary preserves the existing async ownership
+      // contract; fast active requests can still advance during slow peers.
+      if (outstanding == 0 && launched < config_.steps_per_tick)
+        promote(remaining_admissions, now, entered_at);
+    }
+
+    while (!stopping && !dispatch_failed &&
+           launched < config_.steps_per_tick &&
+           outstanding < config_.max_active) {
+      std::shared_ptr<Job> job;
+      std::vector<std::shared_ptr<Job>> idle_cancelled;
+      int token = -1;
+      long position = -1;
+      {
+        std::lock_guard<std::mutex> guard(mutex_);
+        if (stopping_) {
+          stopping = true;
+        } else {
+          // Preserve FIFO admission and round-robin LAUNCH fairness.
+          // Skip states with an unfinished prior step. Never enqueue
+          // two threads with the same request state/absolute position.
+          const std::size_t candidates = running_.size();
+          for (std::size_t n = 0; n < candidates; ++n) {
+            auto candidate = running_.front();
+            running_.pop_front();
+            running_.push_back(candidate);
+            if (candidate->ready_step_in_flight) continue;
+            if (candidate->cancel_requested) {
+              idle_cancelled.push_back(candidate);
+              continue;
+            }
+            job = candidate;
+            job->ready_step_in_flight = true;
+            pending_launch = job;
+            if (job->prompt_consumed < job->request.prompt.size()) {
+              position = static_cast<long>(job->prompt_consumed);
+              token = job->request.prompt[job->prompt_consumed];
+            } else {
+              position = static_cast<long>(
+                  job->request.prompt.size() + job->generated.size() - 1);
+              token = job->generated.back();
+            }
+            break;
+          }
+        }
+      }
+      for (const auto& cancelled : idle_cancelled)
+        finish(cancelled, JobStatus::cancelled);
+      if (!job) break;
+
+      bool was_cancelled;
+      {
+        std::lock_guard<std::mutex> guard(mutex_);
+        was_cancelled = stopping_ || job->cancel_requested;
+        if (was_cancelled) job->ready_step_in_flight = false;
+      }
+      if (was_cancelled) {
+        finish(job, JobStatus::cancelled);
+        pending_launch.reset();
+        continue;
+      }
+
+      // Every worker owns ONE stable array element. No task-vector
+      // reallocation, no unbounded queue allocation or thread detach.
+      const std::size_t index = launched;
+      Work& work = tasks[index];
+      work.job = job;
+      work.token = token;
+      work.position = position;
+      try {
+#ifdef HERMES_ADMISSION_CPU_ONLY
+        // Pure CPU deterministic injection for partial std::thread creation
+        // failure; completely absent from production CUDA builds.
+        if (config_.ready_before_worker_spawn)
+          config_.ready_before_worker_spawn(launched);
+#endif
+        work.worker = std::thread([this, &tasks, &ready_mutex, &ready_cv,
+                                   &ready_indices, &ready_published, index] {
+          auto& own = tasks[index];
+          try {
+            own.ok = backend_.step(own.job->state, own.token, own.position,
+                                   own.logits, own.error);
+          } catch (const std::exception& e) {
+            // An allocation exception while formatting the error must not
+            // escape a std::thread and call std::terminate. The pump will
+            // still fail this request if the message cannot be retained.
+            try { own.error = e.what(); } catch (...) { own.error.clear(); }
+          } catch (...) {
+            try { own.error = "backend ready step threw unknown exception"; }
+            catch (...) { own.error.clear(); }
+          }
+          // The queue is bounded by steps_per_tick <= 16. A worker only
+          // publishes its index after writing the result. The CV mutex
+          // and a subsequent join establish happens-before for the pump.
+          {
+            std::lock_guard<std::mutex> guard(ready_mutex);
+            ready_indices[ready_published++] = index;
+          }
+          ready_cv.notify_one();
+        });
+      } catch (const std::exception& e) {
+        {
+          std::lock_guard<std::mutex> guard(mutex_);
+          job->ready_step_in_flight = false;
+        }
+        finish(job, JobStatus::failed,
+               std::string("ready host worker creation failed: ") + e.what());
+        dispatch_failed = true; // never silently retry a poisoned admission
+        pending_launch.reset();
+        break;
+      } catch (...) {
+        {
+          std::lock_guard<std::mutex> guard(mutex_);
+          job->ready_step_in_flight = false;
+        }
+        finish(job, JobStatus::failed,
+               "ready host worker creation failed: unknown exception");
+        dispatch_failed = true;
+        pending_launch.reset();
+        break;
+      }
+      if (outstanding == 0) {
+        std::lock_guard<std::mutex> guard(mutex_);
+        ++counters_.parallel_waves_total;
+      }
+      ++launched;
+      ++outstanding;
+      pending_launch.reset();
+    }
+
+    if (outstanding == 0) break;
+
+    // Wait only for THE NEXT finished worker, not the full launched group.
+    // A fast client's SSE result can now be delivered while a slow sibling
+    // is still inside backend_.step. Producer threads never touch scheduler
+    // counters, callbacks, request positions, or DecodeState lifetime.
+    std::size_t index;
+    {
+      std::unique_lock<std::mutex> guard(ready_mutex);
+      // Even if every in-flight backend is slow, recheck waiting-request
+      // deadlines and the shutdown flag at bounded 25ms intervals. This
+      // cannot preempt CUDA, but queued work can expire without waiting
+      // for an unrelated long decode_step to finish.
+      if (!ready_cv.wait_for(guard, std::chrono::milliseconds(25),
+                             [&] { return ready_consumed < ready_published; }))
+        continue;
+      index = ready_indices[ready_consumed++];
+    }
+    Work& work = tasks[index];
+    if (work.worker.joinable()) work.worker.join();
+    --outstanding;
+    ++reaped;
+#ifdef HERMES_ADMISSION_CPU_ONLY
+    // Deterministic CPU-only fault after OWN worker joined but before job
+    // commit. The catch joins remaining workers and fails all active jobs.
+    if (config_.ready_before_commit)
+      config_.ready_before_commit(reaped - 1);
+#endif
+
+    bool cancelled;
+    {
+      std::lock_guard<std::mutex> guard(mutex_);
+      work.job->ready_step_in_flight = false;
+      ++counters_.decode_steps_total;
+      ++counters_.parallel_dispatched_steps_total;
+      work.accounted = true;
+      cancelled = stopping_ || work.job->cancel_requested;
+    }
+    if (cancelled) {
+      finish(work.job, JobStatus::cancelled);
+      continue;
+    }
+    if (!work.ok ||
+        work.logits.size() != static_cast<std::size_t>(config_.vocab_size)) {
+      finish(work.job, JobStatus::failed,
+             "PP2 ready decode failed: " +
+             (work.error.empty() ? "wrong logits size or empty output" : work.error));
+      continue;
+    }
+    int best_id = -1;
+    float best = -std::numeric_limits<float>::infinity();
+    for (std::size_t i = 0; i < work.logits.size(); ++i) {
+      if (!std::isfinite(work.logits[i])) {
+        best_id = -1;
+        work.error = "non-finite logit";
+        break;
+      }
+      if (work.logits[i] > best) {
+        best = work.logits[i];
+        best_id = static_cast<int>(i);
+      }
+    }
+    if (best_id < 0) {
+      finish(work.job, JobStatus::failed, "invalid ready logits: " + work.error);
+      continue;
+    }
+
+    bool done = false, produced_token = false;
+    {
+      std::lock_guard<std::mutex> guard(mutex_);
+      if (work.job->prompt_consumed < work.job->request.prompt.size()) {
+        ++work.job->prompt_consumed;
+        if (work.job->prompt_consumed == work.job->request.prompt.size()) {
+          work.job->generated.push_back(best_id);
+          produced_token = true;
+        }
+      } else {
+        work.job->generated.push_back(best_id);
+        produced_token = true;
+      }
+      done = !work.job->generated.empty() &&
+             (work.job->generated.back() == config_.eos_token_id ||
+              work.job->generated.size() >=
+                  static_cast<std::size_t>(work.job->request.max_new_tokens));
+    }
+    if (produced_token) emit_event(work.job, EventKind::token, best_id);
+    bool cancelled_after_event;
+    {
+      std::lock_guard<std::mutex> guard(mutex_);
+      cancelled_after_event = stopping_ || work.job->cancel_requested;
+    }
+    if (done || cancelled_after_event)
+      finish(work.job, cancelled_after_event ? JobStatus::cancelled
+                                            : JobStatus::completed);
+  }
+  } catch (...) {
+    fail_closed_after_exception();
+  }
+  // All launched worker threads were reaped individually. Shutdown can
+  // safely acquire pump_mutex_ after this return and close surviving states.
+  return reaped;
 }
 
 std::size_t ContinuousScheduler::tick_parallel(

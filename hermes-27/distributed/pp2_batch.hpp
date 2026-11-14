@@ -132,12 +132,40 @@ struct SchedulerConfig {
   // supports_parallel_steps() and (for PP2) HERMES_PP2_ASYNC_STREAMS=1.
   // Default false retains the original one-step-at-a-time scheduling path.
   bool enable_parallel_steps = false;
+  // Independent strict opt-in layered on enable_parallel_steps: commit each
+  // request as soon as its own backend step has returned and that worker has
+  // been joined, WITHOUT waiting for the slowest sibling in the host wave.
+  // Requires a backend advertising supports_parallel_steps(); real PP2 only
+  // advertises this under HERMES_PP2_ASYNC_STREAMS=1. Seeded prefill is
+  // incompatible with this path. Default false keeps old wave-join behavior.
+  bool enable_ready_completion_dispatch = false;
+#ifdef HERMES_ADMISSION_CPU_ONLY
+  // CPU-ONLY deterministic std::thread-construction failure injection.
+  // Not included in production/CUDA SchedulerConfig builds.
+  std::function<void(std::size_t)> ready_before_worker_spawn;
+  // CPU-ONLY unexpected pump exception injection AFTER the selected worker
+  // was joined but BEFORE its per-job in-flight marker/result is committed.
+  // Validates global fail-closed cleanup; absent from production builds.
+  std::function<void(std::size_t)> ready_before_commit;
+  // CPU-only deterministic allocation failures inside terminalization.
+  // These are deliberately called while the metadata lock is held.
+  std::function<void()> terminal_before_error_copy;
+  std::function<void()> terminal_before_history_append;
+  // Called after the terminal ID is prepared but before copying its vector.
+  std::function<void()> terminal_before_snapshot_copy;
+#endif
   // Synchronous, optional event sink: no callbacks under metadata lock.
   // Must be thread-safe: queued cancellation calls it from the canceller,
   // admission, tokens and other terminal events from the pump. May call
   // cancel/inspect/retire/enqueue, but never tick/shutdown from this callback.
   // Keep it nonblocking and bound HTTP/SSE queues; cancel on backpressure.
   std::function<void(const SchedulerEvent&)> on_event;
+  // Last-resort allocation-free terminal wakeup when event construction or
+  // on_event throws. The ID is borrowed from a live job; copy nothing before
+  // setting the consumer's done/error flag and notifying its waiters.
+  // Must not throw, call tick/shutdown, or retain the string reference.
+  std::function<void(const std::string&, JobStatus)>
+      on_terminal_delivery_failure;
 };
 
 struct SchedulerMetrics {
@@ -160,6 +188,8 @@ struct SchedulerMetrics {
   std::size_t prefill_failed_total = 0;
   std::size_t prefill_prompt_tokens_total = 0;
   std::size_t callback_errors_total = 0;
+  std::size_t terminal_delivery_failures_total = 0;
+  std::size_t terminal_history_failures_total = 0;
 };
 
 enum class PrefillResult { unsupported, success, failed, seeded = success };
@@ -221,13 +251,20 @@ class ContinuousScheduler {
   void promote(std::size_t& remaining_admissions,
                SchedulerClock::time_point logical_now,
                SchedulerClock::time_point entered_at);
-  void emit_event(const std::shared_ptr<Job>& job, EventKind kind, int token_id = -1);
+  void emit_event(const std::shared_ptr<Job>& job, EventKind kind,
+                  int token_id = -1) noexcept;
   bool closed(JobStatus status) const;
   void trim_finished_locked();
+  bool retain_finished_locked(const std::shared_ptr<Job>& job) noexcept;
+  void forget_unretained(const std::shared_ptr<Job>& job) noexcept;
   // Called with pump_mutex_ held. Never holds mutex_ across backend calls;
   // callbacks and frees are pump-owned and occur only after wave joins.
   std::size_t tick_parallel(SchedulerClock::time_point now,
                             SchedulerClock::time_point entered_at);
+  // Same single pump owner; per-tick bounded worker-completion CV queue.
+  // Every worker is JOINED before its state is advanced, reused or closed.
+  std::size_t tick_ready(SchedulerClock::time_point now,
+                         SchedulerClock::time_point entered_at);
 
   SchedulerConfig config_;
   StepBackend& backend_;
