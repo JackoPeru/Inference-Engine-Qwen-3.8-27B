@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fcntl.h>
 #include <limits>
@@ -38,6 +39,7 @@ struct Options {
   int eos_token = -1;
   bool verify_prefill = false;
   bool batched_prefill = false;
+  bool sliding_kv = false;
   std::string logits_dump_dir;
 };
 
@@ -45,7 +47,8 @@ void usage(FILE* out) {
   std::fprintf(out,
     "Usage: hermes_generate --model FILE.gguf --prompt-ids ID[,ID...] "
     "[--prompt-ids ID[,ID...]] [--max-new-tokens N] [--eos-token ID] "
-    "[--verify-prefill] [--batched-prefill] [--dump-logits-dir EXISTING_DIRECTORY]\n"
+    "[--verify-prefill] [--batched-prefill] [--sliding-kv] "
+    "[--dump-logits-dir EXISTING_DIRECTORY]\n"
     "Greedy PP2 token-ID generation. EOS defaults to GGUF metadata.\n"
     "Each prompt gets fresh decode state. Context limit: 8192 tokens.\n"
     "Default seed runs decode_step per token (sequential T=1).\n"
@@ -53,6 +56,11 @@ void usage(FILE* out) {
     "default GEMV uses raw GGUF; HERMES_PP2_PREFILL_BF16=1 remains a strict\n"
     "experimental quality gate and can reject the request.\n"
     "--verify-prefill compares seed logits with full prefill (prompt <= 64).\n"
+    "--sliding-kv requires HERMES_PP2_SLIDING_KV=1 and uses exactly 8192\n"
+    "resident KV slots; prompt <=8192, max-new-tokens 1..8192. Positions\n"
+    "remain absolute (<2^20), but full attention evicts older KV entries.\n"
+    "Sliding requires sequential decode and refuses batched/verify prefill,\n"
+    "BF16 prefill, packed4 GEMV and L26 debug modes. Experimental only.\n"
     "Chunked prefill and MTP are not supported by this path.\n"
     "Optional logits dump creates prompt_<index>_step_<index>.f32 files;\n"
     "step 0 is post-seed logits for the first greedy generated token.\n");
@@ -144,6 +152,7 @@ bool parse_options(int argc, char** argv, Options& opts) {
     if(arg == "--help" || arg == "-h") { usage(stdout); return false; }
     if(arg == "--verify-prefill") { opts.verify_prefill = true; continue; }
     if(arg == "--batched-prefill") { opts.batched_prefill = true; continue; }
+    if(arg == "--sliding-kv") { opts.sliding_kv = true; continue; }
     if(i + 1 >= argc) {
       std::fprintf(stderr, "ERROR: missing value for %.*s\n", (int)arg.size(), arg.data());
       return false;
@@ -178,6 +187,30 @@ bool parse_options(int argc, char** argv, Options& opts) {
     usage(stderr);
     return false;
   }
+  const char* sliding_env = std::getenv("HERMES_PP2_SLIDING_KV");
+  const bool backend_sliding = sliding_env && std::string_view(sliding_env) == "1";
+  if(opts.sliding_kv && !backend_sliding) {
+    std::fprintf(stderr, "ERROR: --sliding-kv requires HERMES_PP2_SLIDING_KV=1\n");
+    return false;
+  }
+  if(!opts.sliding_kv && backend_sliding) {
+    std::fprintf(stderr, "ERROR: HERMES_PP2_SLIDING_KV=1 requires explicit --sliding-kv\n");
+    return false;
+  }
+  if(opts.sliding_kv) {
+    if(opts.verify_prefill || opts.batched_prefill) {
+      std::fprintf(stderr, "ERROR: --sliding-kv cannot combine with --verify-prefill or --batched-prefill\n");
+      return false;
+    }
+    const char* packed = std::getenv("HERMES_NVFP4_GEMV");
+    const char* bf16 = std::getenv("HERMES_PP2_PREFILL_BF16");
+    if((packed && std::string_view(packed) == "packed4") ||
+       (bf16 && std::string_view(bf16) == "1") ||
+       std::getenv("HERMES_L26")) {
+      std::fprintf(stderr, "ERROR: --sliding-kv incompatible with packed4 GEMV, BF16 prefill or L26 debug\n");
+      return false;
+    }
+  }
   if(!opts.logits_dump_dir.empty()) {
     std::error_code ec;
     const auto root = std::filesystem::path(opts.logits_dump_dir);
@@ -199,7 +232,19 @@ bool parse_options(int argc, char** argv, Options& opts) {
   }
   for(std::size_t i = 0; i < opts.prompts.size(); ++i) {
     const auto size = opts.prompts[i].size();
-    if(size > (std::size_t)kMaxContext || size + (std::size_t)opts.max_new_tokens - 1 > (std::size_t)kMaxContext) {
+    if(opts.sliding_kv && size > (std::size_t)kMaxContext) {
+      std::fprintf(stderr, "ERROR: prompt %zu exceeds sliding seed context limit %d\n", i, kMaxContext);
+      return false;
+    }
+    if(opts.sliding_kv &&
+       size + (std::size_t)opts.max_new_tokens - 1 >
+           (std::size_t)pp2::SLIDING_KV_ABSOLUTE_POSITION_LIMIT) {
+      std::fprintf(stderr, "ERROR: prompt %zu plus generation exceeds sliding absolute position limit\n", i);
+      return false;
+    }
+    if(!opts.sliding_kv &&
+       (size > (std::size_t)kMaxContext ||
+        size + (std::size_t)opts.max_new_tokens - 1 > (std::size_t)kMaxContext)) {
       std::fprintf(stderr, "ERROR: prompt %zu plus max-new-tokens needs more than PP2 context limit %d\n", i, kMaxContext);
       return false;
     }
@@ -279,6 +324,9 @@ int main(int argc, char** argv) {
     return 1;
   }
   std::fprintf(stderr, "MODEL %s eos=%d context_limit=%d MTP=off\n", opts.model.c_str(), eos, kMaxContext);
+  if(opts.sliding_kv)
+    std::fprintf(stderr, "SLIDING KV window=%d absolute_position_limit=%d experimental=1\n",
+                 kMaxContext, pp2::SLIDING_KV_ABSOLUTE_POSITION_LIMIT);
 
   for(std::size_t pi = 0; pi < opts.prompts.size(); ++pi) {
     const auto& prompt = opts.prompts[pi];
@@ -305,7 +353,8 @@ int main(int argc, char** argv) {
     }
 
     pp2::DecodeState state{};
-    const int context_capacity=(int)(prompt.size()+(std::size_t)opts.max_new_tokens-1);
+    const int context_capacity=opts.sliding_kv ? kMaxContext :
+        (int)(prompt.size()+(std::size_t)opts.max_new_tokens-1);
     if(!pp2::decode_init(state, err, context_capacity)) {
       std::fprintf(stderr, "ERROR: prompt %zu decode init failed: %s\n", pi, err.c_str());
       pp2::free_all();
