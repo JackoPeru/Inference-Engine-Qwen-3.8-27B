@@ -225,6 +225,19 @@ struct ContinuousScheduler::Job {
   std::vector<int> generated;
   std::string error;
   void* state = nullptr; // exclusively owned by the scheduler pump
+  // Only read/written under callback_mutex_. These are independent of GPU
+  // lifetime and remain valid as long as a callback delivery holds a ref.
+  bool callback_running = false;
+  bool callback_poisoned = false;
+  bool callback_emergency_sent = false;
+  // Async delivery acknowledgment fence. A request cannot advance the
+  // backend past an unconsumed admitted/token callback, preserving the
+  // serving layer's ability to cancel it on SSE backpressure.
+  std::atomic<unsigned> callback_unconsumed{0};
+  // Only read/written under mutex_; a successful final token is not a
+  // completed terminal until the consumer callback has had a chance to
+  // cancel. The pump, never the callback thread, closes DecodeState.
+  bool ready_pending_final = false;
 };
 
 namespace {
@@ -376,7 +389,39 @@ ContinuousScheduler::ContinuousScheduler(SchedulerConfig config, StepBackend& ba
     throw std::invalid_argument(
         "ready completion requires parallel async backend and forbids seeded prefill");
   }
+  if (config_.enable_ready_callback_delivery &&
+      (!config_.enable_ready_completion_dispatch ||
+       config_.max_active < 2 || !config_.on_event ||
+       !config_.on_terminal_delivery_failure)) {
+    throw std::invalid_argument(
+        "async ready callbacks require ready mode, >=2 active slots, "
+        "event sink, and no-throw terminal emergency notifier");
+  }
   counters_.observability_enabled = config_.enable_observability;
+  if (config_.enable_ready_callback_delivery) {
+    try {
+      for (std::size_t i = 0; i < config_.max_active; ++i) {
+#ifdef HERMES_ADMISSION_CPU_ONLY
+        if (config_.callback_before_worker_spawn)
+          config_.callback_before_worker_spawn(i);
+#endif
+        callback_workers_[i] = std::thread(
+            [this] { callback_worker_loop(); });
+        ++callback_workers_started_;
+      }
+    } catch (...) {
+      // A throwing constructor never invokes ~ContinuousScheduler(). Join
+      // every thread already started before rethrowing to avoid terminate.
+      {
+        std::lock_guard<std::mutex> lock(callback_mutex_);
+        callback_stop_ = true;
+      }
+      callback_cv_.notify_all();
+      for (std::size_t i = 0; i < callback_workers_started_; ++i)
+        if (callback_workers_[i].joinable()) callback_workers_[i].join();
+      throw;
+    }
+  }
 }
 
 ContinuousScheduler::~ContinuousScheduler() { shutdown(); }
@@ -424,6 +469,173 @@ void ContinuousScheduler::forget_unretained(
   } catch (...) {
     // Emergency cleanup cannot make another allocation or throw.
   }
+}
+
+// Fail the consumer transport once. The scheduler keeps ownership of the
+// backend state until its normal joined-step terminal path; callback
+// workers never touch that state. All queued messages for this one request
+// become invalid after a failed/missing event, so discard them before
+// notifying the consumer. No allocation or user callback under either lock.
+void ContinuousScheduler::poison_callback_delivery(
+    const std::shared_ptr<Job>& job) noexcept {
+  bool notify = false;
+  try {
+    {
+      std::lock_guard<std::mutex> guard(callback_mutex_);
+      job->callback_poisoned = true;
+      if (!job->callback_emergency_sent) {
+        job->callback_emergency_sent = true;
+        notify = true;
+      }
+      for (auto& slot : callback_slots_) {
+        if (slot.occupied && slot.job == job) {
+          slot.occupied = false;
+          slot.job.reset();
+          slot.event = SchedulerEvent{};
+          --callback_queued_;
+          job->callback_unconsumed.fetch_sub(1, std::memory_order_release);
+        }
+      }
+      if (callback_queued_ == 0 && callback_running_ == 0)
+        callback_drained_cv_.notify_all();
+    }
+    callback_cv_.notify_all();
+    if (!notify) return;
+    {
+      std::lock_guard<std::mutex> guard(mutex_);
+      if (!closed(job->status)) job->cancel_requested = true;
+      ++counters_.callback_errors_total;
+      ++counters_.terminal_delivery_failures_total;
+    }
+    // Contract: borrowed ID, must not allocate, reenter the pump, or throw.
+    // The original job is kept alive by this shared_ptr even if retired.
+    config_.on_terminal_delivery_failure(job->request.id, JobStatus::failed);
+  } catch (...) {
+    // Even if the emergency sink violates its no-throw contract, preserve
+    // DecodeState ownership and avoid terminating the worker thread.
+  }
+}
+
+bool ContinuousScheduler::post_callback(
+    const std::shared_ptr<Job>& job, SchedulerEvent&& event) noexcept {
+  bool posted = false;
+  try {
+    {
+      std::lock_guard<std::mutex> guard(callback_mutex_);
+      if (!callback_stop_ && !job->callback_poisoned &&
+          callback_queued_ < callback_slots_.size() &&
+          callback_next_order_ != UINT64_MAX) {
+        for (auto& slot : callback_slots_) {
+          if (slot.occupied) continue;
+          // std::string/vector/shared_ptr moves cannot allocate. Only the
+          // pump builds the actual terminal payload before entering here.
+          slot.event = std::move(event);
+          slot.job = job;
+          slot.order = callback_next_order_++;
+          slot.occupied = true;
+          ++callback_queued_;
+          job->callback_unconsumed.fetch_add(1, std::memory_order_release);
+          posted = true;
+          break;
+        }
+      }
+    }
+    if (posted) {
+      callback_cv_.notify_all();
+      return true;
+    }
+  } catch (...) {}
+  // Neither silently drop a token nor hide terminal failure on overflow.
+  // This callback is no-throw by contract and runs after queue lock release.
+  poison_callback_delivery(job);
+  return false;
+}
+
+void ContinuousScheduler::callback_worker_loop() noexcept {
+  for (;;) {
+    SchedulerEvent event;
+    std::shared_ptr<Job> job;
+    {
+      std::unique_lock<std::mutex> guard(callback_mutex_);
+      const auto eligible = [&]() {
+        if (callback_stop_ && callback_queued_ == 0) return true;
+        for (const auto& slot : callback_slots_)
+          if (slot.occupied && !slot.job->callback_running &&
+              !slot.job->callback_poisoned) return true;
+        return false;
+      };
+      callback_cv_.wait(guard, eligible);
+      if (callback_stop_ && callback_queued_ == 0) return;
+      std::size_t chosen = callback_slots_.size();
+      std::uint64_t oldest = UINT64_MAX;
+      for (std::size_t i = 0; i < callback_slots_.size(); ++i) {
+        const auto& slot = callback_slots_[i];
+        if (slot.occupied && !slot.job->callback_running &&
+            !slot.job->callback_poisoned && slot.order < oldest) {
+          oldest = slot.order;
+          chosen = i;
+        }
+      }
+      if (chosen == callback_slots_.size()) continue;
+      auto& slot = callback_slots_[chosen];
+      job = std::move(slot.job);
+      event = std::move(slot.event);
+      slot.occupied = false;
+      --callback_queued_;
+      job->callback_running = true;
+      ++callback_running_;
+    }
+    const auto began = config_.enable_observability ? observation_now_ns() : 0;
+    bool delivered = true;
+    try { config_.on_event(event); }
+    catch (...) { delivered = false; }
+    if (config_.enable_observability) observe_callback(event.kind, began);
+    if (!delivered) {
+      // The pump is forbidden to finalize a successful last token while
+      // the failed consumer has not yet latched cancellation. Preserve
+      // BOTH callback_running and callback_unconsumed across this gap.
+      // Poison takes callback_mutex_, releases it, then takes mutex_;
+      // no thread ever holds both in the reverse order.
+#ifdef HERMES_ADMISSION_CPU_ONLY
+      try {
+        if (config_.callback_before_failure_recovery)
+          config_.callback_before_failure_recovery();
+      } catch (...) {}
+#endif
+      poison_callback_delivery(job);
+    }
+    {
+      std::lock_guard<std::mutex> guard(callback_mutex_);
+      // Only now may the pump observe callback_unconsumed==0. On throw,
+      // poison_callback_delivery has ALREADY set cancel_requested and
+      // delivered the emergency notification.
+      job->callback_running = false;
+      --callback_running_;
+      job->callback_unconsumed.fetch_sub(1, std::memory_order_release);
+      if (callback_queued_ == 0 && callback_running_ == 0)
+        callback_drained_cv_.notify_all();
+    }
+    callback_cv_.notify_all();
+  }
+}
+
+void ContinuousScheduler::stop_callback_workers() {
+  if (!config_.enable_ready_callback_delivery ||
+      callback_workers_started_ == 0) return;
+  {
+    std::unique_lock<std::mutex> guard(callback_mutex_);
+    // No further producers after pump join and the queued-canceller emitter
+    // fence. A blocked user callback may delay shutdown, as it already does
+    // in the synchronous mode; it must return before safe worker teardown.
+    callback_drained_cv_.wait(guard, [&] {
+      return callback_queued_ == 0 && callback_running_ == 0;
+    });
+    callback_stop_ = true;
+  }
+  callback_cv_.notify_all();
+  for (std::size_t i = 0; i < callback_workers_started_; ++i)
+    if (callback_workers_[i].joinable()) callback_workers_[i].join();
+  callback_workers_started_ = 0;
 }
 
 SubmitResult ContinuousScheduler::enqueue(ScheduledRequest request,
@@ -497,12 +709,20 @@ bool ContinuousScheduler::cancel(const std::string& id) {
       ++counters_.cancelled_total;
       retained = retain_finished_locked(job);
       immediate = job;
+      if (config_.enable_ready_callback_delivery) ++cancelled_emitters_;
     }
   }
   // An opening or active request is reaped by the pump after the backend call.
   if (immediate) {
     emit_event(immediate, EventKind::terminal);
     if (!retained) forget_unretained(immediate);
+    if (config_.enable_ready_callback_delivery) {
+      {
+        std::lock_guard<std::mutex> guard(mutex_);
+        --cancelled_emitters_;
+      }
+      cancelled_emitter_cv_.notify_all();
+    }
   }
   return true;
 }
@@ -555,6 +775,10 @@ void ContinuousScheduler::emit_event(const std::shared_ptr<Job>& job,
   const auto wake_failure = [&]() noexcept {
     if (kind != EventKind::terminal || !config_.on_terminal_delivery_failure)
       return;
+    if (config_.enable_ready_callback_delivery) {
+      poison_callback_delivery(job);
+      return;
+    }
     try {
       config_.on_terminal_delivery_failure(job->request.id, job->status);
     } catch (...) {
@@ -563,7 +787,9 @@ void ContinuousScheduler::emit_event(const std::shared_ptr<Job>& job,
   };
   // Timing wraps only the actual sink invocation, never holds mutex_ during
   // user code and samples even if the sink throws.
-  const auto deliver = [&](const SchedulerEvent& snapshot) noexcept {
+  const auto deliver = [&](SchedulerEvent& snapshot) noexcept {
+    if (config_.enable_ready_callback_delivery)
+      return post_callback(job, std::move(snapshot));
     const auto began = config_.enable_observability ? observation_now_ns() : 0;
     bool success = true;
     try {
@@ -596,6 +822,13 @@ void ContinuousScheduler::emit_event(const std::shared_ptr<Job>& job,
     }
   } catch (...) {
     record_failure();
+    // An uncopyable admitted/token event invalidates the client's token
+    // sequence. Fail the transport rather than continuing to generate
+    // seemingly successful tokens from a missing host event.
+    if (config_.enable_ready_callback_delivery && kind != EventKind::terminal) {
+      poison_callback_delivery(job);
+      return;
+    }
     if (kind == EventKind::terminal) {
       // If copying the ID itself exhausted memory, a minimal event has no
       // trustworthy recipient. Prefer the borrowed-ID emergency notifier
@@ -1070,6 +1303,32 @@ std::size_t ContinuousScheduler::tick_ready(
 
   try {
   while (true) {
+    if (config_.enable_ready_callback_delivery) {
+      // Backend ownership always remains with the single pump. Finalize a
+      // request only AFTER its final token callback has returned and could
+      // have signalled SSE backpressure/cancellation. Avoid allocating a
+      // vector while finding eligible terminal jobs.
+      std::array<std::shared_ptr<Job>, kMaxSteps> completed_callbacks{};
+      std::size_t count = 0;
+      {
+        std::lock_guard<std::mutex> guard(mutex_);
+        for (const auto& job : running_) {
+          if (job->ready_pending_final &&
+              job->callback_unconsumed.load(std::memory_order_acquire) == 0 &&
+              count < completed_callbacks.size())
+            completed_callbacks[count++] = job;
+        }
+      }
+      for (std::size_t i = 0; i < count; ++i) {
+        bool cancelled;
+        {
+          std::lock_guard<std::mutex> guard(mutex_);
+          cancelled = stopping_ || completed_callbacks[i]->cancel_requested;
+        }
+        finish(completed_callbacks[i], cancelled ? JobStatus::cancelled
+                                                 : JobStatus::completed);
+      }
+    }
     bool stopping;
     {
       std::lock_guard<std::mutex> guard(mutex_);
@@ -1110,6 +1369,10 @@ std::size_t ContinuousScheduler::tick_ready(
               idle_cancelled.push_back(candidate);
               continue;
             }
+            if (config_.enable_ready_callback_delivery &&
+                (candidate->ready_pending_final ||
+                 candidate->callback_unconsumed.load(
+                     std::memory_order_acquire) != 0)) continue;
             job = candidate;
             job->ready_step_in_flight = true;
             pending_launch = job;
@@ -1213,7 +1476,19 @@ std::size_t ContinuousScheduler::tick_ready(
       pending_launch.reset();
     }
 
-    if (outstanding == 0) break;
+    if (outstanding == 0) {
+      if (config_.enable_ready_callback_delivery && launched == 0) {
+        // All runnable states can be waiting for their own admitted/token
+        // callback acknowledgment. Without a bounded wait, the server's
+        // active>0 outer loop would spin at full CPU speed on tick()==0.
+        // Wait ONLY on the callback mailbox mutex (never metadata mutex),
+        // without invoking callbacks and without blocking shutdown forever.
+        std::unique_lock<std::mutex> guard(callback_mutex_);
+        if (callback_queued_ != 0 || callback_running_ != 0)
+          callback_cv_.wait_for(guard, std::chrono::milliseconds(5));
+      }
+      break;
+    }
 
     // Wait only for THE NEXT finished worker, not the full launched group.
     // A fast client's SSE result can now be delivered while a slow sibling
@@ -1309,7 +1584,11 @@ std::size_t ContinuousScheduler::tick_ready(
       std::lock_guard<std::mutex> guard(mutex_);
       cancelled_after_event = stopping_ || work.job->cancel_requested;
     }
-    if (done || cancelled_after_event)
+    if (done && !cancelled_after_event &&
+        config_.enable_ready_callback_delivery) {
+      std::lock_guard<std::mutex> guard(mutex_);
+      work.job->ready_pending_final = true;
+    } else if (done || cancelled_after_event)
       finish(work.job, cancelled_after_event ? JobStatus::cancelled
                                             : JobStatus::completed);
   }
@@ -1530,6 +1809,7 @@ std::size_t ContinuousScheduler::tick_parallel(
 }
 
 void ContinuousScheduler::shutdown() {
+  std::lock_guard<std::mutex> shutdown_guard(shutdown_mutex_);
   // Fail closed promptly while the pump is blocked on a noninterruptible
   // CUDA step: prevent new enqueue and flag active requests before joining.
   {
@@ -1540,14 +1820,29 @@ void ContinuousScheduler::shutdown() {
     // One opening request may have been popped from waiting_, but promote()
     // checks stopping_ after its GPU allocation and releases that state.
   }
-  std::lock_guard<std::mutex> pump(pump_mutex_);
-  std::vector<std::shared_ptr<Job>> jobs;
   {
-    std::lock_guard<std::mutex> guard(mutex_);
-    jobs.insert(jobs.end(), waiting_.begin(), waiting_.end());
-    jobs.insert(jobs.end(), running_.begin(), running_.end());
+    std::lock_guard<std::mutex> pump(pump_mutex_);
+    std::vector<std::shared_ptr<Job>> jobs;
+    {
+      std::lock_guard<std::mutex> guard(mutex_);
+      jobs.insert(jobs.end(), waiting_.begin(), waiting_.end());
+      jobs.insert(jobs.end(), running_.begin(), running_.end());
+    }
+    for (const auto& job : jobs) finish(job, JobStatus::cancelled);
   }
-  for (const auto& job : jobs) finish(job, JobStatus::cancelled);
+  if (config_.enable_ready_callback_delivery) {
+    // The single pump is stopped and joined. Queued cancellation may have
+    // committed its terminal metadata before shutdown latched stopping_,
+    // then been preempted before calling emit_event outside mutex_. Wait for
+    // those producers before draining the managed callback thread pool.
+    {
+      std::unique_lock<std::mutex> guard(mutex_);
+      cancelled_emitter_cv_.wait(guard, [&] {
+        return cancelled_emitters_ == 0;
+      });
+    }
+    stop_callback_workers();
+  }
 }
 
 #ifndef HERMES_ADMISSION_CPU_ONLY

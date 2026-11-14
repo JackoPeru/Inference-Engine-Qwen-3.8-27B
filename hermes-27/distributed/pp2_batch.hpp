@@ -6,9 +6,11 @@
 // piu` ~75MiB/req/GPU per stati GDN/conv e workspace).
 #include "pp2_fwd.hpp"
 #include <atomic>
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <condition_variable>
 #include <deque>
 #include <functional>
 #include <memory>
@@ -16,6 +18,7 @@
 #include <unordered_map>
 #include <vector>
 #include <string>
+#include <thread>
 
 namespace pp2batch {
 
@@ -141,6 +144,14 @@ struct SchedulerConfig {
   // advertises this under HERMES_PP2_ASYNC_STREAMS=1. Seeded prefill is
   // incompatible with this path. Default false keeps old wave-join behavior.
   bool enable_ready_completion_dispatch = false;
+  // STRICT opt-in, layered on ready completion: deliver host events through
+  // at most max_active managed callback workers instead of blocking the
+  // single GPU pump on a slow independent request's callback. A fixed 64-slot
+  // mailbox preserves per-request order, rejects overflow fail-closed, and
+  // requires a no-throw on_terminal_delivery_failure sink for emergency
+  // wakeup. No thread is detached; shutdown drains/joins callback workers.
+  // The default false preserves synchronous callback semantics exactly.
+  bool enable_ready_callback_delivery = false;
   // Opt-in anonymous, aggregate host-side scheduler timing. Never records
   // prompt text, token IDs, request IDs, or any per-request history; default
   // false costs only a few predictable branches along the scheduling path.
@@ -167,6 +178,13 @@ struct SchedulerConfig {
   // tests. Must not call back into the scheduler or take application locks.
   // Used only with enable_observability=true; production uses steady_clock.
   std::function<SchedulerClock::time_point()> observability_now;
+  // CPU-ONLY deterministic thread-construction fault probe during async
+  // callback dispatcher construction (absent in production).
+  std::function<void(std::size_t)> callback_before_worker_spawn;
+  // CPU-only race latch after a user callback throws but before fail-closed
+  // poisoning. The original callback must remain unacknowledged until its
+  // cancellation and borrowed-ID emergency wakeup are committed.
+  std::function<void()> callback_before_failure_recovery;
 #endif
   // Synchronous, optional event sink: no callbacks under metadata lock.
   // Must be thread-safe: queued cancellation calls it from the canceller,
@@ -308,6 +326,22 @@ class ContinuousScheduler {
                                std::int64_t at_ns) noexcept;
   void observe_callback(EventKind kind, std::int64_t began_ns) noexcept;
   void observe_outstanding(std::size_t outstanding) noexcept;
+  struct DeliverySlot {
+    SchedulerEvent event;
+    std::shared_ptr<Job> job;
+    std::uint64_t order = 0;
+    bool occupied = false;
+  };
+  static constexpr std::size_t kMaxCallbackSlots = 64;
+  static constexpr std::size_t kMaxCallbackWorkers = 16;
+  // All mailbox operations are bounded, allocation-free moves after event
+  // snapshot construction. The mailbox mutex must never be held while
+  // invoking user code, taking mutex_, or joining any thread.
+  bool post_callback(const std::shared_ptr<Job>& job,
+                     SchedulerEvent&& event) noexcept;
+  void poison_callback_delivery(const std::shared_ptr<Job>& job) noexcept;
+  void callback_worker_loop() noexcept;
+  void stop_callback_workers();
   // Called with pump_mutex_ held. Never holds mutex_ across backend calls;
   // callbacks and frees are pump-owned and occur only after wave joins.
   std::size_t tick_parallel(SchedulerClock::time_point now,
@@ -327,6 +361,20 @@ class ContinuousScheduler {
   std::deque<std::string> finished_order_;
   std::unordered_map<std::string, std::shared_ptr<Job>> jobs_;
   SchedulerMetrics counters_;
+  // Only used with enable_ready_callback_delivery. Separate from GPU pump
+  // lock and metadata lock; workers never own DecodeState or backend calls.
+  std::mutex callback_mutex_;
+  std::condition_variable callback_cv_, callback_drained_cv_;
+  std::array<DeliverySlot, kMaxCallbackSlots> callback_slots_{};
+  std::array<std::thread, kMaxCallbackWorkers> callback_workers_{};
+  std::size_t callback_workers_started_ = 0;
+  std::size_t callback_queued_ = 0;
+  std::size_t callback_running_ = 0;
+  std::uint64_t callback_next_order_ = 0;
+  bool callback_stop_ = false;
+  std::mutex shutdown_mutex_;
+  std::condition_variable cancelled_emitter_cv_;
+  std::size_t cancelled_emitters_ = 0; // mutex_-protected
 };
 
 #ifndef HERMES_ADMISSION_CPU_ONLY
