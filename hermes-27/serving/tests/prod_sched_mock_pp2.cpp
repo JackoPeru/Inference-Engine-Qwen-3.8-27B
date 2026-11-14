@@ -74,25 +74,40 @@ bool decode_init(DecodeState& state, std::string& error, int capacity) {
     error = "mock double-initialization of the same PP2 state";
     return false;
   }
+  const char* sliding_flag = std::getenv("HERMES_PP2_SLIDING_KV");
+  const bool sliding = sliding_flag && std::string(sliding_flag) == "1";
+  if (sliding && capacity != DecodeState::MAX_CONTEXT) {
+    error = "mock sliding mode requires physical KV capacity exactly 8192";
+    return false;
+  }
   state.capacity = capacity;
   state.inited = true;
   state.ever_advanced = false;
+  state.sliding_kv_enabled = sliding;
+  state.sliding_kv_poisoned = false;
+  std::fill(std::begin(state.klen), std::end(state.klen), 0);
   trace("open", capacity);
   return true;
 }
 
 std::vector<float> decode_step(int, DecodeState& state, long position,
                                std::string& error) {
-  if (!state.inited || position < 0 || position >= state.capacity) {
+  const bool invalid_position = state.sliding_kv_enabled
+      ? (position >= SLIDING_KV_ABSOLUTE_POSITION_LIMIT ||
+         position != state.klen[0] || state.sliding_kv_poisoned)
+      : position >= state.capacity;
+  if (!state.inited || position < 0 || invalid_position) {
     error = "mock state not initialized or position out of capacity";
     return {};
   }
   state.ever_advanced = true;
   trace("step", position);
   if (std::getenv("FAKE_DECODE_FAIL_ONCE") && !decode_failed_once.exchange(true)) {
+    if (state.sliding_kv_enabled) state.sliding_kv_poisoned = true;
     error = "forced mock decode failure";
     return {};
   }
+  if (state.sliding_kv_enabled) state.klen[0] = static_cast<int>(position) + 1;
   static const std::vector<int> ids = fake_ids();
   const int token = ids[std::min(static_cast<std::size_t>(position), ids.size() - 1)];
   if (token < 0 || token >= 248320) {
@@ -139,6 +154,7 @@ std::vector<float> prefill_into_decode_state(
   }
   stats.prefill_ms = 0.1;
   state.ever_advanced = true;
+  if (state.sliding_kv_enabled) state.klen[0] = static_cast<int>(ids.size());
   return logits;
 }
 
@@ -178,6 +194,7 @@ std::vector<float> prefill_chunks_into_decode_state(
     logits[0] = std::numeric_limits<float>::quiet_NaN();
   stats.prefill_ms = 0.5;
   state.ever_advanced = true;
+  if (state.sliding_kv_enabled) state.klen[0] = static_cast<int>(ids.size());
   return logits;
 }
 

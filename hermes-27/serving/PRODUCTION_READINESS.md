@@ -245,3 +245,77 @@ same-engine state/logit parity is not an HTTP GPU integration test.
 No throughput, independent llama fidelity or production readiness
 is established by CPU mocks. A GPU-exclusive quality gate and
 trusted ingress drain are still mandatory. Production remains NO-GO.
+
+## Experimental ready-completion HTTP scheduler (default OFF)
+
+The strictly opt-in `--ready-completion` flag is a separate mode of the
+existing single `ContinuousScheduler`, not a new request scheduler or
+a replacement for the legacy HTTP route. It requires both
+`--continuous-scheduler` and `--parallel-steps`, together with the exact
+`HERMES_PP2_ASYNC_STREAMS=1` backend capability. Batched and chunked
+prefill are explicitly excluded. Unsupported combinations must fail
+before uploading any model weights.
+
+The intended improvement is narrower than full GPU continuous batching:
+the scheduler can commit a completed request's result after joining that
+request's worker thread, instead of waiting for every request in a
+host-side wave. Each PP2 DecodeState retains a single owner, separate
+CUDA streams, KV/GDN/conv state and request-private transfer buffers.
+Cancellation and shutdown must not release a state until its in-flight
+backend call returns and the relevant streams have drained.
+
+`serving/tests/prod_sched_ready_test.py` is the scoped CPU/mock HTTP
+integration contract for startup rejection, five independent request
+states, SSE/non-stream output parity, Unicode/token usage, and no prompt
+replay. Independent C++ scheduler tests must also prove fast B completion
+while unrelated slow A remains blocked, old-wave behavior unchanged,
+finite logits, exact step positions, callback cancellation and no early
+GPU-state free. CPU checks do **not** measure actual GPU overlap or N4/N8
+throughput. Synchronous tokenizer IPC remains a potential bottleneck.
+
+No production default changes are justified without real, matching
+GGUF+binary CUDA N1/N2/N4/N8 measurements, p50/p95 TTFT/TPOT, full
+248320-logit parity, state isolation/rollback, VRAM, timeouts, shutdown,
+SSE byte/usage parity and repeatable soak. Compare directly to existing
+legacy async and wave-parallel under identical prompts/concurrency;
+reject the opt-in if it does not materially improve aggregate throughput.
+The previously measured +0.656% at N4 and -0.038% at N8 are **not**
+evidence of successful scaling. The full independent llama numerical gate
+remains FAIL and production remains NO-GO.
+
+## Strict experimental rolling-KV HTTP continuation past T8192
+
+`--sliding-kv` is a separately gated legacy-serving integration of
+`HERMES_PP2_SLIDING_KV=1`. The caller must also specify
+`--chunked-prefill --active 1 --context 8192` and
+`HERMES_PP2_CHUNKED_PREFILL=1`; continuous/parallel/ready scheduling,
+async stream opt-ins, packed4/BF16 prefill and layer26 debug modes are
+excluded. An environment flag without the explicit CLI flag and unsafe
+combinations are rejected at startup, before model upload. Defaults are
+unchanged.
+
+In this mode, a request whose prompt has at most 8192 tokens allocates a
+physical **8192-token** KV cache and may request further generated tokens
+up to the separate conservative absolute-position bound 2^20. The last
+prompt logits yield the first generated token without replay; each further
+token enters the **same** PP2 DecodeState at its absolute position.
+The PP2 opt-in ring reads the last 8192 chronological K/V slots, including
+the staged current K/V, before committing eviction. GDN and convolution
+state remain persistent; CUDA failure poisons the state rather than replaying
+or rolling back partially modified recurrence buffers.
+
+`serving/tests/prod_sched_sliding_test.py` uses the real HTTP server and a
+CPU-only fake PP2 backend to check T8192+completion SSE/non-stream,
+absolute step positions, exactly one initialization/chunked seed and close,
+short-prompt fixed capacity, default boundary rejection and unsafe-startup
+rejection. It does **not** execute CUDA attention or compare logits against
+an independent model. Ring attention is **windowed**, not mathematically
+equivalent to unrestricted full-history attention after the boundary.
+
+The GPU implementation requires genuine 8192/8193/16384-token generation
+and a matching independent rolling-window oracle, full-logit/GDN/conv/KV
+checks, GPU VRAM/time/fairness and cancellation/OOM tests before readiness.
+It currently serializes two stream completions per full-attention layer
+after wrap, so latency may be worse. The legacy active=1 restriction means
+this is not a multiuser throughput optimization. It remains an explicitly
+disabled experimental path and cannot be used to justify production GO.

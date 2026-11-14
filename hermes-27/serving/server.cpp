@@ -69,6 +69,8 @@ struct Config {
   bool batched_prefill = false;       // Opt-in seeded PP2 prefill for prompts of <=64.
   bool chunked_prefill = false;       // Experimental legacy-only T65..8192 RAW stateful seed.
   bool parallel_steps = false;        // Opt-in distinct-state concurrent scheduler waves.
+  bool ready_completion = false;      // Opt-in ready-per-request commit (no wave join HOL).
+  bool sliding_kv = false;            // Strict opt-in legacy-only 8192-token rolling KV window.
 };
 
 void usage(FILE* out) {
@@ -80,6 +82,8 @@ void usage(FILE* out) {
     "Experimental: --batched-prefill (seed fresh PP2 state for prompts of 1..64 tokens)\n"
     "Experimental: --chunked-prefill (legacy only, --active 1, HERMES_PP2_CHUNKED_PREFILL=1; RAW T65..8192, uses one-shot at T<=64)\n"
     "Experimental: --parallel-steps (continuous scheduler ONLY; requires HERMES_PP2_ASYNC_STREAMS=1; no seeded prefill)\n"
+    "Experimental: --ready-completion (requires --parallel-steps; commit ready states independently, default OFF)\n"
+    "Experimental: --sliding-kv (requires --chunked-prefill, --context 8192, --active 1, HERMES_PP2_SLIDING_KV=1; NOT full-history parity)\n"
     "Greedy text-only PP2; context defaults to 128. Unsupported sampling/tools are rejected.\n");
 }
 
@@ -105,6 +109,8 @@ bool parse_args(int argc, char** argv, Config& cfg, bool& show_help) {
       continue;
     }
     if (arg == "--parallel-steps") { cfg.parallel_steps = true; continue; }
+    if (arg == "--ready-completion") { cfg.ready_completion = true; continue; }
+    if (arg == "--sliding-kv") { cfg.sliding_kv = true; continue; }
     if (i + 1 >= argc) { std::fprintf(stderr, "missing value for %s\n", arg.c_str()); return false; }
     const char* value = argv[++i];
     if (arg == "--model") cfg.model = value;
@@ -146,7 +152,12 @@ class TokenizerBridge {
     return response.at("text").get<std::string>();
   }
 
-  bool incremental_supported() const { return incremental_; }
+  bool incremental_supported() const noexcept {
+    // A different HTTP thread can restart the tokenizer bridge while the
+    // scheduler pump is processing admission. The restart's capability
+    // update must not race with this read.
+    return incremental_.load(std::memory_order_relaxed);
+  }
 
   void stream_start(const std::string& id) {
     call({{"op", "stream_start"}, {"id", id}});
@@ -171,7 +182,7 @@ class TokenizerBridge {
     if (input_ >= 0) { close(input_); input_ = -1; }
     if (output_ >= 0) { close(output_); output_ = -1; }
     pending_.clear();
-    incremental_ = false;
+    incremental_.store(false, std::memory_order_relaxed);
     if (pid_ <= 0) return;
     const pid_t child = pid_;
     pid_ = -1;
@@ -225,7 +236,8 @@ class TokenizerBridge {
       json ready = json::parse(read_line());
       if (!ready.value("ready", false))
         throw std::runtime_error("tokenizer startup: " + ready.value("error", "no ready response"));
-      incremental_ = ready.value("incremental", false);
+      incremental_.store(ready.value("incremental", false),
+                         std::memory_order_relaxed);
     } catch (...) {
       stop_child();
       throw;
@@ -299,7 +311,7 @@ class TokenizerBridge {
   pid_t pid_ = -1;
   int input_ = -1, output_ = -1;
   std::string pending_;
-  bool incremental_ = false;
+  std::atomic<bool> incremental_{false};
   std::mutex mutex_;
 };
 
@@ -412,7 +424,7 @@ class Scheduler {
   Scheduler(TokenizerBridge& tokenizer, int eos, const Config& cfg)
       : tokenizer_(tokenizer), eos_(eos), active_limit_(cfg.active), queue_limit_(cfg.queued),
         queue_timeout_(cfg.queue_timeout_sec), batched_prefill_(cfg.batched_prefill),
-        chunked_prefill_(cfg.chunked_prefill) {
+        chunked_prefill_(cfg.chunked_prefill), sliding_kv_(cfg.sliding_kv) {
     if (cfg.continuous_scheduler) {
       backend_ = std::make_unique<ServerContinuousBackend>();
       pp2batch::SchedulerConfig options;
@@ -426,9 +438,14 @@ class Scheduler {
       options.max_retained = 64;
       options.enable_batched_prefill = cfg.batched_prefill;
       options.enable_parallel_steps = cfg.parallel_steps;
+      options.enable_ready_completion_dispatch = cfg.ready_completion;
       options.on_event = [this](const pp2batch::SchedulerEvent& event) {
         continuous_event(event);
       };
+      options.on_terminal_delivery_failure =
+          [this](const std::string& id, pp2batch::JobStatus) noexcept {
+            terminal_delivery_failed(id);
+          };
       continuous_ = std::make_unique<pp2batch::ContinuousScheduler>(options, *backend_);
     }
     worker_ = std::thread(&Scheduler::run, this);
@@ -556,6 +573,41 @@ class Scheduler {
   }
 
  private:
+  // The scheduler invokes this borrowed-ID hook if constructing/delivering
+  // its terminal event throws. Never allocate, retain the ID, or call back
+  // into tick()/shutdown(): a failed HTTP waiter must still be awakened.
+  void terminal_delivery_failed(const std::string& id) noexcept {
+    std::shared_ptr<Job> job;
+    try {
+      std::lock_guard<std::mutex> lock(mutex_);
+      const auto it = jobs_.find(id);
+      if (it != jobs_.end()) job = it->second.lock();
+    } catch (...) { return; }
+    if (job) fail_terminal_transport_noexcept(job);
+  }
+
+  void fail_terminal_transport_noexcept(const std::shared_ptr<Job>& job) noexcept {
+    try {
+      std::lock_guard<std::mutex> lock(job->mutex);
+      if (job->done.load()) return;
+      job->http_status = 500;
+      job->error.clear();
+      if (job->stream) {
+        // Best effort only: exhaustion may prevent an SSE delimiter, but
+        // cannot prevent done/notify and strand the requesting client.
+        try {
+          job->stream_chunks.emplace_back("data: [DONE]\n\n");
+          job->stream_buffered_bytes += job->stream_chunks.back().size();
+        } catch (...) {}
+      }
+      job->done.store(true);
+    } catch (...) {
+      job->done.store(true);
+    }
+    job->cv.notify_all();
+    metrics_.errors.fetch_add(1);
+  }
+
   void continuous_event(const pp2batch::SchedulerEvent& event) {
     std::shared_ptr<Job> job;
     {
@@ -618,6 +670,13 @@ class Scheduler {
     // Terminal event occurs exactly once, after ContinuousScheduler has
     // released the privately owned DecodeState. There is no second free.
     if (job->done.load()) return;
+#ifdef HERMES_ADMISSION_CPU_ONLY
+    if (std::getenv("HERMES_TEST_FAIL_TERMINAL_EVENT_ONCE")) {
+      static std::atomic<unsigned> terminal_event_failures{0};
+      if (terminal_event_failures.fetch_add(1) == 0)
+        throw std::bad_alloc();
+    }
+#endif
     if (job->output != event.generated && job->callback_error.empty())
       job->callback_error = "continuous scheduler token/event sequence mismatch";
     int status = 200;
@@ -741,8 +800,21 @@ class Scheduler {
     job->sent_bytes = job->text.size();
   }
 
-  void complete(const std::shared_ptr<Job>& job, int status, std::string error,
-                const std::string& finish_reason) {
+  // A terminal notification is mandatory even when JSON construction,
+  // stream buffering, or tokenizer result assembly exhausts host memory.
+  // Do not let a throwing HTTP callback strand clients after the scheduler
+  // has already released the PP2 DecodeState and marked its job terminal.
+  void complete(const std::shared_ptr<Job>& job, int status, const std::string& error,
+                const std::string& finish_reason) noexcept {
+    try {
+      complete_impl(job, status, error, finish_reason);
+    } catch (...) {
+      fail_terminal_transport_noexcept(job);
+    }
+  }
+
+  void complete_impl(const std::shared_ptr<Job>& job, int status, std::string error,
+                     const std::string& finish_reason) {
     if (job->state_ready) { pp2::decode_free(job->state); job->state_ready = false; }
     const bool was_cancelled = job->cancel.load();
     if (was_cancelled && status == 200) error.clear();
@@ -778,6 +850,16 @@ class Scheduler {
       catch (const std::exception& e) { status = 500; error = std::string("detokenization failed: ") + e.what(); }
     }
     if (status == 200) stream_text(job);
+
+#ifdef HERMES_ADMISSION_CPU_ONLY
+    // Mock-server-only failpoint. Proves a terminal JSON/stream allocation
+    // failure cannot leave a request asleep after its PP2 state is closed.
+    // Excluded entirely from the production CUDA server build.
+    if (std::getenv("HERMES_TEST_FAIL_COMPLETE_ONCE")) {
+      static std::atomic<unsigned> terminal_failures{0};
+      if (terminal_failures.fetch_add(1) == 0) throw std::bad_alloc();
+    }
+#endif
 
     if (status == 200) {
       const std::string reason = was_cancelled ? "cancelled" : (job->stop_matched ? "stop" : finish_reason);
@@ -839,7 +921,11 @@ class Scheduler {
       std::lock_guard<std::mutex> lock(mutex_);
       active_count = active_.size();
     }
-    const int context = static_cast<int>(job->prompt.size()) + job->max_new_tokens - 1;
+    // Sliding attention has a FIXED 8192-token physical KV allocation.
+    // Absolute output positions beyond that limit are not extra KV bytes;
+    // they reuse old slots only after the corresponding attention step.
+    const int context = sliding_kv_ ? pp2::DecodeState::MAX_CONTEXT :
+        static_cast<int>(job->prompt.size()) + job->max_new_tokens - 1;
     if (!pp2batch::admit_check(static_cast<int>(active_count + 1), context, why)) return false;
     std::size_t used0 = 0, used1 = 0;
     pp2batch::vram_used(used0, used1);
@@ -1019,7 +1105,8 @@ class Scheduler {
         std::string err;
         // The final generated token is emitted from the previous logits and
         // therefore needs no additional decode state position.
-        const int capacity = static_cast<int>(job->prompt.size()) + job->max_new_tokens - 1;
+        const int capacity = sliding_kv_ ? pp2::DecodeState::MAX_CONTEXT :
+            static_cast<int>(job->prompt.size()) + job->max_new_tokens - 1;
         if (!pp2::decode_init(job->state, err, capacity)) {
           metrics_.rejected.fetch_add(1);
           complete(job, 503, "PP2 state allocation failed: " + err, "length");
@@ -1111,6 +1198,7 @@ class Scheduler {
   int active_limit_, queue_limit_, queue_timeout_;
   bool batched_prefill_ = false;
   bool chunked_prefill_ = false;
+  bool sliding_kv_ = false;
   mutable std::mutex mutex_;
   std::condition_variable cv_;
   std::deque<std::shared_ptr<Job>> queue_;
@@ -1347,6 +1435,12 @@ int main(int argc, char** argv) {
   Config cfg;
   bool show_help = false;
   if (!parse_args(argc, argv, cfg, show_help)) return show_help ? 0 : 2;
+  if (cfg.ready_completion && !cfg.parallel_steps) {
+    std::fprintf(stderr,
+        "--ready-completion requires --continuous-scheduler --parallel-steps "
+        "and the asynchronous PP2 backend (strict opt-in)\n");
+    return 2;
+  }
   if (cfg.parallel_steps) {
     const char* async_flag = std::getenv("HERMES_PP2_ASYNC_STREAMS");
     if (!cfg.continuous_scheduler || cfg.batched_prefill ||
@@ -1370,6 +1464,22 @@ int main(int argc, char** argv) {
           "--chunked-prefill requires legacy scheduler, --active 1, "
           "HERMES_PP2_CHUNKED_PREFILL=1, no async/multiuser/GEMV packed4/L26 "
           "(strict fail-closed; experimental only)\n");
+      return 2;
+    }
+  }
+  const char* sliding_flag = std::getenv("HERMES_PP2_SLIDING_KV");
+  const bool sliding_env_enabled = sliding_flag && std::strcmp(sliding_flag, "1") == 0;
+  if (cfg.sliding_kv || sliding_env_enabled) {
+    // The lower PP2 layer samples this environment variable at decode_init.
+    // Reject implicit activation, other scheduler owners, unsafe settings
+    // and a capacity other than the exact physical 8192-token ring.
+    if (!cfg.sliding_kv || !sliding_env_enabled || !cfg.chunked_prefill ||
+        cfg.continuous_scheduler || cfg.parallel_steps || cfg.ready_completion ||
+        cfg.active != 1 || cfg.context != pp2::DecodeState::MAX_CONTEXT) {
+      std::fprintf(stderr,
+          "--sliding-kv requires explicit HERMES_PP2_SLIDING_KV=1, "
+          "legacy --chunked-prefill, --context 8192, --active 1, "
+          "and forbids continuous/parallel/ready scheduling (fail-closed)\n");
       return 2;
     }
   }
@@ -1492,8 +1602,13 @@ int main(int argc, char** argv) {
       if (std::any_of(prompt.begin(), prompt.end(), [](int id) { return id < 0 || id >= kVocab; })) {
         scheduler.rejected(); set_error(res, 400, "tokenizer returned an ID outside the model vocabulary", "invalid_request_error", "messages", "invalid_value"); return;
       }
+      const std::size_t last_required_position_plus_one =
+          prompt.size() + static_cast<std::size_t>(max_tokens) - 1;
+      const std::size_t max_position_plus_one = cfg.sliding_kv
+          ? static_cast<std::size_t>(pp2::SLIDING_KV_ABSOLUTE_POSITION_LIMIT)
+          : static_cast<std::size_t>(cfg.context);
       if (prompt.size() > static_cast<std::size_t>(cfg.context) ||
-          prompt.size() + static_cast<std::size_t>(max_tokens) - 1 > static_cast<std::size_t>(cfg.context)) {
+          last_required_position_plus_one > max_position_plus_one) {
         scheduler.rejected(); set_error(res, 400, "prompt plus max_tokens exceeds PP2 context limit " + std::to_string(cfg.context), "invalid_request_error", "max_tokens", "context_length_exceeded"); return;
       }
 
