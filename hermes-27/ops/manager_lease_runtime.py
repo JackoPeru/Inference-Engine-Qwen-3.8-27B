@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 import hmac
 import ipaddress
 import json
@@ -22,7 +23,7 @@ from pathlib import Path
 import re
 import subprocess
 import time
-from typing import Any
+from typing import Any, Callable
 
 from fastapi import Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -33,11 +34,44 @@ except ImportError:  # staged next to live manager.py, import as top-level modul
     from manager_lease_core import LeaseRejected, LeaseStoreFault, ManagerLeaseV1
 
 
+@dataclass(frozen=True)
+class LeaseTrustInputs:
+    """Explicitly reviewed, caller-provisioned trust; NEVER read from env.
+
+    This object does not authenticate its own creator. A separately reviewed
+    root-owned deployment must supply the journal secret and verifier after
+    validating the physical checker and independent ingress/GPU provenance.
+    The fields are intentionally excluded from dataclass repr/logging.
+    """
+
+    journal_key: bytes = field(repr=False)
+    proof_verifier: Callable[[str, dict], bool] = field(repr=False)
+    bootstrap_authorized: bool = False
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.journal_key, bytes) or len(self.journal_key) < 32:
+            raise ValueError("journal trust key must be private bytes of length >=32")
+        if not callable(self.proof_verifier):
+            raise ValueError("independent proof verifier is required")
+        if type(self.bootstrap_authorized) is not bool:
+            raise ValueError("bootstrap_authorized must be explicit boolean")
+
+
 class LeaseRuntime:
-    def __init__(self, namespace: dict):
+    def __init__(self, namespace: dict, *, trust: LeaseTrustInputs | None = None):
+        if trust is not None and not isinstance(trust, LeaseTrustInputs):
+            raise TypeError("lease trust must come from explicit reviewed LeaseTrustInputs")
         self.ns = namespace
+        self._trust_supplied = trust is not None
+        # These inputs are NEVER sourced from environment variables, a
+        # request body, a checker output, or the on-disk journal itself.
+        # Default/no trust intentionally constructs a permanently fenced
+        # ManagerLeaseV1 under the hardened core contract.
         self.core = ManagerLeaseV1(
-            os.environ.get("HERMES_MANAGER_LEASE_STORE", "/var/lib/hermes-gpu-manager/lease-v1.json")
+            os.environ.get("HERMES_MANAGER_LEASE_STORE", "/var/lib/hermes-gpu-manager/lease-v1.json"),
+            journal_key=trust.journal_key if trust is not None else None,
+            proof_verifier=trust.proof_verifier if trust is not None else None,
+            bootstrap_authorized=trust.bootstrap_authorized if trust is not None else False,
         )
         self._recovery_task: asyncio.Task | None = None
         self._last_recovery_try = 0.0
@@ -49,12 +83,17 @@ class LeaseRuntime:
     def status_fields(self) -> dict:
         # Claim protocol v1 ONLY when all external attestation hooks are
         # configured. No-op/present-but-unconfigured must remain NO-GO.
-        if not self._configured():
+        if not self._trusted_ready() or not self._configured():
             return {"watchdog_lease_contract_version": None,
                     "manager_instance_id": self.core.instance_id,
                     "maintenance_lease": None,
                     "maintenance_recovery_required": self.core.fenced}
         return self.core.status()
+
+    def _trusted_ready(self) -> bool:
+        # Independent of _configured(): a mocked/present-but-unverified
+        # checker executable cannot bypass missing journal/issuer trust.
+        return self._trust_supplied and not self.core.faulted
 
     async def current_state(self, original: str) -> str:
         if not self.fenced:
@@ -94,6 +133,8 @@ class LeaseRuntime:
         return path
 
     def _configured(self) -> bool:
+        if not self._trusted_ready():
+            return False
         try:
             for key, executable in (("HERMES_MANAGER_LEASE_TOKEN_FILE", False),
                                     ("HERMES_MANAGER_INGRESS_CHECK", True),
@@ -202,8 +243,8 @@ class LeaseRuntime:
     async def operate(self, action: str, body: dict) -> dict:
         if action not in ("acquire", "renew", "release"):
             raise LeaseRejected("unsupported lease operation")
-        if not self._configured():
-            raise LeaseRejected("lease integration unavailable: missing local checker or token")
+        if not self._trusted_ready() or not self._configured():
+            raise LeaseRejected("lease integration unavailable: trusted journal, proof or checker missing")
         async with self._guarded_lock():
             if action == "acquire":
                 # _submit_lock is separate from _lock in the installed
@@ -236,8 +277,8 @@ class LeaseRuntime:
                                      gpu_safe_proof=gpu, tabby_serving=serving)
 
     async def recover(self) -> dict:
-        if not self._configured():
-            raise LeaseRejected("recovery requires independent local proof executables")
+        if not self._trusted_ready() or not self._configured():
+            raise LeaseRejected("recovery requires trusted journal and independent local proof")
         async with self._guarded_lock():
             ingress = await self._proof("HERMES_MANAGER_INGRESS_CHECK")
             gpu = await self._proof("HERMES_MANAGER_GPU_CHECK")
@@ -281,9 +322,15 @@ class LeaseRuntime:
         return True
 
 
-def install_manager_lease(namespace: dict) -> LeaseRuntime:
-    """Register authenticated endpoints on existing manager FastAPI app."""
-    runtime = LeaseRuntime(namespace)
+def install_manager_lease(
+    namespace: dict, *, trust: LeaseTrustInputs | None = None,
+) -> LeaseRuntime:
+    """Stage endpoints; default remains fenced until external trust review.
+
+    Existing one-argument callers receive NO journal key, NO proof verifier,
+    and NO automatic bootstrap. They are intentionally NOT production-ready.
+    """
+    runtime = LeaseRuntime(namespace, trust=trust)
     app = namespace["app"]
     require_laya = namespace["require_laya"]
 

@@ -1,6 +1,8 @@
 """Offline manager lease v1 persistence/fencing tests; no systemctl or GPU."""
 
 from pathlib import Path
+import hashlib
+import hmac
 import json
 import tempfile
 import unittest
@@ -19,8 +21,13 @@ class ManagerLeaseCoreTests(unittest.TestCase):
         self.patch_dir.start()
         self.addCleanup(self.patch_dir.stop)
         self.instance = "a" * 32
+        self.proof_key = b"offline-test-only-fenced-lease-key"
+        self.journal_key = b"offline-test-only-journal-MAC-key-32bytes"
         self.manager = lease.ManagerLeaseV1(self.journal, clock=lambda: self.now,
-                                           instance_id=self.instance)
+                                           instance_id=self.instance,
+                                           proof_verifier=self.authenticate,
+                                           journal_key=self.journal_key,
+                                           bootstrap_authorized=True)
         self.request = {
             "protocol": lease.PROTOCOL,
             "action": "acquire", "owner": lease.OWNER,
@@ -35,19 +42,35 @@ class ManagerLeaseCoreTests(unittest.TestCase):
                 "llm_online": True, "llm_serving": True,
                 "worker_alive_s": 1.0, "transition_lock_held": True}
 
+    def attest(self, kind, value):
+        bare = {key: item for key, item in value.items() if key != "_proof_mac"}
+        payload = (kind + "\0" + json.dumps(
+            bare, sort_keys=True, separators=(",", ":"))).encode("utf-8")
+        return {**bare, "_proof_mac": hmac.new(
+            self.proof_key, payload, hashlib.sha256).hexdigest()}
+
+    def authenticate(self, kind, proof):
+        if not isinstance(proof, dict) or not isinstance(proof.get("_proof_mac"), str):
+            return False
+        expected = self.attest(kind, proof)["_proof_mac"]
+        return hmac.compare_digest(expected, proof["_proof_mac"])
+
     def ingress(self):
-        return {"scope": "all-tabby-clients", "blocked": True,
-                "inflight": 0, "observed_at_unix": self.now}
+        return self.attest("ingress", {
+            "scope": "all-tabby-clients", "blocked": True,
+            "inflight": 0, "observed_at_unix": self.now})
 
     def gpu_before(self):
-        return {"scope": "all-hermes-gpus-and-pids", "gpu_count": 2,
-                "gpu_owner": "none", "gpu_free": True,
-                "hermes_pids": [], "other_gpu_processes": [],
-                "observed_at_unix": self.now}
+        return self.attest("gpu-free", {
+            "scope": "all-hermes-gpus-and-pids", "gpu_count": 2,
+            "gpu_owner": "none", "gpu_free": True,
+            "hermes_pids": [], "other_gpu_processes": [],
+            "observed_at_unix": self.now})
 
     def gpu_after(self):
-        return {**self.gpu_before(), "gpu_owner": "tabby",
-                "gpu_free": False, "tabby_owns_both_gpus": True}
+        return self.attest("gpu-restored", {
+            **self.gpu_before(), "gpu_owner": "tabby",
+            "gpu_free": False, "tabby_owns_both_gpus": True})
 
     def acquire(self):
         return self.manager.acquire(self.request, snapshot=self.idle(), ingress_proof=self.ingress())
@@ -172,7 +195,9 @@ class ManagerLeaseCoreTests(unittest.TestCase):
     def test_process_restart_keeps_outstanding_fence(self):
         self.acquire()
         fresh = lease.ManagerLeaseV1(self.journal, clock=lambda: self.now,
-                                    instance_id="d" * 32)
+                                    instance_id="d" * 32,
+                                    proof_verifier=self.authenticate,
+                                    journal_key=self.journal_key)
         self.assertTrue(fresh.fenced)
         self.assertTrue(fresh.recovery_required)
         self.assertEqual(fresh.status()["maintenance_lease"]["status"], "recovery_required")
@@ -184,7 +209,9 @@ class ManagerLeaseCoreTests(unittest.TestCase):
         self.manager.release(self.holder("release"), ingress_proof=self.ingress(),
                              gpu_safe_proof=self.gpu_after(), tabby_serving=True)
         fresh = lease.ManagerLeaseV1(self.journal, clock=lambda: self.now,
-                                    instance_id="d" * 32)
+                                    instance_id="d" * 32,
+                                    proof_verifier=self.authenticate,
+                                    journal_key=self.journal_key)
         self.assertFalse(fresh.fenced)
         req = {**self.request, "manager_instance_id": "d" * 32,
                "lease_id": "e" * 32}
@@ -295,7 +322,8 @@ class ManagerLeaseCoreTests(unittest.TestCase):
     def test_corrupt_persisted_journal_never_unfences(self):
         self.journal.parent.mkdir(parents=True, exist_ok=True)
         self.journal.write_text("{invalid JSON")
-        fresh = lease.ManagerLeaseV1(self.journal, clock=lambda: self.now)
+        fresh = lease.ManagerLeaseV1(self.journal, clock=lambda: self.now,
+                                    journal_key=self.journal_key)
         self.assertTrue(fresh.faulted)
         self.assertTrue(fresh.fenced)
         with self.assertRaises(lease.LeaseStoreFault):
@@ -312,7 +340,8 @@ class ManagerLeaseCoreTests(unittest.TestCase):
         self.journal.parent.mkdir(parents=True, exist_ok=True)
         self.journal.write_text(json.dumps({"version": 1, "counter": -1,
                                             "recovery_required": False, "lease": None}))
-        fresh = lease.ManagerLeaseV1(self.journal, clock=lambda: self.now)
+        fresh = lease.ManagerLeaseV1(self.journal, clock=lambda: self.now,
+                                    journal_key=self.journal_key)
         self.assertTrue(fresh.fenced)
 
     def test_gpu_proof_denies_active_unknown_gpu_process(self):

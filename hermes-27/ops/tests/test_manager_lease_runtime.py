@@ -1,6 +1,9 @@
 """Mock-only FastAPI manager integration tests. No HTTP listeners or CUDA."""
 
 import asyncio
+import hashlib
+import hmac
+import json
 from pathlib import Path
 import os
 import tempfile
@@ -31,6 +34,10 @@ class ManagerLeaseRuntimeTests(unittest.TestCase):
         private.start()
         self.addCleanup(private.stop)
         self.now = time.time()
+        # Disposable, per-test authenticated fixtures. This is NOT a
+        # production trust source or a claim about actual GPUs/ingress.
+        self._fixture_proof_key = os.urandom(32)
+        self._fixture_journal_key = os.urandom(32)
         self.tabby_up = True
         self.restored = False
         self.restore_calls = 0
@@ -60,7 +67,14 @@ class ManagerLeaseRuntimeTests(unittest.TestCase):
             "llm_online": true_online, "llm_serving": true_online,
             "service_active": service_active, "transition_to_llm": restore,
         }
-        self.runtime = runtime_mod.LeaseRuntime(self.ns)
+        self.runtime = runtime_mod.LeaseRuntime(
+            self.ns,
+            trust=runtime_mod.LeaseTrustInputs(
+                journal_key=self._fixture_journal_key,
+                proof_verifier=self.verify_test_proof,
+                bootstrap_authorized=True,
+            ),
+        )
         self.runtime.core.clock = lambda: self.now
         self.enabled = mock.patch.object(self.runtime, "_configured", return_value=True)
         self.enabled.start()
@@ -78,19 +92,38 @@ class ManagerLeaseRuntimeTests(unittest.TestCase):
     def run_async(self, coro):
         return asyncio.run(coro)
 
+    def sign_test_proof(self, kind, proof):
+        unsigned = {k: v for k, v in proof.items() if k != "_fixture_mac"}
+        payload = (kind + "\0" + json.dumps(
+            unsigned, sort_keys=True, separators=(",", ":"))).encode("utf-8")
+        return {**unsigned, "_fixture_mac": hmac.new(
+            self._fixture_proof_key, payload, hashlib.sha256).hexdigest()}
+
+    def verify_test_proof(self, kind, proof):
+        if not isinstance(proof, dict) or not isinstance(proof.get("_fixture_mac"), str):
+            return False
+        expected = self.sign_test_proof(kind, proof)["_fixture_mac"]
+        return hmac.compare_digest(expected, proof["_fixture_mac"])
+
     def ingress(self):
-        return {"scope": "all-tabby-clients", "blocked": True,
-                "inflight": 0, "observed_at_unix": self.now}
+        return self.sign_test_proof("ingress", {
+            "scope": "all-tabby-clients", "blocked": True,
+            "inflight": 0, "observed_at_unix": self.now,
+        })
 
     def gpu_before(self):
-        return {"scope": "all-hermes-gpus-and-pids", "gpu_count": 2,
-                "hermes_pids": [], "other_gpu_processes": [],
-                "gpu_owner": "none", "gpu_free": True,
-                "observed_at_unix": self.now}
+        return self.sign_test_proof("gpu-free", {
+            "scope": "all-hermes-gpus-and-pids", "gpu_count": 2,
+            "hermes_pids": [], "other_gpu_processes": [],
+            "gpu_owner": "none", "gpu_free": True,
+            "observed_at_unix": self.now,
+        })
 
     def gpu_after(self):
-        return {**self.gpu_before(), "gpu_owner": "tabby", "gpu_free": False,
-                "tabby_owns_both_gpus": True}
+        return self.sign_test_proof("gpu-restored", {
+            **self.gpu_before(), "gpu_owner": "tabby", "gpu_free": False,
+            "tabby_owns_both_gpus": True,
+        })
 
     def request(self, action, token=None):
         return {"protocol": core.PROTOCOL, "action": action,
