@@ -51,6 +51,18 @@ CAPTURE_STAGES = {
     "k_conv_predelta-0": ((128, (16, 48), 2, 1), 2),
     "attn_output-0": ((128, 48, 2, 1), 2),
 }
+# These callback labels exist in the pinned llama model source. They are
+# necessary for deeper diagnostics, but cannot establish HERMES full-model
+# equivalence. ffn_out is named at two source sites (potential duplicate).
+UNPROVEN_ORACLE_STAGES = {
+    "v_conv_predelta-0": ((128, 48, 2, 1), 2),
+    "final_output-0": ((6144, 2, 1, 1), 1),
+    "linear_attn_out-0": ((5120, 2, 1, 1), 1),
+    "attn_residual-0": ((5120, 2, 1, 1), 1),
+    "attn_post_norm-0": ((5120, 2, 1, 1), 1),
+    "ffn_out-0": ((5120, 2, 1, 1), 1),
+    "post_ffn-0": ((5120, 2, 1, 1), 1),
+}
 SHA_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
 
 
@@ -82,6 +94,16 @@ def checked_file(path: Path, sha: str, size: int | None = None) -> Path:
     return actual_path
 
 
+def exact_file_inventory(folder: Path, names: set[str]) -> None:
+    """Reject stale, partial, hidden, nested, or symlinked captures."""
+    need(folder.is_dir() and not folder.is_symlink(), "capture directory missing or aliased")
+    paths = list(folder.iterdir())
+    need(all(p.is_file() and not p.is_symlink() for p in paths),
+         "capture contains a symlink or nonregular entry")
+    need(len(paths) == len(names) and {p.name for p in paths} == names,
+         "capture has missing, stale, partial or unexpected files")
+
+
 def json_no_duplicates(pairs: list[tuple[str, object]]) -> dict:
     result = {}
     for key, value in pairs:
@@ -91,6 +113,10 @@ def json_no_duplicates(pairs: list[tuple[str, object]]) -> dict:
 
 
 def prior_manifest(path: Path, model: Path, lib: Path) -> dict:
+    need(not path.is_symlink() and path.name == "manifest.json",
+         "earlier pos0 manifest missing/cannot be aliased")
+    exact_file_inventory(path.parent, {"manifest.json"} |
+                         {name + ".f32" for name in PRIOR_STAGES})
     checked_file(path, PRIOR_SHA)
     document = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=json_no_duplicates)
     need(isinstance(document, dict) and
@@ -125,11 +151,16 @@ def prior_manifest(path: Path, model: Path, lib: Path) -> dict:
         need(entry.get("shape") == [count, 1, 1, 1] and
              entry.get("elements") == count and entry.get("bytes") == count * 4 and
              entry.get("source_type") == "f32" and
+             isinstance(entry.get("source_strides_bytes"), list) and
+             len(entry["source_strides_bytes"]) == 4 and
+             entry["source_strides_bytes"][0] == 4 and
              entry.get("file") == name + ".f32" and
              entry.get("sha256") == expected_sha,
              f"prior source tensor shape/bytes/identity wrong: {name}")
         checked_file(path.parent / entry["file"], expected_sha, count * 4)
     need(seen == set(PRIOR_STAGES), "earlier trace tensor set incomplete")
+    need(sha256_file(path) == PRIOR_SHA,
+         "earlier pos0 manifest changed during inspection")
     # v1 did not record a physical exporter path; this cannot attest it.
     return document
 
@@ -157,8 +188,13 @@ def parse_loaded_runtime(text: str) -> dict[str, str]:
     return parse_lock(rows)
 
 
-def ensure_stage_layout(manifest: dict, stages: dict = CAPTURE_STAGES) -> None:
-    """Validate runtime-reported GGML dimensions; never transpose by width."""
+def ensure_stage_layout(manifest: dict, stages: dict = CAPTURE_STAGES,
+                        *, strict_source_contract: bool = False) -> None:
+    """Validate GGML geometry. Real postcapture additionally checks source metadata.
+
+    The previous structural-only API stays usable by old synthetic tests;
+    it is never an oracle-admission verdict.
+    """
     need(manifest.get("schema") == "h27.reliability-layer0-downstream-cb.v1" and
          manifest.get("backend") == "llama.cpp" and
          manifest.get("status") == "CAPTURED_NOT_INDEPENDENTLY_COMPARED" and
@@ -167,6 +203,12 @@ def ensure_stage_layout(manifest: dict, stages: dict = CAPTURE_STAGES) -> None:
          manifest.get("one_contiguous_decode_batch") is True and
          manifest.get("layer") == 0,
          "missing contiguous two-token llama batch provenance")
+    if strict_source_contract:
+        need(manifest.get("tensor_data_format") ==
+             "little-endian-fp32-ne0-fastest" and
+             type(manifest.get("n_gpu_layers")) is int and
+             0 <= manifest["n_gpu_layers"] <= 128,
+             "actual backend tensor format or GPU layer count invalid")
     argmax = manifest.get("greedy_argmax")
     need(isinstance(argmax, list) and len(argmax) == 2 and
          all(type(x) is int and 0 <= x < 248320 for x in argmax) and
@@ -199,6 +241,15 @@ def ensure_stage_layout(manifest: dict, stages: dict = CAPTURE_STAGES) -> None:
              record.get("bytes") == count * 4 and
              record.get("file") == name + ".f32",
              f"FP32 length/file does not match GGML axes: {name}")
+        if strict_source_contract:
+            dtype = record.get("source_type")
+            strides = record.get("source_strides_bytes")
+            need(dtype in ("f32", "f16", "bf16") and
+                 isinstance(strides, list) and len(strides) == 4 and
+                 all(type(v) is int and v > 0 for v in strides) and
+                 strides[0] == (4 if dtype == "f32" else 2) and
+                 isinstance(record.get("buffer"), str) and bool(record["buffer"]),
+                 f"callback source scalar stride/type/backend missing: {name}")
     need(names == set(stages), "missing downstream tensor")
 
 
@@ -234,10 +285,12 @@ def preflight(args: argparse.Namespace) -> dict:
     checked_file(args.tracer, args.trusted_exporter_sha)
     need(args.capture_dir.is_dir(), "capture directory missing")
     if args.capture_manifest is None:
-        need(not any(args.capture_dir.iterdir()),
-             "capture directory must exist and be empty before GPU run")
+        exact_file_inventory(args.capture_dir, set())
     else:
-        need(args.capture_manifest.resolve().parent == args.capture_dir.resolve(),
+        need(args.capture_manifest.name == "manifest.json" and
+             not args.capture_manifest.is_symlink() and
+             args.capture_manifest.parent == args.capture_dir and
+             not args.capture_dir.is_symlink(),
              "post-capture manifest is outside selected capture directory")
     need(args.runtime_lock.is_file(), "runtime SHA lock missing")
     parse_lock(args.runtime_lock.read_text(encoding="ascii"))
@@ -246,12 +299,19 @@ def preflight(args: argparse.Namespace) -> dict:
     for name in CAPTURE_STAGES:
         need(plan.splitlines().count(name) == 1,
              f"compiled tracer does not declare callback {name}")
+    for name in UNPROVEN_ORACLE_STAGES:
+        need(plan.splitlines().count(name) == 1,
+             f"compiled tracer lacks source-confirmed callback label {name}")
     runtime = cpu_inspect(args.tracer, "--inspect-runtime",
                           "LOADED_RUNTIME_SHA_LOCK_TEMPLATE")
     parse_loaded_runtime(runtime)
     cpu_inspect(args.tracer, "--selftest", "PASS CPU callback selection")
     if args.capture_manifest is not None:
         need(args.capture_manifest.is_file(), "post-capture manifest absent")
+        expected_names = ({"manifest.json"} |
+                          {name + ".f32" for name in CAPTURE_STAGES})
+        exact_file_inventory(args.capture_dir, expected_names)
+        manifest_digest = sha256_file(args.capture_manifest)
         checked_capture = subprocess.run(
             [sys.executable, str(args.verifier), "--verify", str(args.capture_manifest),
              "--runtime-lock", str(args.runtime_lock),
@@ -264,7 +324,9 @@ def preflight(args: argparse.Namespace) -> dict:
              "independent completed-capture SHA/FP32 verification failed")
         parsed = json.loads(args.capture_manifest.read_text(encoding="utf-8"),
                             object_pairs_hook=json_no_duplicates)
-        ensure_stage_layout(parsed)
+        ensure_stage_layout(parsed, strict_source_contract=True)
+        need(sha256_file(args.capture_manifest) == manifest_digest,
+             "post-capture manifest changed after independent verification")
     return {
         "status": ("VERIFIED_CAPTURE_STAGES_ONLY" if args.capture_manifest
                    else "PASS_CPU_PREFLIGHT_ONLY"),
@@ -276,6 +338,9 @@ def preflight(args: argparse.Namespace) -> dict:
         "prior_pos0_manifest_sha256": PRIOR_SHA,
         "required_runtime_stages": {name: {"shape": list(shape), "token_axis": axis}
                                     for name, (shape, axis) in CAPTURE_STAGES.items()},
+        "additional_source_callbacks_not_admitted": sorted(UNPROVEN_ORACLE_STAGES),
+        "numerical_oracle_admission": "BLOCKED_NO_AUTHENTIC_CROSSENGINE_PROOF",
+        "qk_semantic_mapping": "BLOCKED_UNPROVEN_HEAD_REPETITION_AND_Q_SCALE",
         "limitations": ["No GPU or model inference was run",
                         "Source SHA and exporter SHA do not prove a reproducible build",
                         "Q/K predelta are not assumed equal to HERMES q_norm_scaled/k_norm",
