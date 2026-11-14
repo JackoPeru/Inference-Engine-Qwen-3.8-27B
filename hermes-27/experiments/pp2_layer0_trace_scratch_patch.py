@@ -24,6 +24,10 @@ POINT = (
     '  add_k<<<(int)((nH+255)/256),256,0,stream>>>(d_x,d_core,(int)nH);\n'
     '  if(getenv("HERMES_L26") && li==26){'
 )
+DECODE_POINT = (
+    '  if(ds.async_ctx) return decode_step_async(tok,ds,pos,err);\n'
+    '  ds.ever_advanced=true;'
+)
 TAG = "HERMES_SCRATCH_LAYER0_TRACE_DIR"
 
 HELPER = r'''
@@ -34,6 +38,23 @@ struct L0TraceField {
   size_t floats;
 };
 static std::atomic<unsigned> g_l0_trace_sequence{0};
+static std::atomic<const DecodeState*> g_l0_trace_state{nullptr};
+struct L0TraceInvocation {
+  int token = -1;
+  long position = -1;
+  const DecodeState* state = nullptr;
+};
+static thread_local L0TraceInvocation g_l0_trace_invocation;
+// Bind the snapshot to the actual public decode_step arguments, not to
+// guessed CLI order or to the name of the output file.
+struct L0TraceScope {
+  explicit L0TraceScope(int token, long position, const DecodeState* state) {
+    g_l0_trace_invocation = {token, position, state};
+  }
+  ~L0TraceScope() { g_l0_trace_invocation = {}; }
+  L0TraceScope(const L0TraceScope&) = delete;
+  L0TraceScope& operator=(const L0TraceScope&) = delete;
+};
 static bool l0_trace_scratch(
     const char* root, unsigned sequence, cudaStream_t stream,
     std::string& err, const L0TraceField* fields, size_t field_count) {
@@ -44,6 +65,23 @@ static bool l0_trace_scratch(
   }
   if (sequence > 1) {
     err = "scratch layer0 trace limited to exactly two decode tokens";
+    return false;
+  }
+  const int expected_tokens[] = {6205, 161421};
+  const auto& invocation = g_l0_trace_invocation;
+  if (!invocation.state || invocation.position != (long)sequence ||
+      invocation.token != expected_tokens[sequence]) {
+    err = "scratch layer0 actual token/absolute position mismatch";
+    return false;
+  }
+  if (sequence == 0) {
+    const DecodeState* empty = nullptr;
+    if (!g_l0_trace_state.compare_exchange_strong(empty, invocation.state)) {
+      err = "scratch layer0 reused or concurrent request";
+      return false;
+    }
+  } else if (g_l0_trace_state.load() != invocation.state) {
+    err = "scratch layer0 tokens do not share one DecodeState";
     return false;
   }
   int current_device = -1;
@@ -100,6 +138,29 @@ static bool l0_trace_scratch(
       return false;
     }
   }
+  // Exclusive sidecar is produced from decode_step's actual arguments.
+  // A missing, truncated or altered sidecar is a verifier error. Like the
+  // tensor files, this scratch artifact must never be shipped.
+  char context_path[256];
+  int nc = std::snprintf(context_path, sizeof(context_path),
+                         "%s/p%u_context.txt", root, sequence);
+  if (nc < 0 || static_cast<size_t>(nc) >= sizeof(context_path)) {
+    err = "scratch layer0 token context path too long";
+    return false;
+  }
+  FILE* context = std::fopen(context_path, "wbx");
+  if (!context) {
+    err = "scratch layer0 token context already exists or not writable";
+    return false;
+  }
+  int written = std::fprintf(context,
+      "token_id=%d\nabsolute_position=%ld\nsequence=%u\n",
+      invocation.token, invocation.position, sequence);
+  int closed = std::fclose(context);
+  if (written < 0 || closed != 0) {
+    err = "scratch layer0 partial token context; discard capture";
+    return false;
+  }
   return true;
 }
 '''
@@ -138,12 +199,17 @@ CAPTURE = r'''  // Optional, strictly scratch-only, single-request two-token pro
 def patched_source(source: str) -> str:
     if TAG in source:
         raise Blocked("source already contains scratch trace; refuse double patch")
-    if source.count(INCLUDE) != 1 or source.count(BEGIN) != 1 or source.count(POINT) != 1:
+    if (source.count(INCLUDE) != 1 or source.count(BEGIN) != 1 or
+            source.count(POINT) != 1 or source.count(DECODE_POINT) != 1):
         raise Blocked("PP2 source layout changed: exact anchors not verified")
     result = source.replace(INCLUDE, INCLUDE + "#include <atomic>\n", 1)
     result = result.replace(BEGIN, HELPER + "\n" + BEGIN, 1)
     result = result.replace(POINT, POINT.split("\n")[0] + "\n" + CAPTURE +
                             "  if(getenv(\"HERMES_L26\") && li==26){", 1)
+    result = result.replace(DECODE_POINT,
+                            DECODE_POINT.split("\n")[0] + "\n"
+                            "  L0TraceScope actual_decode_token(tok,pos,&ds);\n"
+                            "  ds.ever_advanced=true;", 1)
     if result.count(TAG) != 2:
         raise Blocked("scratch trace insertion incomplete")
     return result

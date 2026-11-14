@@ -33,6 +33,10 @@ class ScratchLayer0Test(unittest.TestCase):
         self.assertEqual(patched.count("l0_trace_scratch("), 2)
         self.assertIn("cudaStreamSynchronize(stream)", patched)
         self.assertIn('std::fopen(filename, "wbx")', patched)
+        self.assertIn('L0TraceScope actual_decode_token(tok,pos,&ds);', patched)
+        self.assertIn('"%s/p%u_context.txt"', patched)
+        self.assertIn('invocation.token != expected_tokens[sequence]', patched)
+        self.assertIn('g_l0_trace_state.compare_exchange_strong', patched)
         self.assertEqual(self.original, SOURCE.read_text(encoding="utf-8"))
 
     def test_all_required_shapes_and_names(self):
@@ -57,6 +61,9 @@ class ScratchLayer0Test(unittest.TestCase):
         with self.assertRaisesRegex(p.Blocked, "exact anchors"):
             p.patched_source(self.original.replace(
                 p.POINT, '  if(false){', 1))
+        with self.assertRaisesRegex(p.Blocked, "exact anchors"):
+            p.patched_source(self.original.replace(
+                p.DECODE_POINT, '  ds.ever_advanced=true;', 1))
 
     def test_repatch_and_preexisting_output_rejected(self):
         patched = p.patched_source(self.original)

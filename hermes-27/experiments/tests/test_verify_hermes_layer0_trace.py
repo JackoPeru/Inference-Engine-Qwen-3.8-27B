@@ -44,6 +44,11 @@ class VerifyLayer0Test(unittest.TestCase):
             "expected_bytes": self.model.stat().st_size,
         }
         for position in (0, 1):
+            (self.capture / f"p{position}_context.txt").write_text(
+                f"token_id={(6205, 161421)[position]}\n"
+                f"absolute_position={position}\nsequence={position}\n",
+                encoding="ascii",
+            )
             for name, count in v.STAGES.items():
                 (self.capture / f"p{position}_{name}.f32").write_bytes(
                     array("f", [0.5] * count).tobytes())
@@ -52,8 +57,32 @@ class VerifyLayer0Test(unittest.TestCase):
         report = v.verify(**self.arguments)
         self.assertEqual(len(report["tensors"]), 22)
         self.assertTrue(report["not_release_gate"])
-        self.assertIn("NOT_INDEPENDENTLY_PROVEN", report["status"])
-        self.assertEqual([6205, 161421], report["prompt_ids_assumed_from_cli"])
+        self.assertEqual("RUNTIME_DECODE_ARGUMENTS_RECORDED_NOT_LLAMA_COMPARED",
+                         report["status"])
+        self.assertEqual([6205, 161421], report["prompt_ids_runtime_reported"])
+        self.assertEqual([0, 1], report["absolute_positions_runtime_reported"])
+        self.assertEqual(len(report["runtime_decode_contexts"]), 2)
+
+    def test_runtime_context_wrong_token_position_missing_and_symlink(self):
+        context = self.capture / "p1_context.txt"
+        valid = context.read_bytes()
+        for corrupted in (
+            valid.replace(b"161421", b"6205"),
+            valid.replace(b"position=1", b"position=0"),
+            valid.replace(b"sequence=1", b"sequence=0"),
+            valid + b"unexpected=1\n",
+            valid[:-1],
+        ):
+            with self.subTest(corrupted=corrupted):
+                context.write_bytes(corrupted)
+                with self.assertRaisesRegex(v.Blocked, "runtime decode token/position"):
+                    v.verify(**self.arguments)
+        context.unlink()
+        with self.assertRaisesRegex(v.Blocked, "runtime token-position contexts"):
+            v.verify(**self.arguments)
+        context.symlink_to(self.capture / "p0_context.txt")
+        with self.assertRaisesRegex(v.Blocked, "runtime context symlink"):
+            v.verify(**self.arguments)
 
     def test_bad_model_bytes_or_hash_blocks(self):
         with self.assertRaises(v.Blocked):

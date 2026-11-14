@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Fail-closed verification of the two-token HERMES scratch layer0 trace.
 
-No GPU, network or model execution. This verifies bytes/provenance only,
-not same-position semantics or independent llama.cpp numerical fidelity.
+No GPU, network or model execution. This verifies trace bytes and the
+scratch runtime's recorded decode_step(token, absolute_position) arguments;
+it does not establish independent llama.cpp numerical fidelity.
 """
 from __future__ import annotations
 
@@ -73,6 +74,27 @@ def verify(
         raise Blocked(f"missing or unexpected trace tensor files: "
                       f"missing={sorted(expected_files-actual_files)} "
                       f"unexpected={sorted(actual_files-expected_files)}")
+    expected_contexts = {f"p{pos}_context.txt" for pos in (0, 1)}
+    actual_contexts = {path.name for path in capture_dir.glob("p*_context.txt")}
+    if actual_contexts != expected_contexts:
+        raise Blocked("missing/unexpected runtime token-position contexts")
+    expected_tokens = (6205, 161421)
+    context_records = []
+    for pos, token in enumerate(expected_tokens):
+        context_path = capture_dir / f"p{pos}_context.txt"
+        if context_path.is_symlink():
+            raise Blocked(f"runtime context symlink rejected: {context_path}")
+        raw_context = context_path.read_bytes()
+        expected_context = (f"token_id={token}\nabsolute_position={pos}\n"
+                            f"sequence={pos}\n").encode("ascii")
+        if raw_context != expected_context:
+            raise Blocked(f"runtime decode token/position mismatch: {context_path}")
+        context_records.append({
+            "runtime_token_id": token,
+            "runtime_absolute_position": pos,
+            "decode_sequence": pos,
+            "context_sha256": hashlib.sha256(raw_context).hexdigest(),
+        })
     tensor_records = []
     for pos in (0, 1):
         for name, count in STAGES.items():
@@ -87,24 +109,25 @@ def verify(
             if any(not math.isfinite(value) for value in floats):
                 raise Blocked(f"nonfinite trace values: {path}")
             tensor_records.append({
-                "name": name, "position_assumed": pos,
+                "name": name, "runtime_reported_position": pos,
                 "dtype": "little-endian-fp32", "shape": [count],
                 "bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest(),
             })
     return {
-        "schema": "h27.hermes-scratch-layer0-capture.v1",
+        "schema": "h27.hermes-scratch-layer0-capture.v2",
         "backend": "hermes-27-scratch",
-        "status": "BYTES_VERIFIED_RUNTIME_POSITION_NOT_INDEPENDENTLY_PROVEN",
+        "status": "RUNTIME_DECODE_ARGUMENTS_RECORDED_NOT_LLAMA_COMPARED",
         "not_release_gate": True,
-        "prompt_ids_assumed_from_cli": [6205, 161421],
-        "absolute_positions_assumed_from_serial_decode": [0, 1],
+        "prompt_ids_runtime_reported": list(expected_tokens),
+        "absolute_positions_runtime_reported": [0, 1],
+        "runtime_decode_contexts": context_records,
         "model_sha256": expected_sha, "model_bytes": expected_bytes,
         "source_sha256": hashlib.sha256(original).hexdigest(),
         "patched_source_sha256": hashlib.sha256(modified).hexdigest(),
         "binary_sha256": sha256_file(binary),
         "tensors": tensor_records,
         "limitations": [
-            "No independently authenticated token/position from HERMES debug output",
+            "Token IDs and positions were recorded inside the instrumented HERMES decode_step, not independently inside llama.cpp",
             "No independent llama stage numeric comparison",
             "Scratch-only trace files may contain hidden activations; never commit them",
         ],
