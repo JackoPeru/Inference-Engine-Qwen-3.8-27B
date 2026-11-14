@@ -55,6 +55,8 @@ constexpr char kTerminalTransportFailureSse[] =
     "data: {\"error\":{\"message\":\"request finalization failed\","
     "\"type\":\"server_error\"}}\n\n"
     "data: [DONE]\n\n";
+// Constructed before requests: OOM recovery must not allocate its own message.
+const std::string kStreamAllocationError = "stream output allocation failed";
 
 struct Config {
   std::string model = "/home/matteo/hermes-27/models/Qwen3.8-27B-Uncensored-NVFP4-MTP.gguf";
@@ -984,7 +986,12 @@ class Scheduler {
   // a seeded batched prefill. All SSE, stop, usage and terminal semantics
   // share exactly this code; a caller must never feed the same token twice.
   bool legacy_token(const std::shared_ptr<Job>& job, int token) {
-    job->output.push_back(token);
+    try {
+      job->output.push_back(token);
+    } catch (const std::bad_alloc&) {
+      complete(job, 500, kStreamAllocationError, "length");
+      return true;
+    }
     if (job->stream_started) {
       try {
         const std::string delta = tokenizer_.stream_push(job->id, token);
@@ -993,11 +1000,15 @@ class Scheduler {
           job->decoded_text += delta;
           update_visible_text(*job, false);
         }
+        // SSE JSON/string/queue allocation is fallible, just like tokenization.
+        stream_text(job);
+      } catch (const std::bad_alloc&) {
+        complete(job, 500, kStreamAllocationError, "length");
+        return true;
       } catch (const std::exception& e) {
         complete(job, 500, std::string("incremental detokenization failed: ") + e.what(), "length");
         return true;
       }
-      stream_text(job);
     } else if (!job->stops.empty()) {
       // Unsupported non-ByteLevel tokenizers use reference decoding for
       // stop checks, but emit only completed SSE text.
